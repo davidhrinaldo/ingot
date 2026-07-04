@@ -4,8 +4,6 @@ import (
 	"fmt"
 	"math/rand"
 	"testing"
-
-	"github.com/stretchr/testify/assert"
 )
 
 // bstreamBytes writes (value, nbits) pairs and returns the encoded bytes.
@@ -144,8 +142,12 @@ func TestBstream(t *testing.T) {
 			r := newBReader(tc.data)
 			for i, op := range tc.reads {
 				got, err := r.readBits(op.nbits)
-				assert.Equal(t, op.wantVal, got, "op %d val (nbits=%d)", i, op.nbits)
-				assert.Equal(t, op.wantErr, err, "op %d err (nbits=%d)", i, op.nbits)
+				if got != op.wantVal {
+					t.Errorf("op %d val (nbits=%d): got %v, want %v", i, op.nbits, got, op.wantVal)
+				}
+				if err != op.wantErr {
+					t.Errorf("op %d err (nbits=%d): got %v, want %v", i, op.nbits, err, op.wantErr)
+				}
 			}
 		})
 	}

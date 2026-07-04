@@ -5,8 +5,6 @@ import (
 	"testing"
 
 	"git.dvdt.dev/david/ingot/labels"
-	"github.com/stretchr/testify/assert"
-	"github.com/stretchr/testify/require"
 )
 
 func TestCollectMetrics(t *testing.T) {
@@ -35,10 +33,16 @@ func TestCollectMetrics(t *testing.T) {
 			setup: func(t *testing.T, db *DB) {
 				app := db.Appender()
 				_, err := app.Append(0, labels.FromStrings("__name__", "temp", "room", "a"), 1000, 1.0)
-				require.NoError(t, err)
+				if err != nil {
+					t.Fatalf("unexpected error: %v", err)
+				}
 				_, err = app.Append(0, labels.FromStrings("__name__", "temp", "room", "b"), 1000, 2.0)
-				require.NoError(t, err)
-				require.NoError(t, app.Commit())
+				if err != nil {
+					t.Fatalf("unexpected error: %v", err)
+				}
+				if err := app.Commit(); err != nil {
+					t.Fatalf("unexpected error: %v", err)
+				}
 			},
 			// 2 user series + 5 metric series = 7
 			collectCalls:    2,
@@ -52,14 +56,22 @@ func TestCollectMetrics(t *testing.T) {
 			setup: func(t *testing.T, db *DB) {
 				app := db.Appender()
 				ref, err := app.Append(0, labels.FromStrings("__name__", "temp"), 0, 0)
-				require.NoError(t, err)
+				if err != nil {
+					t.Fatalf("unexpected error: %v", err)
+				}
 				for i := 1; i < 250; i++ {
 					_, err = app.Append(ref, nil, int64(i*15000), float64(i))
-					require.NoError(t, err)
+					if err != nil {
+						t.Fatalf("unexpected error: %v", err)
+					}
 				}
-				require.NoError(t, app.Commit())
+				if err := app.Commit(); err != nil {
+					t.Fatalf("unexpected error: %v", err)
+				}
 				_, err = db.FlushOlderThan(math.MaxInt64)
-				require.NoError(t, err)
+				if err != nil {
+					t.Fatalf("unexpected error: %v", err)
+				}
 			},
 			collectCalls:    2,
 			wantHeadSeries:  6, // 1 user + 5 metric series
@@ -82,7 +94,9 @@ func TestCollectMetrics(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			clock := &testClock{now: 100_000}
 			db, err := Open(t.TempDir(), Options{Clock: clock.fn()})
-			require.NoError(t, err)
+			if err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
 			t.Cleanup(func() { db.Close() })
 
 			tc.setup(t, db)
@@ -95,7 +109,9 @@ func TestCollectMetrics(t *testing.T) {
 			// Query each expected metric.
 			lastValue := func(name string) (float64, bool) {
 				q, err := db.Querier(math.MinInt64, math.MaxInt64)
-				require.NoError(t, err)
+				if err != nil {
+					t.Fatalf("unexpected error: %v", err)
+				}
 				defer q.Close()
 				ss := q.Select(labels.MustNewMatcher(labels.MatchEqual, "__name__", name))
 				found := false
@@ -105,36 +121,58 @@ func TestCollectMetrics(t *testing.T) {
 					for it.Next() {
 						_, last = it.At()
 					}
-					require.NoError(t, it.Err())
+					if err := it.Err(); err != nil {
+						t.Fatalf("unexpected error: %v", err)
+					}
 					found = true
 				}
-				require.NoError(t, ss.Err())
+				if err := ss.Err(); err != nil {
+					t.Fatalf("unexpected error: %v", err)
+				}
 				return last, found
 			}
 
 			v, found := lastValue(MetricHeadSeries)
-			assert.True(t, found, "ingot_head_series not found")
-			assert.Equal(t, tc.wantHeadSeries, v, "ingot_head_series")
+			if !found {
+				t.Errorf("ingot_head_series not found")
+			}
+			if v != tc.wantHeadSeries {
+				t.Errorf("ingot_head_series: got %v, want %v", v, tc.wantHeadSeries)
+			}
 
 			v, found = lastValue(MetricBlocksTotal)
-			assert.True(t, found, "ingot_blocks_total not found")
-			assert.Equal(t, tc.wantBlocksTotal, v, "ingot_blocks_total")
+			if !found {
+				t.Errorf("ingot_blocks_total not found")
+			}
+			if v != tc.wantBlocksTotal {
+				t.Errorf("ingot_blocks_total: got %v, want %v", v, tc.wantBlocksTotal)
+			}
 
 			v, found = lastValue(MetricCompactionsTotal)
-			assert.True(t, found, "ingot_compactions_total not found")
-			assert.Equal(t, tc.wantCompactions, v, "ingot_compactions_total")
+			if !found {
+				t.Errorf("ingot_compactions_total not found")
+			}
+			if v != tc.wantCompactions {
+				t.Errorf("ingot_compactions_total: got %v, want %v", v, tc.wantCompactions)
+			}
 
 			// Count total ingot_* series.
 			q, err := db.Querier(math.MinInt64, math.MaxInt64)
-			require.NoError(t, err)
+			if err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
 			defer q.Close()
 			ss := q.Select(labels.MustNewMatcher(labels.MatchRegexp, "__name__", "ingot_.*"))
 			count := 0
 			for ss.Next() {
 				count++
 			}
-			require.NoError(t, ss.Err())
-			assert.Equal(t, tc.wantMetricCount, count, "metric series count")
+			if err := ss.Err(); err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+			if count != tc.wantMetricCount {
+				t.Errorf("metric series count: got %v, want %v", count, tc.wantMetricCount)
+			}
 		})
 	}
 }

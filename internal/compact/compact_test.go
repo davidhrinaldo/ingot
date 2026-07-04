@@ -8,8 +8,6 @@ import (
 	"git.dvdt.dev/david/ingot/internal/block"
 	"git.dvdt.dev/david/ingot/internal/chunkenc"
 	"git.dvdt.dev/david/ingot/labels"
-	"github.com/stretchr/testify/assert"
-	"github.com/stretchr/testify/require"
 )
 
 const (
@@ -21,7 +19,9 @@ func makeChunk(t *testing.T, timestamps []int64, values []float64) []byte {
 	t.Helper()
 	c := chunkenc.NewXORChunk()
 	a, err := c.Appender()
-	require.NoError(t, err)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
 	for i := range timestamps {
 		a.Append(timestamps[i], values[i])
 	}
@@ -38,9 +38,13 @@ func flushTestBlock(t *testing.T, dataDir string, series []block.SeriesFlush, le
 	} else {
 		ulid, err = block.FlushCompacted(dataDir, series, level, sources)
 	}
-	require.NoError(t, err)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
 	r, err := block.Open(filepath.Join(dataDir, ulid))
-	require.NoError(t, err)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
 	return r
 }
 
@@ -48,13 +52,17 @@ func flushTestBlock(t *testing.T, dataDir string, series []block.SeriesFlush, le
 func collectBlockSamples(t *testing.T, r *block.Reader, ref uint64) []sample {
 	t.Helper()
 	it, err := r.SeriesChunkIterator(ref, math.MinInt64, math.MaxInt64)
-	require.NoError(t, err)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
 	var out []sample
 	for it.Next() {
 		ts, v := it.At()
 		out = append(out, sample{ts, v})
 	}
-	require.NoError(t, it.Err())
+	if err := it.Err(); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
 	return out
 }
 
@@ -162,12 +170,20 @@ func TestPlan(t *testing.T) {
 			group := c.Plan(blocks)
 
 			if !tc.wantGroup {
-				assert.Nil(t, group, "expected no compaction group")
+				if group != nil {
+					t.Errorf("expected no compaction group, got %v", group)
+				}
 				return
 			}
-			require.NotNil(t, group, "expected a compaction group")
-			assert.Equal(t, tc.wantLevel, group.Level, "compaction level")
-			assert.Equal(t, tc.wantCount, len(group.Sources), "source count")
+			if group == nil {
+				t.Fatalf("expected a compaction group")
+			}
+			if got, want := group.Level, tc.wantLevel; got != want {
+				t.Errorf("compaction level: got %v, want %v", got, want)
+			}
+			if got, want := len(group.Sources), tc.wantCount; got != want {
+				t.Errorf("source count: got %v, want %v", got, want)
+			}
 		})
 	}
 }
@@ -263,8 +279,12 @@ func TestCompact(t *testing.T) {
 
 			// Compact.
 			newULID, err := c.Compact(sources)
-			require.NoError(t, err)
-			require.NotEmpty(t, newULID)
+			if err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+			if newULID == "" {
+				t.Fatalf("expected non-empty ULID")
+			}
 
 			// Close source blocks.
 			for _, s := range sources {
@@ -273,24 +293,38 @@ func TestCompact(t *testing.T) {
 
 			// Open compacted block.
 			compacted, err := block.Open(filepath.Join(dataDir, newULID))
-			require.NoError(t, err)
+			if err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
 			defer compacted.Close()
 
 			// Verify compaction level.
-			assert.Equal(t, tc.wantLevel, compacted.Meta.Compaction.Level, "compaction level")
-			assert.Equal(t, len(tc.sourceBlocks), len(compacted.Meta.Compaction.Sources), "source count")
+			if got, want := compacted.Meta.Compaction.Level, tc.wantLevel; got != want {
+				t.Errorf("compaction level: got %v, want %v", got, want)
+			}
+			if got, want := len(compacted.Meta.Compaction.Sources), len(tc.sourceBlocks); got != want {
+				t.Errorf("source count: got %v, want %v", got, want)
+			}
 
 			// Verify series count.
-			assert.Equal(t, len(tc.wantSeriesRefs), compacted.Meta.Stats.NumSeries, "series count")
+			if got, want := compacted.Meta.Stats.NumSeries, len(tc.wantSeriesRefs); got != want {
+				t.Errorf("series count: got %v, want %v", got, want)
+			}
 
 			// Verify each series' samples.
 			for _, ref := range tc.wantSeriesRefs {
 				got := collectBlockSamples(t, compacted, ref)
 				want := tc.wantSamples[ref]
-				require.Equal(t, len(want), len(got), "sample count for ref %d", ref)
+				if len(got) != len(want) {
+					t.Fatalf("sample count for ref %d: got %v, want %v", ref, len(got), len(want))
+				}
 				for i := range want {
-					assert.Equal(t, want[i].t, got[i].t, "ref %d sample %d t", ref, i)
-					assert.Equal(t, want[i].v, got[i].v, "ref %d sample %d v", ref, i)
+					if got[i].t != want[i].t {
+						t.Errorf("ref %d sample %d t: got %v, want %v", ref, i, got[i].t, want[i].t)
+					}
+					if got[i].v != want[i].v {
+						t.Errorf("ref %d sample %d v: got %v, want %v", ref, i, got[i].v, want[i].v)
+					}
 				}
 			}
 		})
@@ -357,7 +391,9 @@ func TestExpired(t *testing.T) {
 			}
 
 			expired := c.Expired(blocks)
-			assert.Equal(t, tc.wantCount, len(expired), "expired block count")
+			if got, want := len(expired), tc.wantCount; got != want {
+				t.Errorf("expired block count: got %v, want %v", got, want)
+			}
 		})
 	}
 }

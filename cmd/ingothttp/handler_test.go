@@ -10,14 +10,14 @@ import (
 
 	"git.dvdt.dev/david/ingot"
 	"git.dvdt.dev/david/ingot/labels"
-	"github.com/stretchr/testify/assert"
-	"github.com/stretchr/testify/require"
 )
 
 func openTestDB(t *testing.T) *ingot.DB {
 	t.Helper()
 	db, err := ingot.Open(t.TempDir(), ingot.Options{})
-	require.NoError(t, err)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
 	t.Cleanup(func() { db.Close() })
 	return db
 }
@@ -26,12 +26,20 @@ func seedDB(t *testing.T, db *ingot.DB) {
 	t.Helper()
 	app := db.Appender()
 	ref, err := app.Append(0, labels.FromStrings("__name__", "temp", "room", "office"), 1000, 71.3)
-	require.NoError(t, err)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
 	_, err = app.Append(ref, nil, 2000, 71.4)
-	require.NoError(t, err)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
 	_, err = app.Append(0, labels.FromStrings("__name__", "humidity", "room", "office"), 1000, 55.0)
-	require.NoError(t, err)
-	require.NoError(t, app.Commit())
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if err := app.Commit(); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
 }
 
 func TestQueryRange(t *testing.T) {
@@ -117,12 +125,16 @@ func TestQueryRange(t *testing.T) {
 			rec := httptest.NewRecorder()
 			h.queryRange(rec, req)
 
-			assert.Equal(t, tc.wantStatus, rec.Code)
+			if rec.Code != tc.wantStatus {
+				t.Errorf("got %v, want %v", rec.Code, tc.wantStatus)
+			}
 
 			// Always decode — error responses produce zero-valued struct.
 			var resp queryRangeResponse
 			json.Unmarshal(rec.Body.Bytes(), &resp)
-			assert.Equal(t, tc.wantCount, len(resp.Data.Result))
+			if len(resp.Data.Result) != tc.wantCount {
+				t.Errorf("got %v, want %v", len(resp.Data.Result), tc.wantCount)
+			}
 		})
 	}
 }
@@ -200,13 +212,17 @@ func TestRead(t *testing.T) {
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
 			body, err := json.Marshal(tc.request)
-			require.NoError(t, err)
+			if err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
 
 			req := httptest.NewRequest(tc.method, "/api/v1/read", bytes.NewReader(body))
 			rec := httptest.NewRecorder()
 			h.read(rec, req)
 
-			assert.Equal(t, tc.wantStatus, rec.Code)
+			if rec.Code != tc.wantStatus {
+				t.Errorf("got %v, want %v", rec.Code, tc.wantStatus)
+			}
 
 			// Always decode — error responses produce zero-valued struct.
 			var resp ReadResponse
@@ -215,7 +231,9 @@ func TestRead(t *testing.T) {
 			if len(resp.Results) > 0 {
 				firstResultLen = len(resp.Results[0].Timeseries)
 			}
-			assert.Equal(t, tc.wantSeries, firstResultLen)
+			if firstResultLen != tc.wantSeries {
+				t.Errorf("got %v, want %v", firstResultLen, tc.wantSeries)
+			}
 		})
 	}
 }
@@ -267,13 +285,19 @@ func TestStatus(t *testing.T) {
 			rec := httptest.NewRecorder()
 			h.status(rec, req)
 
-			assert.Equal(t, tc.wantStatus, rec.Code)
+			if rec.Code != tc.wantStatus {
+				t.Errorf("got %v, want %v", rec.Code, tc.wantStatus)
+			}
 
 			// Always decode — error responses produce zero-valued struct.
 			var resp statusResponse
 			json.Unmarshal(rec.Body.Bytes(), &resp)
-			assert.Equal(t, tc.wantHeadSeries, resp.HeadSeries)
-			assert.Equal(t, tc.wantBlocks, resp.Blocks)
+			if resp.HeadSeries != tc.wantHeadSeries {
+				t.Errorf("got %v, want %v", resp.HeadSeries, tc.wantHeadSeries)
+			}
+			if resp.Blocks != tc.wantBlocks {
+				t.Errorf("got %v, want %v", resp.Blocks, tc.wantBlocks)
+			}
 		})
 	}
 }

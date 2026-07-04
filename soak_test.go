@@ -11,8 +11,6 @@ import (
 	"time"
 
 	"git.dvdt.dev/david/ingot/labels"
-	"github.com/stretchr/testify/assert"
-	"github.com/stretchr/testify/require"
 )
 
 // TestSoak simulates 48h of ingestion at 15s intervals across 10k series,
@@ -48,7 +46,9 @@ func TestSoak(t *testing.T) {
 		BlockDuration: time.Duration(blockDuration) * time.Millisecond,
 		Clock:         clock,
 	})
-	require.NoError(t, err)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
 	defer db.Close()
 
 	// Generate series labels.
@@ -81,7 +81,9 @@ func TestSoak(t *testing.T) {
 				ls = seriesLabels[i]
 			}
 			r, err := app.Append(refs[i], ls, ts, float64(ts+int64(i)))
-			require.NoError(t, err)
+			if err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
 			refs[i] = r
 			if i < canaryCount {
 				if ls != nil {
@@ -90,20 +92,26 @@ func TestSoak(t *testing.T) {
 				oracle.addSample(r, ts, float64(ts+int64(i)))
 			}
 		}
-		require.NoError(t, app.Commit())
+		if err := app.Commit(); err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
 		totalSamples += int64(numSeries)
 
 		// Periodic flush.
 		elapsed := ts - startTime
 		if elapsed > 0 && elapsed%flushInterval == 0 {
 			_, err := db.FlushOlderThan(ts - int64(blockDuration))
-			require.NoError(t, err)
+			if err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
 		}
 
 		// Periodic compaction + retention.
 		if elapsed > 0 && elapsed%compactInterval == 0 {
 			err := db.RunCompaction()
-			require.NoError(t, err)
+			if err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
 			db.ApplyRetention()
 		}
 
@@ -128,14 +136,20 @@ func TestSoak(t *testing.T) {
 	t.Logf("Peak heap: %d MiB", maxHeapMB)
 
 	// Assert zero query errors.
-	assert.Equal(t, int64(0), atomic.LoadInt64(&queryErrors), "query errors during soak")
+	if got := atomic.LoadInt64(&queryErrors); got != int64(0) {
+		t.Errorf("query errors during soak: got %v, want %v", got, int64(0))
+	}
 
 	// Assert bounded memory (should stay well under 1 GiB with 10k series).
-	assert.Less(t, maxHeapMB, uint64(1024), "heap should stay under 1 GiB")
+	if !(maxHeapMB < uint64(1024)) {
+		t.Errorf("heap should stay under 1 GiB: got %v, want < %v", maxHeapMB, uint64(1024))
+	}
 
 	// Assert bounded disk: count block directories.
 	entries, err := os.ReadDir(dir)
-	require.NoError(t, err)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
 	blockCount := 0
 	for _, e := range entries {
 		if e.IsDir() && e.Name() != "wal" {
@@ -147,7 +161,9 @@ func TestSoak(t *testing.T) {
 	t.Logf("Block count at end: %d", blockCount)
 	// With 24h retention and 2h blocks, expect roughly 12 raw + some compacted.
 	// Should be well under 50.
-	assert.Less(t, blockCount, 50, "block count should be bounded by retention")
+	if !(blockCount < 50) {
+		t.Errorf("block count should be bounded by retention: got %v, want < %v", blockCount, 50)
+	}
 
 	// Final canary validation.
 	finalNow := now.Load()
@@ -155,7 +171,9 @@ func TestSoak(t *testing.T) {
 
 	// Live query during compaction: start query, compact, finish query.
 	q, err := db.Querier(math.MinInt64, math.MaxInt64)
-	require.NoError(t, err)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
 	ss := q.Select(labels.MustNewMatcher(labels.MatchRegexp, "__name__", "metric_0.*"))
 	// Trigger compaction while query is open.
 	db.RunCompaction()
@@ -164,10 +182,16 @@ func TestSoak(t *testing.T) {
 		it := ss.At().Iterator()
 		for it.Next() {
 		}
-		assert.NoError(t, it.Err())
+		if err := it.Err(); err != nil {
+			t.Errorf("unexpected error: %v", err)
+		}
 	}
-	assert.NoError(t, ss.Err())
-	require.NoError(t, q.Close())
+	if err := ss.Err(); err != nil {
+		t.Errorf("unexpected error: %v", err)
+	}
+	if err := q.Close(); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
 }
 
 // validateCanaries queries each canary series and compares with the oracle.
@@ -193,7 +217,9 @@ func validateCanaries(t *testing.T, db *DB, o *oracle, now int64, retentionMs in
 
 		// Query.
 		q, err := db.Querier(mint, maxt)
-		require.NoError(t, err, "querier for canary ref %d", ref)
+		if err != nil {
+			t.Fatalf("querier for canary ref %d: unexpected error: %v", ref, err)
+		}
 
 		ss := q.Select(matchers...)
 		var gotSamples []sample
@@ -211,10 +237,12 @@ func validateCanaries(t *testing.T, db *DB, o *oracle, now int64, retentionMs in
 		q.Close()
 
 		// All assertions run unconditionally for every canary.
-		if !assert.NoError(t, iterErr, "canary ref %d: iterator error", ref) {
+		if iterErr != nil {
+			t.Errorf("canary ref %d: iterator error: %v", ref, iterErr)
 			pass = false
 		}
-		if !assert.NoError(t, ssErr, "canary ref %d: series set error", ref) {
+		if ssErr != nil {
+			t.Errorf("canary ref %d: series set error: %v", ref, ssErr)
 			pass = false
 		}
 
@@ -225,8 +253,8 @@ func validateCanaries(t *testing.T, db *DB, o *oracle, now int64, retentionMs in
 			wantSamples = s
 		}
 
-		if !assert.Equal(t, len(wantSamples), len(gotSamples),
-			"canary ref %d sample count (mint=%d maxt=%d)", ref, mint, maxt) {
+		if len(wantSamples) != len(gotSamples) {
+			t.Errorf("canary ref %d sample count (mint=%d maxt=%d): got %v, want %v", ref, mint, maxt, len(gotSamples), len(wantSamples))
 			pass = false
 		}
 	}

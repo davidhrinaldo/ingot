@@ -9,15 +9,15 @@ import (
 	"git.dvdt.dev/david/ingot/internal/block"
 	"git.dvdt.dev/david/ingot/internal/chunkenc"
 	"git.dvdt.dev/david/ingot/labels"
-	"github.com/stretchr/testify/assert"
-	"github.com/stretchr/testify/require"
 )
 
 func makeChunk(t *testing.T, samples []struct{ t int64; v float64 }) []byte {
 	t.Helper()
 	c := chunkenc.NewXORChunk()
 	a, err := c.Appender()
-	require.NoError(t, err)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
 	for _, s := range samples {
 		a.Append(s.t, s.v)
 	}
@@ -51,7 +51,9 @@ func setupTestData(t *testing.T) string {
 	}
 
 	_, err := block.Flush(dir, series)
-	require.NoError(t, err)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
 	return dir
 }
 
@@ -59,7 +61,9 @@ func setupTestData(t *testing.T) string {
 func blockDir(t *testing.T, dataDir string) string {
 	t.Helper()
 	entries, err := os.ReadDir(dataDir)
-	require.NoError(t, err)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
 	for _, e := range entries {
 		if e.IsDir() && e.Name() != "wal" {
 			return filepath.Join(dataDir, e.Name())
@@ -124,10 +128,16 @@ func TestCmdBlocks(t *testing.T) {
 				return cmdErr
 			}()
 
-			assert.Equal(t, tc.wantErr != "", err != nil, "error presence")
-			assert.Contains(t, errString(err), tc.wantErr)
+			if got := (err != nil); got != (tc.wantErr != "") {
+				t.Errorf("error presence: got %v, want %v", got, tc.wantErr != "")
+			}
+			if !strings.Contains(errString(err), tc.wantErr) {
+				t.Errorf("got %q, want substring %q", errString(err), tc.wantErr)
+			}
 			for _, want := range tc.wantOutputs {
-				assert.Contains(t, output, want)
+				if !strings.Contains(output, want) {
+					t.Errorf("got %q, want substring %q", output, want)
+				}
 			}
 		})
 	}
@@ -166,10 +176,16 @@ func TestCmdInspect(t *testing.T) {
 				return cmdErr
 			}()
 
-			assert.Equal(t, tc.wantErr != "", err != nil, "error presence")
-			assert.Contains(t, errString(err), tc.wantErr)
+			if got := (err != nil); got != (tc.wantErr != "") {
+				t.Errorf("error presence: got %v, want %v", got, tc.wantErr != "")
+			}
+			if !strings.Contains(errString(err), tc.wantErr) {
+				t.Errorf("got %q, want substring %q", errString(err), tc.wantErr)
+			}
 			for _, want := range tc.wantOutputs {
-				assert.Contains(t, output, want)
+				if !strings.Contains(output, want) {
+					t.Errorf("got %q, want substring %q", output, want)
+				}
 			}
 		})
 	}
@@ -220,10 +236,16 @@ func TestCmdChunks(t *testing.T) {
 				return cmdErr
 			}()
 
-			assert.Equal(t, tc.wantErr != "", err != nil, "error presence")
-			assert.Contains(t, errString(err), tc.wantErr)
+			if got := (err != nil); got != (tc.wantErr != "") {
+				t.Errorf("error presence: got %v, want %v", got, tc.wantErr != "")
+			}
+			if !strings.Contains(errString(err), tc.wantErr) {
+				t.Errorf("got %q, want substring %q", errString(err), tc.wantErr)
+			}
 			for _, want := range tc.wantOutputs {
-				assert.Contains(t, output, want)
+				if !strings.Contains(output, want) {
+					t.Errorf("got %q, want substring %q", output, want)
+				}
 			}
 		})
 	}
@@ -263,8 +285,12 @@ func TestCmdFsck(t *testing.T) {
 				return cmdErr
 			}()
 
-			assert.Equal(t, tc.wantErr != "", err != nil, "error presence")
-			assert.Contains(t, errString(err), tc.wantErr)
+			if got := (err != nil); got != (tc.wantErr != "") {
+				t.Errorf("error presence: got %v, want %v", got, tc.wantErr != "")
+			}
+			if !strings.Contains(errString(err), tc.wantErr) {
+				t.Errorf("got %q, want substring %q", errString(err), tc.wantErr)
+			}
 		})
 	}
 }

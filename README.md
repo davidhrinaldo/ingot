@@ -31,7 +31,7 @@ db.Close()
 
 ## Status
 
-**Pre-alpha.** The API is frozen (M4) and the system survives a 48h soak test under sustained load (M5), but this hasn't seen production use yet.
+**Alpha.** The API is frozen (M4) and the system survives a 48h soak test under sustained load (M5), but this hasn't seen production use yet.
 
 | Milestone | State |
 |---|---|
@@ -44,14 +44,24 @@ db.Close()
 
 See [DESIGN.md](DESIGN.md) for architecture, on-disk format, and the non-goals table. See [ROADMAP.md](ROADMAP.md) for what's next.
 
+## Why
+
+I needed a library to store time-series data locally and the options out there didn't quite work for my case. Prometheus was too heavy for what I needed but I wanted that level of compression. tstorage was close but it didn't have the compression or label indexing.
+
+## Install
+
+```sh
+go get git.dvdt.dev/david/ingot
+```
+
 ## Features
 
 - **Gorilla XOR compression** — ~1 byte/sample on regular metric data (see benchmarks below)
-- **Crash-safe** — WAL with CRC32C records; kill -9 at any point loses at most uncommitted samples
+- **Crash-safe** — WAL with CRC32C records. Committed data is persisted
 - **Query by label matchers** — equality, negation, regex, negative regex; merged across head and blocks
 - **Levelled compaction** — 2h → 8h → 32h blocks, background merging, retention-based expiry
 - **Self-instrumentation** — the DB records its own metrics (series/chunk counts, compactions, WAL fsync duration) through the normal write path, queryable like any other series
-- **Zero external dependencies** (except testify for tests)
+- **Zero external dependencies**
 
 ## Tools
 
@@ -137,8 +147,6 @@ Most of the design is lifted from Prometheus TSDB — chunk encoding, index form
 The chunk encoding comes from the Gorilla paper (Pelkonen et al., VLDB 2015) via Prometheus, which adapted the bit-width buckets for millisecond timestamps. ingot uses the Prometheus variant.
 
 [tstorage](https://github.com/nakabonne/tstorage) is the closest existing embedded TSDB for Go. It doesn't do Gorilla compression or label-based indexing, which is most of why ingot exists.
-
-I needed a library to store time-series data locally and the options out there didn't quite fit. Prometheus was too heavy for what I needed but I wanted that level of compression. tstorage was close but it didn't have the compression or label indexing.
 
 ## Non-goals
 

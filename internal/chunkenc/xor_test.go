@@ -6,9 +6,8 @@ import (
 	"fmt"
 	"math"
 	"math/rand"
+	"reflect"
 	"testing"
-
-	"github.com/stretchr/testify/assert"
 )
 
 // encodeChunk builds a valid XOR chunk from samples and returns its bytes.
@@ -284,16 +283,28 @@ func TestXORChunk(t *testing.T) {
 			for i, r := range tc.reads {
 				next := it.Next()
 				gotT, gotV := it.At()
-				assert.Equal(t, r.wantNext, next, "read %d Next()", i)
-				assert.Equal(t, r.wantT, gotT, "read %d timestamp", i)
-				assert.Equal(t, r.wantVBits, math.Float64bits(gotV), "read %d value", i)
+				if next != r.wantNext {
+					t.Errorf("read %d Next(): got %v, want %v", i, next, r.wantNext)
+				}
+				if gotT != r.wantT {
+					t.Errorf("read %d timestamp: got %v, want %v", i, gotT, r.wantT)
+				}
+				if math.Float64bits(gotV) != r.wantVBits {
+					t.Errorf("read %d value: got %v, want %v", i, math.Float64bits(gotV), r.wantVBits)
+				}
 			}
-			assert.Equal(t, tc.wantIterErr, it.Err())
+			if it.Err() != tc.wantIterErr {
+				t.Errorf("iter err: got %v, want %v", it.Err(), tc.wantIterErr)
+			}
 
-			assert.LessOrEqual(t, len(tc.data), tc.maxBytes)
+			if !(len(tc.data) <= tc.maxBytes) {
+				t.Errorf("got %v bytes, want <= %v", len(tc.data), tc.maxBytes)
+			}
 
 			_, appErr := c.Appender()
-			assert.Equal(t, tc.wantAppenderErr, appErr)
+			if !reflect.DeepEqual(appErr, tc.wantAppenderErr) {
+				t.Errorf("appender err: got %v, want %v", appErr, tc.wantAppenderErr)
+			}
 		})
 	}
 }
@@ -329,23 +340,39 @@ func TestXORChunkFromBytes(t *testing.T) {
 
 			reconstituted := XORChunkFromBytes(orig.Bytes())
 
-			assert.Equal(t, orig.NumSamples(), reconstituted.NumSamples())
-			assert.Equal(t, orig.Bytes(), reconstituted.Bytes())
+			if orig.NumSamples() != reconstituted.NumSamples() {
+				t.Errorf("NumSamples: got %v, want %v", reconstituted.NumSamples(), orig.NumSamples())
+			}
+			if !reflect.DeepEqual(orig.Bytes(), reconstituted.Bytes()) {
+				t.Errorf("Bytes mismatch")
+			}
 
 			// Verify iteration produces identical samples.
 			it := reconstituted.Iterator()
 			for i, s := range tc.samples {
-				assert.True(t, it.Next(), "sample %d", i)
+				if !it.Next() {
+					t.Errorf("sample %d: expected Next()=true", i)
+				}
 				gotT, gotV := it.At()
-				assert.Equal(t, int64(s[0]), gotT, "sample %d t", i)
-				assert.Equal(t, math.Float64bits(s[1]), math.Float64bits(gotV), "sample %d v", i)
+				if gotT != int64(s[0]) {
+					t.Errorf("sample %d t: got %v, want %v", i, gotT, int64(s[0]))
+				}
+				if math.Float64bits(gotV) != math.Float64bits(s[1]) {
+					t.Errorf("sample %d v: got %v, want %v", i, math.Float64bits(gotV), math.Float64bits(s[1]))
+				}
 			}
-			assert.False(t, it.Next())
-			assert.NoError(t, it.Err())
+			if it.Next() {
+				t.Errorf("expected Next()=false after all samples")
+			}
+			if it.Err() != nil {
+				t.Errorf("unexpected iter error: %v", it.Err())
+			}
 
 			// Appender on non-empty reconstituted chunk should fail.
 			_, err := reconstituted.Appender()
-			assert.Error(t, err)
+			if err == nil {
+				t.Errorf("expected error from Appender on non-empty chunk")
+			}
 		})
 	}
 }
@@ -429,7 +456,9 @@ func TestBytesPerSample(t *testing.T) {
 			c := benchChunk(tc.gen)
 			bps := float64(len(c.Bytes())) / 120.0
 			t.Logf("%s: %.3f bytes/sample (%d bytes total)", tc.name, bps, len(c.Bytes()))
-			assert.LessOrEqual(t, bps, tc.max, "%s bytes/sample exceeds ceiling", tc.name)
+			if !(bps <= tc.max) {
+				t.Errorf("%s bytes/sample exceeds ceiling: got %v, want <= %v", tc.name, bps, tc.max)
+			}
 		})
 	}
 }

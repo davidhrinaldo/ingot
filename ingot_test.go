@@ -3,12 +3,11 @@ package ingot
 import (
 	"math"
 	"os"
+	"reflect"
 	"testing"
 	"time"
 
 	"git.dvdt.dev/david/ingot/labels"
-	"github.com/stretchr/testify/assert"
-	"github.com/stretchr/testify/require"
 )
 
 // sample is a test convenience type.
@@ -92,13 +91,17 @@ func collectSeriesSet(t *testing.T, ss SeriesSet) map[uint64][]sample {
 			st, sv := it.At()
 			samples = append(samples, sample{st, sv})
 		}
-		require.NoError(t, it.Err())
+		if err := it.Err(); err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
 		if len(samples) > 0 {
 			h := labels.Hash(ls)
 			result[h] = samples
 		}
 	}
-	require.NoError(t, ss.Err())
+	if err := ss.Err(); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
 	return result
 }
 
@@ -117,7 +120,9 @@ func oracleByLabelHash(o *oracle, mint, maxt int64, matchers ...*labels.Matcher)
 func openTestDB(t *testing.T) *DB {
 	t.Helper()
 	db, err := Open(t.TempDir(), Options{})
-	require.NoError(t, err)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
 	t.Cleanup(func() { db.Close() })
 	return db
 }
@@ -133,20 +138,28 @@ func TestQueryOracle(t *testing.T) {
 			setup: func(t *testing.T, db *DB, o *oracle) {
 				app := db.Appender()
 				ref, err := app.Append(0, labels.FromStrings("__name__", "temp", "room", "office"), 1000, 71.3)
-				require.NoError(t, err)
+				if err != nil {
+					t.Fatalf("unexpected error: %v", err)
+				}
 				o.addSeries(ref, labels.FromStrings("__name__", "temp", "room", "office"))
 				o.addSample(ref, 1000, 71.3)
 
 				_, err = app.Append(ref, nil, 2000, 71.4)
-				require.NoError(t, err)
+				if err != nil {
+					t.Fatalf("unexpected error: %v", err)
+				}
 				o.addSample(ref, 2000, 71.4)
 
 				ref2, err := app.Append(0, labels.FromStrings("__name__", "humidity", "room", "office"), 1000, 55.0)
-				require.NoError(t, err)
+				if err != nil {
+					t.Fatalf("unexpected error: %v", err)
+				}
 				o.addSeries(ref2, labels.FromStrings("__name__", "humidity", "room", "office"))
 				o.addSample(ref2, 1000, 55.0)
 
-				require.NoError(t, app.Commit())
+				if err := app.Commit(); err != nil {
+					t.Fatalf("unexpected error: %v", err)
+				}
 			},
 			queries: []queryCase{
 				{
@@ -199,19 +212,27 @@ func TestQueryOracle(t *testing.T) {
 				app := db.Appender()
 				// Write enough samples to seal chunks (need >120 for a sealed chunk).
 				ref, err := app.Append(0, labels.FromStrings("__name__", "temp"), 0, 0)
-				require.NoError(t, err)
+				if err != nil {
+					t.Fatalf("unexpected error: %v", err)
+				}
 				o.addSeries(ref, labels.FromStrings("__name__", "temp"))
 				o.addSample(ref, 0, 0)
 				for i := 1; i < 250; i++ {
 					_, err = app.Append(ref, nil, int64(i*15000), float64(i))
-					require.NoError(t, err)
+					if err != nil {
+						t.Fatalf("unexpected error: %v", err)
+					}
 					o.addSample(ref, int64(i*15000), float64(i))
 				}
-				require.NoError(t, app.Commit())
+				if err := app.Commit(); err != nil {
+					t.Fatalf("unexpected error: %v", err)
+				}
 
 				// Flush to block.
 				_, err = db.FlushOlderThan(math.MaxInt64)
-				require.NoError(t, err)
+				if err != nil {
+					t.Fatalf("unexpected error: %v", err)
+				}
 			},
 			queries: []queryCase{
 				{
@@ -233,30 +254,42 @@ func TestQueryOracle(t *testing.T) {
 			setup: func(t *testing.T, db *DB, o *oracle) {
 				app := db.Appender()
 				ref, err := app.Append(0, labels.FromStrings("__name__", "temp", "room", "office"), 0, 0)
-				require.NoError(t, err)
+				if err != nil {
+					t.Fatalf("unexpected error: %v", err)
+				}
 				o.addSeries(ref, labels.FromStrings("__name__", "temp", "room", "office"))
 				o.addSample(ref, 0, 0)
 
 				// Write 250 samples (2 sealed chunks + 10 active).
 				for i := 1; i < 250; i++ {
 					_, err = app.Append(ref, nil, int64(i*15000), float64(i))
-					require.NoError(t, err)
+					if err != nil {
+						t.Fatalf("unexpected error: %v", err)
+					}
 					o.addSample(ref, int64(i*15000), float64(i))
 				}
-				require.NoError(t, app.Commit())
+				if err := app.Commit(); err != nil {
+					t.Fatalf("unexpected error: %v", err)
+				}
 
 				// Flush sealed chunks to block.
 				_, err = db.FlushOlderThan(math.MaxInt64)
-				require.NoError(t, err)
+				if err != nil {
+					t.Fatalf("unexpected error: %v", err)
+				}
 
 				// Append more samples to head (after flush).
 				app = db.Appender()
 				for i := 250; i < 260; i++ {
 					_, err = app.Append(ref, nil, int64(i*15000), float64(i))
-					require.NoError(t, err)
+					if err != nil {
+						t.Fatalf("unexpected error: %v", err)
+					}
 					o.addSample(ref, int64(i*15000), float64(i))
 				}
-				require.NoError(t, app.Commit())
+				if err := app.Commit(); err != nil {
+					t.Fatalf("unexpected error: %v", err)
+				}
 			},
 			queries: []queryCase{
 				{
@@ -300,15 +333,21 @@ func TestQueryOracle(t *testing.T) {
 				app := db.Appender()
 				for _, s := range series {
 					ref, err := app.Append(0, s.ls, 1000, 1.0)
-					require.NoError(t, err)
+					if err != nil {
+						t.Fatalf("unexpected error: %v", err)
+					}
 					o.addSeries(ref, s.ls)
 					o.addSample(ref, 1000, 1.0)
 
 					_, err = app.Append(ref, nil, 2000, 2.0)
-					require.NoError(t, err)
+					if err != nil {
+						t.Fatalf("unexpected error: %v", err)
+					}
 					o.addSample(ref, 2000, 2.0)
 				}
-				require.NoError(t, app.Commit())
+				if err := app.Commit(); err != nil {
+					t.Fatalf("unexpected error: %v", err)
+				}
 			},
 			queries: []queryCase{
 				{
@@ -357,39 +396,57 @@ func TestQueryOracle(t *testing.T) {
 			setup: func(t *testing.T, db *DB, o *oracle) {
 				app := db.Appender()
 				ref, err := app.Append(0, labels.FromStrings("__name__", "temp"), 0, 0)
-				require.NoError(t, err)
+				if err != nil {
+					t.Fatalf("unexpected error: %v", err)
+				}
 				o.addSeries(ref, labels.FromStrings("__name__", "temp"))
 				o.addSample(ref, 0, 0)
 				for i := 1; i < 250; i++ {
 					_, err = app.Append(ref, nil, int64(i*15000), float64(i))
-					require.NoError(t, err)
+					if err != nil {
+						t.Fatalf("unexpected error: %v", err)
+					}
 					o.addSample(ref, int64(i*15000), float64(i))
 				}
-				require.NoError(t, app.Commit())
+				if err := app.Commit(); err != nil {
+					t.Fatalf("unexpected error: %v", err)
+				}
 
 				// First flush.
 				_, err = db.FlushOlderThan(math.MaxInt64)
-				require.NoError(t, err)
+				if err != nil {
+					t.Fatalf("unexpected error: %v", err)
+				}
 
 				// More data -> second flush.
 				app = db.Appender()
 				for i := 250; i < 500; i++ {
 					_, err = app.Append(ref, nil, int64(i*15000), float64(i))
-					require.NoError(t, err)
+					if err != nil {
+						t.Fatalf("unexpected error: %v", err)
+					}
 					o.addSample(ref, int64(i*15000), float64(i))
 				}
-				require.NoError(t, app.Commit())
+				if err := app.Commit(); err != nil {
+					t.Fatalf("unexpected error: %v", err)
+				}
 				_, err = db.FlushOlderThan(math.MaxInt64)
-				require.NoError(t, err)
+				if err != nil {
+					t.Fatalf("unexpected error: %v", err)
+				}
 
 				// Some data in head.
 				app = db.Appender()
 				for i := 500; i < 510; i++ {
 					_, err = app.Append(ref, nil, int64(i*15000), float64(i))
-					require.NoError(t, err)
+					if err != nil {
+						t.Fatalf("unexpected error: %v", err)
+					}
 					o.addSample(ref, int64(i*15000), float64(i))
 				}
-				require.NoError(t, app.Commit())
+				if err := app.Commit(); err != nil {
+					t.Fatalf("unexpected error: %v", err)
+				}
 			},
 			queries: []queryCase{
 				{
@@ -411,10 +468,14 @@ func TestQueryOracle(t *testing.T) {
 			setup: func(t *testing.T, db *DB, o *oracle) {
 				app := db.Appender()
 				ref, err := app.Append(0, labels.FromStrings("__name__", "temp"), 1000, 1.0)
-				require.NoError(t, err)
+				if err != nil {
+					t.Fatalf("unexpected error: %v", err)
+				}
 				o.addSeries(ref, labels.FromStrings("__name__", "temp"))
 				o.addSample(ref, 1000, 1.0)
-				require.NoError(t, app.Commit())
+				if err := app.Commit(); err != nil {
+					t.Fatalf("unexpected error: %v", err)
+				}
 			},
 			queries: []queryCase{
 				{
@@ -443,18 +504,26 @@ func TestQueryOracle(t *testing.T) {
 			for _, qc := range tc.queries {
 				t.Run(qc.name, func(t *testing.T) {
 					q, err := db.Querier(qc.mint, qc.maxt)
-					require.NoError(t, err)
+					if err != nil {
+						t.Fatalf("unexpected error: %v", err)
+					}
 					defer q.Close()
 
 					ss := q.Select(qc.matchers...)
 					got := collectSeriesSet(t, ss)
 					want := oracleByLabelHash(o, qc.mint, qc.maxt, qc.matchers...)
 
-					assert.Equal(t, len(want), len(got), "series count mismatch")
+					if len(got) != len(want) {
+						t.Errorf("series count mismatch: got %v, want %v", len(got), len(want))
+					}
 					for h, wantSamples := range want {
 						gotSamples, ok := got[h]
-						assert.True(t, ok, "missing series with hash %d", h)
-						assert.Equal(t, wantSamples, gotSamples, "sample mismatch for hash %d", h)
+						if !ok {
+							t.Errorf("missing series with hash %d", h)
+						}
+						if !reflect.DeepEqual(gotSamples, wantSamples) {
+							t.Errorf("sample mismatch for hash %d: got %v, want %v", h, gotSamples, wantSamples)
+						}
 					}
 				})
 			}
@@ -483,13 +552,21 @@ func TestDBLifecycle(t *testing.T) {
 			name: "append_and_query_back",
 			setup: func(t *testing.T, dir string) *DB {
 				db, err := Open(dir, Options{})
-				require.NoError(t, err)
+				if err != nil {
+					t.Fatalf("unexpected error: %v", err)
+				}
 				app := db.Appender()
 				ref, err := app.Append(0, labels.FromStrings("__name__", "temp", "room", "office"), 1000, 71.3)
-				require.NoError(t, err)
+				if err != nil {
+					t.Fatalf("unexpected error: %v", err)
+				}
 				_, err = app.Append(ref, nil, 2000, 71.4)
-				require.NoError(t, err)
-				require.NoError(t, app.Commit())
+				if err != nil {
+					t.Fatalf("unexpected error: %v", err)
+				}
+				if err := app.Commit(); err != nil {
+					t.Fatalf("unexpected error: %v", err)
+				}
 				return db
 			},
 			wantSampleCount: 2,
@@ -502,21 +579,35 @@ func TestDBLifecycle(t *testing.T) {
 			name: "reopen_with_blocks",
 			setup: func(t *testing.T, dir string) *DB {
 				db, err := Open(dir, Options{})
-				require.NoError(t, err)
+				if err != nil {
+					t.Fatalf("unexpected error: %v", err)
+				}
 				app := db.Appender()
 				ref, err := app.Append(0, labels.FromStrings("__name__", "temp"), 0, 0)
-				require.NoError(t, err)
+				if err != nil {
+					t.Fatalf("unexpected error: %v", err)
+				}
 				for i := 1; i < 250; i++ {
 					_, err = app.Append(ref, nil, int64(i*15000), float64(i))
-					require.NoError(t, err)
+					if err != nil {
+						t.Fatalf("unexpected error: %v", err)
+					}
 				}
-				require.NoError(t, app.Commit())
+				if err := app.Commit(); err != nil {
+					t.Fatalf("unexpected error: %v", err)
+				}
 				_, err = db.FlushOlderThan(math.MaxInt64)
-				require.NoError(t, err)
-				require.NoError(t, db.Close())
+				if err != nil {
+					t.Fatalf("unexpected error: %v", err)
+				}
+				if err := db.Close(); err != nil {
+					t.Fatalf("unexpected error: %v", err)
+				}
 
 				db2, err := Open(dir, Options{})
-				require.NoError(t, err)
+				if err != nil {
+					t.Fatalf("unexpected error: %v", err)
+				}
 				return db2
 			},
 			wantSampleCount: 250,
@@ -529,7 +620,9 @@ func TestDBLifecycle(t *testing.T) {
 			name: "compacted_blocks_queryable",
 			setup: func(t *testing.T, dir string) *DB {
 				db, err := Open(dir, Options{})
-				require.NoError(t, err)
+				if err != nil {
+					t.Fatalf("unexpected error: %v", err)
+				}
 				const samplesPerBlock = 130
 				ref := uint64(0)
 				for b := 0; b < 4; b++ {
@@ -537,14 +630,22 @@ func TestDBLifecycle(t *testing.T) {
 					for i := 0; i < samplesPerBlock; i++ {
 						ts := int64((b*samplesPerBlock + i) * 15000)
 						r, err := app.Append(ref, labels.FromStrings("__name__", "temp"), ts, float64(ts))
-						require.NoError(t, err)
+						if err != nil {
+							t.Fatalf("unexpected error: %v", err)
+						}
 						ref = r
 					}
-					require.NoError(t, app.Commit())
+					if err := app.Commit(); err != nil {
+						t.Fatalf("unexpected error: %v", err)
+					}
 					_, err := db.FlushOlderThan(math.MaxInt64)
-					require.NoError(t, err)
+					if err != nil {
+						t.Fatalf("unexpected error: %v", err)
+					}
 				}
-				require.NoError(t, db.RunCompaction())
+				if err := db.RunCompaction(); err != nil {
+					t.Fatalf("unexpected error: %v", err)
+				}
 				return db
 			},
 			wantSampleCount: 520,
@@ -561,29 +662,47 @@ func TestDBLifecycle(t *testing.T) {
 					Retention: 24 * time.Hour,
 					Clock:     func() int64 { return now },
 				})
-				require.NoError(t, err)
+				if err != nil {
+					t.Fatalf("unexpected error: %v", err)
+				}
 				// Old data (50 hours ago).
 				app := db.Appender()
 				ref, err := app.Append(0, labels.FromStrings("__name__", "old"), 50*3600*1000, 1.0)
-				require.NoError(t, err)
+				if err != nil {
+					t.Fatalf("unexpected error: %v", err)
+				}
 				for i := 1; i < 250; i++ {
 					_, err = app.Append(ref, nil, int64(50*3600*1000+i*15000), float64(i))
-					require.NoError(t, err)
+					if err != nil {
+						t.Fatalf("unexpected error: %v", err)
+					}
 				}
-				require.NoError(t, app.Commit())
+				if err := app.Commit(); err != nil {
+					t.Fatalf("unexpected error: %v", err)
+				}
 				_, err = db.FlushOlderThan(math.MaxInt64)
-				require.NoError(t, err)
+				if err != nil {
+					t.Fatalf("unexpected error: %v", err)
+				}
 				// Recent data (1 hour ago).
 				app = db.Appender()
 				ref2, err := app.Append(0, labels.FromStrings("__name__", "recent"), 99*3600*1000, 1.0)
-				require.NoError(t, err)
+				if err != nil {
+					t.Fatalf("unexpected error: %v", err)
+				}
 				for i := 1; i < 250; i++ {
 					_, err = app.Append(ref2, nil, int64(99*3600*1000+i*15000), float64(i))
-					require.NoError(t, err)
+					if err != nil {
+						t.Fatalf("unexpected error: %v", err)
+					}
 				}
-				require.NoError(t, app.Commit())
+				if err := app.Commit(); err != nil {
+					t.Fatalf("unexpected error: %v", err)
+				}
 				_, err = db.FlushOlderThan(math.MaxInt64)
-				require.NoError(t, err)
+				if err != nil {
+					t.Fatalf("unexpected error: %v", err)
+				}
 				db.ApplyRetention()
 				return db
 			},
@@ -602,7 +721,9 @@ func TestDBLifecycle(t *testing.T) {
 			defer db.Close()
 
 			q, err := db.Querier(tc.mint, tc.maxt)
-			require.NoError(t, err)
+			if err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
 			defer q.Close()
 
 			ss := q.Select(tc.matchers...)
@@ -614,11 +735,19 @@ func TestDBLifecycle(t *testing.T) {
 				for it.Next() {
 					sampleCount++
 				}
-				require.NoError(t, it.Err())
+				if err := it.Err(); err != nil {
+					t.Fatalf("unexpected error: %v", err)
+				}
 			}
-			require.NoError(t, ss.Err())
-			assert.Equal(t, tc.wantSeriesCount, seriesCount, "series count")
-			assert.Equal(t, tc.wantSampleCount, sampleCount, "sample count")
+			if err := ss.Err(); err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+			if seriesCount != tc.wantSeriesCount {
+				t.Errorf("series count: got %v, want %v", seriesCount, tc.wantSeriesCount)
+			}
+			if sampleCount != tc.wantSampleCount {
+				t.Errorf("sample count: got %v, want %v", sampleCount, tc.wantSampleCount)
+			}
 		})
 	}
 }
@@ -645,7 +774,9 @@ func TestQueryDuringCompaction(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			dir := t.TempDir()
 			db, err := Open(dir, Options{})
-			require.NoError(t, err)
+			if err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
 			defer db.Close()
 
 			ref := uint64(0)
@@ -654,12 +785,18 @@ func TestQueryDuringCompaction(t *testing.T) {
 				for i := 0; i < tc.samplesPerBlock; i++ {
 					ts := int64((b*tc.samplesPerBlock + i) * 15000)
 					r, err := app.Append(ref, labels.FromStrings("__name__", "temp"), ts, float64(ts))
-					require.NoError(t, err)
+					if err != nil {
+						t.Fatalf("unexpected error: %v", err)
+					}
 					ref = r
 				}
-				require.NoError(t, app.Commit())
+				if err := app.Commit(); err != nil {
+					t.Fatalf("unexpected error: %v", err)
+				}
 				_, err := db.FlushOlderThan(math.MaxInt64)
-				require.NoError(t, err)
+				if err != nil {
+					t.Fatalf("unexpected error: %v", err)
+				}
 			}
 
 			// Snapshot source block dirs.
@@ -672,21 +809,31 @@ func TestQueryDuringCompaction(t *testing.T) {
 
 			// Start query holding refs on all blocks.
 			q, err := db.Querier(math.MinInt64, math.MaxInt64)
-			require.NoError(t, err)
+			if err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
 
 			ss := q.Select(labels.MustNewMatcher(labels.MatchEqual, "__name__", "temp"))
-			require.True(t, ss.Next())
+			if !ss.Next() {
+				t.Fatalf("expected true")
+			}
 			it := ss.At().Iterator()
-			require.True(t, it.Next())
+			if !it.Next() {
+				t.Fatalf("expected true")
+			}
 
 			// Compact while query is open.
 			err = db.RunCompaction()
-			require.NoError(t, err)
+			if err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
 
 			// Source dirs still exist (query holds refs).
 			for _, d := range sourceDirs {
 				_, statErr := os.Stat(d)
-				assert.NoError(t, statErr, "source dir should exist while query holds ref")
+				if statErr != nil {
+					t.Errorf("source dir should exist while query holds ref: %v", statErr)
+				}
 			}
 
 			// Finish iterating — all data still readable.
@@ -694,19 +841,29 @@ func TestQueryDuringCompaction(t *testing.T) {
 			for it.Next() {
 				count++
 			}
-			require.NoError(t, it.Err())
-			assert.Equal(t, tc.samplesPerBlock*tc.numBlocks, count, "all samples readable during compaction")
+			if err := it.Err(); err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+			if count != tc.samplesPerBlock*tc.numBlocks {
+				t.Errorf("all samples readable during compaction: got %v, want %v", count, tc.samplesPerBlock*tc.numBlocks)
+			}
 
 			// Close querier — source dirs should be deleted.
-			require.NoError(t, q.Close())
+			if err := q.Close(); err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
 			for _, d := range sourceDirs {
 				_, statErr := os.Stat(d)
-				assert.True(t, os.IsNotExist(statErr), "source dir should be deleted after query close")
+				if !os.IsNotExist(statErr) {
+					t.Errorf("source dir should be deleted after query close")
+				}
 			}
 
 			// Compacted block still queryable.
 			q2, err := db.Querier(math.MinInt64, math.MaxInt64)
-			require.NoError(t, err)
+			if err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
 			defer q2.Close()
 			ss2 := q2.Select(labels.MustNewMatcher(labels.MatchEqual, "__name__", "temp"))
 			count = 0
@@ -715,10 +872,16 @@ func TestQueryDuringCompaction(t *testing.T) {
 				for it2.Next() {
 					count++
 				}
-				require.NoError(t, it2.Err())
+				if err := it2.Err(); err != nil {
+					t.Fatalf("unexpected error: %v", err)
+				}
 			}
-			require.NoError(t, ss2.Err())
-			assert.Equal(t, tc.samplesPerBlock*tc.numBlocks, count, "compacted block has all samples")
+			if err := ss2.Err(); err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+			if count != tc.samplesPerBlock*tc.numBlocks {
+				t.Errorf("compacted block has all samples: got %v, want %v", count, tc.samplesPerBlock*tc.numBlocks)
+			}
 		})
 	}
 }

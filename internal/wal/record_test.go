@@ -3,9 +3,8 @@ package wal
 import (
 	"encoding/binary"
 	"hash/crc32"
+	"reflect"
 	"testing"
-
-	"github.com/stretchr/testify/assert"
 )
 
 func TestRecord(t *testing.T) {
@@ -138,10 +137,18 @@ func TestRecord(t *testing.T) {
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
 			typ, payload, consumed, err := DecodeRecord(tc.data)
-			assert.Equal(t, tc.want.typ, typ, "type")
-			assert.Equal(t, tc.want.payload, payload, "payload")
-			assert.Equal(t, tc.want.consumed, consumed, "consumed")
-			assert.Equal(t, tc.want.err, err, "error")
+			if typ != tc.want.typ {
+				t.Errorf("type: got %v, want %v", typ, tc.want.typ)
+			}
+			if !reflect.DeepEqual(payload, tc.want.payload) {
+				t.Errorf("payload: got %v, want %v", payload, tc.want.payload)
+			}
+			if consumed != tc.want.consumed {
+				t.Errorf("consumed: got %v, want %v", consumed, tc.want.consumed)
+			}
+			if err != tc.want.err {
+				t.Errorf("error: got %v, want %v", err, tc.want.err)
+			}
 		})
 	}
 }
@@ -149,11 +156,17 @@ func TestRecord(t *testing.T) {
 func TestEncodeRecordAppendsToExisting(t *testing.T) {
 	prefix := []byte("existing")
 	result := EncodeRecord(prefix, RecordSeries, []byte{0x01})
-	assert.Equal(t, []byte("existing"), result[:8])
+	if !reflect.DeepEqual([]byte("existing"), result[:8]) {
+		t.Errorf("prefix: got %v, want %v", result[:8], []byte("existing"))
+	}
 
 	_, payload, _, err := DecodeRecord(result[8:])
-	assert.Equal(t, []byte{0x01}, payload)
-	assert.Equal(t, nil, err)
+	if !reflect.DeepEqual([]byte{0x01}, payload) {
+		t.Errorf("payload: got %v, want %v", payload, []byte{0x01})
+	}
+	if err != nil {
+		t.Errorf("error: got %v, want nil", err)
+	}
 }
 
 func TestRecordSize(t *testing.T) {
@@ -167,7 +180,9 @@ func TestRecordSize(t *testing.T) {
 	}
 
 	for _, tc := range tests {
-		assert.Equal(t, tc.want, RecordSize(tc.payloadLen))
+		if got := RecordSize(tc.payloadLen); got != tc.want {
+			t.Errorf("RecordSize(%d): got %v, want %v", tc.payloadLen, got, tc.want)
+		}
 	}
 }
 
@@ -179,5 +194,7 @@ func TestEncodeCRCCoversHeaderAndPayload(t *testing.T) {
 	headerAndPayload := rec[:recordHeaderSize+len(payload)]
 	want := crc32.Checksum(headerAndPayload, castagnoliTable)
 	got := binary.BigEndian.Uint32(rec[recordHeaderSize+len(payload):])
-	assert.Equal(t, want, got)
+	if got != want {
+		t.Errorf("CRC: got %v, want %v", got, want)
+	}
 }

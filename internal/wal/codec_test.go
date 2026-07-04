@@ -3,11 +3,10 @@ package wal
 import (
 	"encoding/binary"
 	"math"
+	"reflect"
 	"testing"
 
 	"git.dvdt.dev/david/ingot/labels"
-	"github.com/stretchr/testify/assert"
-	"github.com/stretchr/testify/require"
 )
 
 func TestSeriesRecord(t *testing.T) {
@@ -140,8 +139,12 @@ func TestSeriesRecord(t *testing.T) {
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
 			rec, err := DecodeSeriesRecord(tc.data)
-			assert.Equal(t, tc.want.rec, rec, "record")
-			assert.Equal(t, tc.want.err, err, "error")
+			if !reflect.DeepEqual(rec, tc.want.rec) {
+				t.Errorf("record: got %v, want %v", rec, tc.want.rec)
+			}
+			if err != tc.want.err {
+				t.Errorf("error: got %v, want %v", err, tc.want.err)
+			}
 		})
 	}
 }
@@ -260,10 +263,16 @@ func TestSamplesRecord(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			samples, err := DecodeSamplesRecord(tc.data)
 			got := samplesToBits(samples)
-			assert.Equal(t, tc.want.err, err, "error")
-			require.Equal(t, len(tc.want.samples), len(got), "sample count")
+			if err != tc.want.err {
+				t.Errorf("error: got %v, want %v", err, tc.want.err)
+			}
+			if len(got) != len(tc.want.samples) {
+				t.Fatalf("sample count: got %d, want %d", len(got), len(tc.want.samples))
+			}
 			for i := range tc.want.samples {
-				assert.Equal(t, tc.want.samples[i], got[i], "sample %d", i)
+				if got[i] != tc.want.samples[i] {
+					t.Errorf("sample %d: got %v, want %v", i, got[i], tc.want.samples[i])
+				}
 			}
 		})
 	}

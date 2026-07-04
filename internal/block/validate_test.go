@@ -8,8 +8,6 @@ import (
 	"testing"
 
 	"git.dvdt.dev/david/ingot/labels"
-	"github.com/stretchr/testify/assert"
-	"github.com/stretchr/testify/require"
 )
 
 func TestValidate(t *testing.T) {
@@ -33,7 +31,9 @@ func TestValidate(t *testing.T) {
 					},
 				}
 				ulid, err := Flush(dir, series)
-				require.NoError(t, err)
+				if err != nil {
+					t.Fatalf("unexpected error: %v", err)
+				}
 				return filepath.Join(dir, ulid)
 			},
 			wantErrors: 0,
@@ -53,7 +53,9 @@ func TestValidate(t *testing.T) {
 					},
 				}
 				ulid, err := Flush(dir, series)
-				require.NoError(t, err)
+				if err != nil {
+					t.Fatalf("unexpected error: %v", err)
+				}
 				blockDir := filepath.Join(dir, ulid)
 				os.Remove(filepath.Join(blockDir, "meta.json"))
 				return blockDir
@@ -75,15 +77,21 @@ func TestValidate(t *testing.T) {
 					},
 				}
 				ulid, err := Flush(dir, series)
-				require.NoError(t, err)
+				if err != nil {
+					t.Fatalf("unexpected error: %v", err)
+				}
 				blockDir := filepath.Join(dir, ulid)
 
 				// Corrupt a byte in the chunk data.
 				chunkPath := filepath.Join(blockDir, "chunks", "000001")
 				data, err := os.ReadFile(chunkPath)
-				require.NoError(t, err)
+				if err != nil {
+					t.Fatalf("unexpected error: %v", err)
+				}
 				data[chunkHeaderLen+chunkEntryHeaderLen+2] ^= 0xFF
-				require.NoError(t, os.WriteFile(chunkPath, data, 0644))
+				if err := os.WriteFile(chunkPath, data, 0644); err != nil {
+					t.Fatalf("unexpected error: %v", err)
+				}
 				return blockDir
 			},
 			wantErrors: 1,
@@ -103,14 +111,20 @@ func TestValidate(t *testing.T) {
 					},
 				}
 				ulid, err := Flush(dir, series)
-				require.NoError(t, err)
+				if err != nil {
+					t.Fatalf("unexpected error: %v", err)
+				}
 				blockDir := filepath.Join(dir, ulid)
 
 				chunkPath := filepath.Join(blockDir, "chunks", "000001")
 				data, err := os.ReadFile(chunkPath)
-				require.NoError(t, err)
+				if err != nil {
+					t.Fatalf("unexpected error: %v", err)
+				}
 				binary.BigEndian.PutUint32(data[:4], 0xDEADBEEF)
-				require.NoError(t, os.WriteFile(chunkPath, data, 0644))
+				if err := os.WriteFile(chunkPath, data, 0644); err != nil {
+					t.Fatalf("unexpected error: %v", err)
+				}
 				return blockDir
 			},
 			wantErrors: 1,
@@ -122,7 +136,9 @@ func TestValidate(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			blockDir := tc.setup(t)
 			errs := Validate(blockDir)
-			assert.Equal(t, tc.wantErrors, len(errs), "error count: %v", errs)
+			if len(errs) != tc.wantErrors {
+				t.Errorf("error count: got %d, want %d: %v", len(errs), tc.wantErrors, errs)
+			}
 
 			// Concatenate all error strings; "" is contained in everything.
 			var combined strings.Builder
@@ -130,7 +146,9 @@ func TestValidate(t *testing.T) {
 				combined.WriteString(e.Error())
 				combined.WriteByte('\n')
 			}
-			assert.Contains(t, combined.String(), tc.wantMatch)
+			if !strings.Contains(combined.String(), tc.wantMatch) {
+				t.Errorf("got %q, want substring %q", combined.String(), tc.wantMatch)
+			}
 		})
 	}
 }
@@ -159,7 +177,9 @@ func TestReadMeta(t *testing.T) {
 						},
 					},
 				})
-				require.NoError(t, err)
+				if err != nil {
+					t.Fatalf("unexpected error: %v", err)
+				}
 				return dir, ulid
 			},
 			wantULID: true,
@@ -175,12 +195,24 @@ func TestReadMeta(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			dir, ulid := tc.setup(t)
 			meta, err := ReadMeta(filepath.Join(dir, ulid))
-			assert.Equal(t, tc.wantErr, err)
-			assert.Equal(t, tc.wantULID, meta.ULID == ulid)
-			assert.Equal(t, tc.wantMinT, meta.MinTime)
-			assert.Equal(t, tc.wantMaxT, meta.MaxTime)
-			assert.Equal(t, tc.wantNSer, meta.Stats.NumSeries)
-			assert.Equal(t, tc.wantNChk, meta.Stats.NumChunks)
+			if err != tc.wantErr {
+				t.Errorf("error: got %v, want %v", err, tc.wantErr)
+			}
+			if (meta.ULID == ulid) != tc.wantULID {
+				t.Errorf("ULID match: got %v, want %v", meta.ULID == ulid, tc.wantULID)
+			}
+			if meta.MinTime != tc.wantMinT {
+				t.Errorf("MinTime: got %v, want %v", meta.MinTime, tc.wantMinT)
+			}
+			if meta.MaxTime != tc.wantMaxT {
+				t.Errorf("MaxTime: got %v, want %v", meta.MaxTime, tc.wantMaxT)
+			}
+			if meta.Stats.NumSeries != tc.wantNSer {
+				t.Errorf("NumSeries: got %v, want %v", meta.Stats.NumSeries, tc.wantNSer)
+			}
+			if meta.Stats.NumChunks != tc.wantNChk {
+				t.Errorf("NumChunks: got %v, want %v", meta.Stats.NumChunks, tc.wantNChk)
+			}
 		})
 	}
 }

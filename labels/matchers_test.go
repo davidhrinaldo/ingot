@@ -1,10 +1,8 @@
 package labels
 
 import (
+	"reflect"
 	"testing"
-
-	"github.com/stretchr/testify/assert"
-	"github.com/stretchr/testify/require"
 )
 
 func TestMatcherMatches(t *testing.T) {
@@ -45,8 +43,12 @@ func TestMatcherMatches(t *testing.T) {
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
 			m, err := NewMatcher(tc.typ, "__name__", tc.pattern)
-			require.NoError(t, err)
-			assert.Equal(t, tc.want, m.Matches(tc.value))
+			if err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+			if got := m.Matches(tc.value); got != tc.want {
+				t.Errorf("got %v, want %v", got, tc.want)
+			}
 		})
 	}
 }
@@ -64,7 +66,9 @@ func TestNewMatcherErrors(t *testing.T) {
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
 			_, err := NewMatcher(tc.typ, "__name__", tc.pattern)
-			assert.Error(t, err)
+			if err == nil {
+				t.Errorf("expected error")
+			}
 		})
 	}
 }
@@ -81,9 +85,18 @@ func TestMustNewMatcherPanics(t *testing.T) {
 
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
-			assert.Panics(t, func() {
+			panicked := false
+			func() {
+				defer func() {
+					if r := recover(); r != nil {
+						panicked = true
+					}
+				}()
 				MustNewMatcher(tc.typ, "__name__", tc.pattern)
-			})
+			}()
+			if !panicked {
+				t.Errorf("expected panic")
+			}
 		})
 	}
 }
@@ -114,7 +127,9 @@ func TestFromStrings(t *testing.T) {
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
 			got := FromStrings(tc.args...)
-			assert.Equal(t, tc.want, got)
+			if !reflect.DeepEqual(got, tc.want) {
+				t.Errorf("got %v, want %v", got, tc.want)
+			}
 		})
 	}
 }
@@ -130,9 +145,18 @@ func TestFromStringsPanics(t *testing.T) {
 
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
-			assert.Panics(t, func() {
+			panicked := false
+			func() {
+				defer func() {
+					if r := recover(); r != nil {
+						panicked = true
+					}
+				}()
 				FromStrings(tc.args...)
-			})
+			}()
+			if !panicked {
+				t.Errorf("expected panic")
+			}
 		})
 	}
 }
@@ -150,7 +174,9 @@ func TestMatchTypeString(t *testing.T) {
 
 	for _, tc := range tests {
 		t.Run(tc.want, func(t *testing.T) {
-			assert.Equal(t, tc.want, tc.typ.String())
+			if got := tc.typ.String(); got != tc.want {
+				t.Errorf("got %v, want %v", got, tc.want)
+			}
 		})
 	}
 }

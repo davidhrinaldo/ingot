@@ -4,14 +4,13 @@ import (
 	"math"
 	"os"
 	"path/filepath"
+	"reflect"
 	"sync"
 	"testing"
 
 	"git.dvdt.dev/david/ingot/internal/block"
 	"git.dvdt.dev/david/ingot/internal/wal"
 	"git.dvdt.dev/david/ingot/labels"
-	"github.com/stretchr/testify/assert"
-	"github.com/stretchr/testify/require"
 )
 
 // sample is a convenience type for expected results.
@@ -31,7 +30,9 @@ func collectSamples(t *testing.T, h *Head, ref uint64, mint, maxt int64) []sampl
 		ts, v := it.At()
 		out = append(out, sample{ts, math.Float64bits(v)})
 	}
-	require.NoError(t, it.Err())
+	if err := it.Err(); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
 	return out
 }
 
@@ -61,7 +62,9 @@ func openHead(t *testing.T) *Head {
 	t.Helper()
 	dir := filepath.Join(t.TempDir(), "wal")
 	h, err := Open(dir, wal.Options{})
-	require.NoError(t, err)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
 	t.Cleanup(func() { h.Close() })
 	return h
 }
@@ -285,22 +288,34 @@ func TestHead(t *testing.T) {
 					app = h.Appender()
 				case actAppend:
 					ref, err := app.Append(act.ref, act.labels, act.t, act.v)
-					assert.Equal(t, act.wantRef, ref, "action %d ref", i)
-					assert.Equal(t, act.wantErr, err, "action %d error", i)
+					if ref != act.wantRef {
+						t.Errorf("action %d ref: got %v, want %v", i, ref, act.wantRef)
+					}
+					if err != act.wantErr {
+						t.Errorf("action %d error: got %v, want %v", i, err, act.wantErr)
+					}
 				case actCommit:
 					err := app.Commit()
-					assert.Equal(t, act.wantErr, err, "action %d commit error", i)
+					if err != act.wantErr {
+						t.Errorf("action %d commit error: got %v, want %v", i, err, act.wantErr)
+					}
 				case actRollback:
 					err := app.Rollback()
-					assert.Equal(t, act.wantErr, err, "action %d rollback error", i)
+					if err != act.wantErr {
+						t.Errorf("action %d rollback error: got %v, want %v", i, err, act.wantErr)
+					}
 				}
 			}
 
 			for ref, wantSamples := range tc.wantSamples {
 				got := collectSamples(t, h, ref, math.MinInt64, math.MaxInt64)
-				require.Equal(t, len(wantSamples), len(got), "ref %d sample count", ref)
+				if len(got) != len(wantSamples) {
+					t.Fatalf("ref %d sample count: got %v, want %v", ref, len(got), len(wantSamples))
+				}
 				for i, want := range wantSamples {
-					assert.Equal(t, want, got[i], "ref %d sample %d", ref, i)
+					if !reflect.DeepEqual(got[i], want) {
+						t.Errorf("ref %d sample %d: got %v, want %v", ref, i, got[i], want)
+					}
 				}
 			}
 		})
@@ -317,14 +332,24 @@ func TestWALReplay(t *testing.T) {
 			name: "basic_recovery",
 			setup: func(t *testing.T, dir string) {
 				h, err := Open(dir, wal.Options{})
-				require.NoError(t, err)
+				if err != nil {
+					t.Fatalf("unexpected error: %v", err)
+				}
 				app := h.Appender()
 				ref, err := app.Append(0, []labels.Label{{Name: "__name__", Value: "temp"}}, 1000, 71.3)
-				require.NoError(t, err)
+				if err != nil {
+					t.Fatalf("unexpected error: %v", err)
+				}
 				_, err = app.Append(ref, nil, 1015, 71.4)
-				require.NoError(t, err)
-				require.NoError(t, app.Commit())
-				require.NoError(t, h.Close())
+				if err != nil {
+					t.Fatalf("unexpected error: %v", err)
+				}
+				if err := app.Commit(); err != nil {
+					t.Fatalf("unexpected error: %v", err)
+				}
+				if err := h.Close(); err != nil {
+					t.Fatalf("unexpected error: %v", err)
+				}
 			},
 			wantSeries: map[uint64][]sample{
 				1: {s(1000, 71.3), s(1015, 71.4)},
@@ -334,14 +359,24 @@ func TestWALReplay(t *testing.T) {
 			name: "multi_series_recovery",
 			setup: func(t *testing.T, dir string) {
 				h, err := Open(dir, wal.Options{})
-				require.NoError(t, err)
+				if err != nil {
+					t.Fatalf("unexpected error: %v", err)
+				}
 				app := h.Appender()
 				_, err = app.Append(0, []labels.Label{{Name: "__name__", Value: "temp"}}, 1000, 71.3)
-				require.NoError(t, err)
+				if err != nil {
+					t.Fatalf("unexpected error: %v", err)
+				}
 				_, err = app.Append(0, []labels.Label{{Name: "__name__", Value: "humidity"}}, 1000, 55.0)
-				require.NoError(t, err)
-				require.NoError(t, app.Commit())
-				require.NoError(t, h.Close())
+				if err != nil {
+					t.Fatalf("unexpected error: %v", err)
+				}
+				if err := app.Commit(); err != nil {
+					t.Fatalf("unexpected error: %v", err)
+				}
+				if err := h.Close(); err != nil {
+					t.Fatalf("unexpected error: %v", err)
+				}
 			},
 			wantSeries: map[uint64][]sample{
 				1: {s(1000, 71.3)},
@@ -352,16 +387,26 @@ func TestWALReplay(t *testing.T) {
 			name: "chunk_sealing_recovery",
 			setup: func(t *testing.T, dir string) {
 				h, err := Open(dir, wal.Options{})
-				require.NoError(t, err)
+				if err != nil {
+					t.Fatalf("unexpected error: %v", err)
+				}
 				app := h.Appender()
 				ref, err := app.Append(0, []labels.Label{{Name: "__name__", Value: "temp"}}, 0, 0)
-				require.NoError(t, err)
+				if err != nil {
+					t.Fatalf("unexpected error: %v", err)
+				}
 				for i := 1; i < 250; i++ {
 					_, err = app.Append(ref, nil, int64(i*15000), float64(i))
-					require.NoError(t, err)
+					if err != nil {
+						t.Fatalf("unexpected error: %v", err)
+					}
 				}
-				require.NoError(t, app.Commit())
-				require.NoError(t, h.Close())
+				if err := app.Commit(); err != nil {
+					t.Fatalf("unexpected error: %v", err)
+				}
+				if err := h.Close(); err != nil {
+					t.Fatalf("unexpected error: %v", err)
+				}
 			},
 			wantSeries: map[uint64][]sample{
 				1: func() []sample {
@@ -377,16 +422,28 @@ func TestWALReplay(t *testing.T) {
 			name: "multiple_commits_recovery",
 			setup: func(t *testing.T, dir string) {
 				h, err := Open(dir, wal.Options{})
-				require.NoError(t, err)
+				if err != nil {
+					t.Fatalf("unexpected error: %v", err)
+				}
 				app := h.Appender()
 				_, err = app.Append(0, []labels.Label{{Name: "__name__", Value: "temp"}}, 1000, 1.0)
-				require.NoError(t, err)
-				require.NoError(t, app.Commit())
+				if err != nil {
+					t.Fatalf("unexpected error: %v", err)
+				}
+				if err := app.Commit(); err != nil {
+					t.Fatalf("unexpected error: %v", err)
+				}
 				app = h.Appender()
 				_, err = app.Append(1, nil, 2000, 2.0)
-				require.NoError(t, err)
-				require.NoError(t, app.Commit())
-				require.NoError(t, h.Close())
+				if err != nil {
+					t.Fatalf("unexpected error: %v", err)
+				}
+				if err := app.Commit(); err != nil {
+					t.Fatalf("unexpected error: %v", err)
+				}
+				if err := h.Close(); err != nil {
+					t.Fatalf("unexpected error: %v", err)
+				}
 			},
 			wantSeries: map[uint64][]sample{
 				1: {s(1000, 1.0), s(2000, 2.0)},
@@ -396,17 +453,29 @@ func TestWALReplay(t *testing.T) {
 			name: "rollback_not_recovered",
 			setup: func(t *testing.T, dir string) {
 				h, err := Open(dir, wal.Options{})
-				require.NoError(t, err)
+				if err != nil {
+					t.Fatalf("unexpected error: %v", err)
+				}
 				app := h.Appender()
 				_, err = app.Append(0, []labels.Label{{Name: "__name__", Value: "temp"}}, 1000, 1.0)
-				require.NoError(t, err)
-				require.NoError(t, app.Commit())
+				if err != nil {
+					t.Fatalf("unexpected error: %v", err)
+				}
+				if err := app.Commit(); err != nil {
+					t.Fatalf("unexpected error: %v", err)
+				}
 				// Second batch is rolled back — should not survive restart.
 				app = h.Appender()
 				_, err = app.Append(1, nil, 2000, 2.0)
-				require.NoError(t, err)
-				require.NoError(t, app.Rollback())
-				require.NoError(t, h.Close())
+				if err != nil {
+					t.Fatalf("unexpected error: %v", err)
+				}
+				if err := app.Rollback(); err != nil {
+					t.Fatalf("unexpected error: %v", err)
+				}
+				if err := h.Close(); err != nil {
+					t.Fatalf("unexpected error: %v", err)
+				}
 			},
 			wantSeries: map[uint64][]sample{
 				1: {s(1000, 1.0)},
@@ -420,14 +489,20 @@ func TestWALReplay(t *testing.T) {
 			tc.setup(t, dir)
 
 			h, err := Open(dir, wal.Options{})
-			require.NoError(t, err)
+			if err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
 			defer h.Close()
 
 			for ref, wantSamples := range tc.wantSeries {
 				got := collectSamples(t, h, ref, math.MinInt64, math.MaxInt64)
-				require.Equal(t, len(wantSamples), len(got), "ref %d sample count", ref)
+				if len(got) != len(wantSamples) {
+					t.Fatalf("ref %d sample count: got %v, want %v", ref, len(got), len(wantSamples))
+				}
 				for i, want := range wantSamples {
-					assert.Equal(t, want, got[i], "ref %d sample %d", ref, i)
+					if !reflect.DeepEqual(got[i], want) {
+						t.Errorf("ref %d sample %d: got %v, want %v", ref, i, got[i], want)
+					}
 				}
 			}
 		})
@@ -493,49 +568,76 @@ func TestFlushOlderThan(t *testing.T) {
 
 			app := h.Appender()
 			ref, err := app.Append(0, []labels.Label{{Name: "__name__", Value: "temp"}}, 0, 0)
-			require.NoError(t, err)
+			if err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
 			for i := 1; i < tc.numSamples; i++ {
 				_, err = app.Append(ref, nil, int64(i*15000), float64(i))
-				require.NoError(t, err)
+				if err != nil {
+					t.Fatalf("unexpected error: %v", err)
+				}
 			}
-			require.NoError(t, app.Commit())
+			if err := app.Commit(); err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
 
 			ulid, err := h.FlushOlderThan(tc.flushMaxT)
-			require.NoError(t, err)
+			if err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
 
 			// Post-flush appends.
 			if tc.postFlushAppend > 0 {
 				app = h.Appender()
 				for i := tc.numSamples; i < tc.numSamples+tc.postFlushAppend; i++ {
 					_, err = app.Append(ref, nil, int64(i*15000), float64(i))
-					require.NoError(t, err)
+					if err != nil {
+						t.Fatalf("unexpected error: %v", err)
+					}
 				}
-				require.NoError(t, app.Commit())
+				if err := app.Commit(); err != nil {
+					t.Fatalf("unexpected error: %v", err)
+				}
 			}
 
 			// Assert ULID presence.
-			assert.Equal(t, tc.wantULID, ulid != "", "block ULID presence")
+			gotULID := ulid != ""
+			if gotULID != tc.wantULID {
+				t.Errorf("block ULID presence: got %v, want %v", gotULID, tc.wantULID)
+			}
 
 			// Assert block contents.
 			blockCount := 0
 			if ulid != "" {
 				blockDir := filepath.Join(h.DataDir(), ulid)
 				br, err := block.Open(blockDir)
-				require.NoError(t, err)
+				if err != nil {
+					t.Fatalf("unexpected error: %v", err)
+				}
 				defer br.Close()
-				assert.Equal(t, tc.wantBlockSeries, br.Meta.Stats.NumSeries, "block series count")
+				if br.Meta.Stats.NumSeries != tc.wantBlockSeries {
+					t.Errorf("block series count: got %v, want %v", br.Meta.Stats.NumSeries, tc.wantBlockSeries)
+				}
 				it, err := br.SeriesChunkIterator(ref, math.MinInt64, math.MaxInt64)
-				require.NoError(t, err)
+				if err != nil {
+					t.Fatalf("unexpected error: %v", err)
+				}
 				for it.Next() {
 					blockCount++
 				}
-				require.NoError(t, it.Err())
+				if err := it.Err(); err != nil {
+					t.Fatalf("unexpected error: %v", err)
+				}
 			}
-			assert.Equal(t, tc.wantBlockCount, blockCount, "block sample count")
+			if blockCount != tc.wantBlockCount {
+				t.Errorf("block sample count: got %v, want %v", blockCount, tc.wantBlockCount)
+			}
 
 			// Assert head still has data.
 			headSamples := collectSamples(t, h, ref, math.MinInt64, math.MaxInt64)
-			assert.GreaterOrEqual(t, len(headSamples), tc.wantHeadCount, "head sample count")
+			if len(headSamples) < tc.wantHeadCount {
+				t.Errorf("head sample count: got %v, want >= %v", len(headSamples), tc.wantHeadCount)
+			}
 		})
 	}
 }
@@ -555,41 +657,65 @@ func TestFlushWALTruncation(t *testing.T) {
 			walDir := filepath.Join(dir, "wal")
 
 			h, err := Open(walDir, wal.Options{})
-			require.NoError(t, err)
+			if err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
 
 			app := h.Appender()
 			ref, err := app.Append(0, []labels.Label{{Name: "__name__", Value: "temp"}}, 0, 0)
-			require.NoError(t, err)
+			if err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
 			_ = ref
 			for i := 1; i < tc.numSamples; i++ {
 				_, err = app.Append(ref, nil, int64(i*15000), float64(i))
-				require.NoError(t, err)
+				if err != nil {
+					t.Fatalf("unexpected error: %v", err)
+				}
 			}
-			require.NoError(t, app.Commit())
+			if err := app.Commit(); err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
 
 			walEntries, err := os.ReadDir(walDir)
-			require.NoError(t, err)
+			if err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
 			segsBefore := len(walEntries)
 
 			_, err = h.FlushOlderThan(math.MaxInt64)
-			require.NoError(t, err)
+			if err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
 
 			walEntries, err = os.ReadDir(walDir)
-			require.NoError(t, err)
+			if err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
 			segsAfter := len(walEntries)
-			assert.LessOrEqual(t, segsAfter, segsBefore, "WAL should be truncated after flush")
+			if segsAfter > segsBefore {
+				t.Errorf("WAL should be truncated after flush: got %v segments after, had %v before", segsAfter, segsBefore)
+			}
 
-			require.NoError(t, h.Close())
+			if err := h.Close(); err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
 
 			// Re-open: head should be functional.
 			h2, err := Open(walDir, wal.Options{})
-			require.NoError(t, err)
+			if err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
 			defer h2.Close()
 
 			app = h2.Appender()
 			_, err = app.Append(0, []labels.Label{{Name: "__name__", Value: "new_series"}}, 5000000, 42.0)
-			require.NoError(t, err)
-			require.NoError(t, app.Commit())
+			if err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+			if err := app.Commit(); err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
 		})
 	}
 }
@@ -600,12 +726,20 @@ func TestHeadPostings(t *testing.T) {
 	// Add three series.
 	app := h.Appender()
 	_, err := app.Append(0, []labels.Label{{Name: "__name__", Value: "temp"}, {Name: "room", Value: "office"}}, 1000, 1.0)
-	require.NoError(t, err)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
 	_, err = app.Append(0, []labels.Label{{Name: "__name__", Value: "humidity"}, {Name: "room", Value: "office"}}, 1000, 2.0)
-	require.NoError(t, err)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
 	_, err = app.Append(0, []labels.Label{{Name: "__name__", Value: "temp"}, {Name: "room", Value: "kitchen"}}, 1000, 3.0)
-	require.NoError(t, err)
-	require.NoError(t, app.Commit())
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if err := app.Commit(); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
 
 	tests := []struct {
 		name     string
@@ -622,7 +756,9 @@ func TestHeadPostings(t *testing.T) {
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
 			got := h.Postings(tc.label, tc.value)
-			assert.Equal(t, tc.wantRefs, got)
+			if !reflect.DeepEqual(got, tc.wantRefs) {
+				t.Errorf("got %v, want %v", got, tc.wantRefs)
+			}
 		})
 	}
 }
@@ -631,8 +767,8 @@ func TestHeadQueryMethods(t *testing.T) {
 	tests := []struct {
 		name            string
 		series          [][]labels.Label
-		wantLabelValues map[string][]string // label name -> expected values
-		wantLabels      map[uint64][]labels.Label // ref -> expected labels
+		wantLabelValues map[string][]string          // label name -> expected values
+		wantLabels      map[uint64][]labels.Label    // ref -> expected labels
 		wantAllPostings []uint64
 	}{
 		{
@@ -677,29 +813,43 @@ func TestHeadQueryMethods(t *testing.T) {
 			app := h.Appender()
 			for _, ls := range tc.series {
 				_, err := app.Append(0, ls, 1000, 1.0)
-				require.NoError(t, err)
+				if err != nil {
+					t.Fatalf("unexpected error: %v", err)
+				}
 			}
-			require.NoError(t, app.Commit())
+			if err := app.Commit(); err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
 
 			// Assert LabelValues.
 			for name, wantVals := range tc.wantLabelValues {
 				got := h.LabelValues(name)
-				assert.Equal(t, wantVals, got, "LabelValues(%q)", name)
+				if !reflect.DeepEqual(got, wantVals) {
+					t.Errorf("LabelValues(%q): got %v, want %v", name, got, wantVals)
+				}
 			}
 
 			// Assert Labels by ref.
 			for ref, wantLabels := range tc.wantLabels {
 				ls, ok := h.Labels(ref)
-				assert.True(t, ok, "Labels(%d) should exist", ref)
-				assert.Equal(t, wantLabels, ls, "Labels(%d)", ref)
+				if !ok {
+					t.Errorf("Labels(%d) should exist", ref)
+				}
+				if !reflect.DeepEqual(ls, wantLabels) {
+					t.Errorf("Labels(%d): got %v, want %v", ref, ls, wantLabels)
+				}
 			}
 
 			// Unknown ref returns false.
 			_, ok := h.Labels(999)
-			assert.False(t, ok, "Labels(999) should not exist")
+			if ok {
+				t.Errorf("Labels(999) should not exist")
+			}
 
 			// Assert AllPostings.
-			assert.Equal(t, tc.wantAllPostings, h.AllPostings(), "AllPostings")
+			if !reflect.DeepEqual(h.AllPostings(), tc.wantAllPostings) {
+				t.Errorf("AllPostings: got %v, want %v", h.AllPostings(), tc.wantAllPostings)
+			}
 		})
 	}
 }
@@ -732,20 +882,30 @@ func TestConcurrentAppend(t *testing.T) {
 						{Name: "goroutine", Value: string(rune('A' + g))},
 					}
 					ref, err := app.Append(0, ls, int64(g*1000000), 0)
-					require.NoError(t, err)
+					if err != nil {
+						t.Errorf("unexpected error: %v", err)
+						return
+					}
 					refs[g] = ref
 					for i := 1; i < tc.samplesPerGoroutine; i++ {
 						_, err = app.Append(ref, nil, int64(g*1000000+i*1000), float64(i))
-						require.NoError(t, err)
+						if err != nil {
+							t.Errorf("unexpected error: %v", err)
+							return
+						}
 					}
-					require.NoError(t, app.Commit())
+					if err := app.Commit(); err != nil {
+						t.Errorf("unexpected error: %v", err)
+					}
 				}(g)
 			}
 			wg.Wait()
 
 			for g := 0; g < tc.numGoroutines; g++ {
 				got := collectSamples(t, h, refs[g], math.MinInt64, math.MaxInt64)
-				assert.Equal(t, tc.samplesPerGoroutine, len(got), "goroutine %d sample count", g)
+				if len(got) != tc.samplesPerGoroutine {
+					t.Errorf("goroutine %d sample count: got %v, want %v", g, len(got), tc.samplesPerGoroutine)
+				}
 			}
 		})
 	}

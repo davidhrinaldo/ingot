@@ -5,13 +5,12 @@ import (
 	"math/rand"
 	"os"
 	"path/filepath"
+	"reflect"
 	"testing"
 
 	"git.dvdt.dev/david/ingot/internal/chunkenc"
 	"git.dvdt.dev/david/ingot/internal/index"
 	"git.dvdt.dev/david/ingot/labels"
-	"github.com/stretchr/testify/assert"
-	"github.com/stretchr/testify/require"
 )
 
 type sample struct {
@@ -26,7 +25,9 @@ func makeChunk(t *testing.T, samples []sample) []byte {
 	t.Helper()
 	c := chunkenc.NewXORChunk()
 	a, err := c.Appender()
-	require.NoError(t, err)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
 	for _, s := range samples {
 		a.Append(s.t, math.Float64frombits(s.vBits))
 	}
@@ -41,7 +42,9 @@ func collectIterator(t *testing.T, it chunkenc.ChunkIterator) []sample {
 		ts, v := it.At()
 		out = append(out, sample{ts, math.Float64bits(v)})
 	}
-	require.NoError(t, it.Err())
+	if err := it.Err(); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
 	return out
 }
 
@@ -137,30 +140,52 @@ func TestBlockRoundTrip(t *testing.T) {
 
 			// Write block.
 			ulid, err := Flush(dataDir, flushData)
-			require.NoError(t, err)
-			require.NotEmpty(t, ulid)
+			if err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+			if ulid == "" {
+				t.Fatalf("got empty ULID")
+			}
 
 			// Open block for reading.
 			blockDir := filepath.Join(dataDir, ulid)
 			r, err := Open(blockDir)
-			require.NoError(t, err)
+			if err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
 			defer r.Close()
 
 			// Verify meta.
-			assert.Equal(t, ulid, r.Meta.ULID)
-			assert.Equal(t, 1, r.Meta.Version)
-			assert.Equal(t, len(tc.series), r.Meta.Stats.NumSeries)
-			assert.Equal(t, len(tc.series), r.Meta.Stats.NumChunks)
+			if got, want := r.Meta.ULID, ulid; got != want {
+				t.Errorf("got %v, want %v", got, want)
+			}
+			if got, want := r.Meta.Version, 1; got != want {
+				t.Errorf("got %v, want %v", got, want)
+			}
+			if got, want := r.Meta.Stats.NumSeries, len(tc.series); got != want {
+				t.Errorf("got %v, want %v", got, want)
+			}
+			if got, want := r.Meta.Stats.NumChunks, len(tc.series); got != want {
+				t.Errorf("got %v, want %v", got, want)
+			}
 
 			// Verify each series' data via iteration.
 			for _, s := range tc.series {
 				it, err := r.SeriesChunkIterator(s.ref, math.MinInt64, math.MaxInt64)
-				require.NoError(t, err)
+				if err != nil {
+					t.Fatalf("unexpected error: %v", err)
+				}
 				got := collectIterator(t, it)
-				require.Equal(t, len(s.samples), len(got), "ref %d sample count", s.ref)
+				if len(got) != len(s.samples) {
+					t.Fatalf("ref %d sample count: got %v, want %v", s.ref, len(got), len(s.samples))
+				}
 				for i, want := range s.samples {
-					assert.Equal(t, want.t, got[i].t, "ref %d sample %d t", s.ref, i)
-					assert.Equal(t, want.vBits, got[i].vBits, "ref %d sample %d v", s.ref, i)
+					if got[i].t != want.t {
+						t.Errorf("ref %d sample %d t: got %v, want %v", s.ref, i, got[i].t, want.t)
+					}
+					if got[i].vBits != want.vBits {
+						t.Errorf("ref %d sample %d v: got %v, want %v", s.ref, i, got[i].vBits, want.vBits)
+					}
 				}
 			}
 
@@ -168,15 +193,28 @@ func TestBlockRoundTrip(t *testing.T) {
 			for _, s := range tc.series {
 				for _, l := range s.labels {
 					refs := r.Postings(l.Name, l.Value)
-					assert.Contains(t, refs, s.ref, "postings for %s=%s", l.Name, l.Value)
+					found := false
+					for _, ref := range refs {
+						if ref == s.ref {
+							found = true
+							break
+						}
+					}
+					if !found {
+						t.Errorf("postings for %s=%s: %v does not contain %d", l.Name, l.Value, refs, s.ref)
+					}
 				}
 			}
 
 			// Verify labels lookup.
 			for _, s := range tc.series {
 				ls, ok := r.Labels(s.ref)
-				assert.True(t, ok)
-				assert.Equal(t, s.labels, ls)
+				if !ok {
+					t.Errorf("Labels(%d) returned ok=false", s.ref)
+				}
+				if !reflect.DeepEqual(ls, s.labels) {
+					t.Errorf("got %v, want %v", ls, s.labels)
+				}
 			}
 		})
 	}
@@ -236,20 +274,32 @@ func TestBlockSeriesChunkIterator(t *testing.T) {
 		},
 	}
 	ulid, err := Flush(dataDir, flushData)
-	require.NoError(t, err)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
 	r, err := Open(filepath.Join(dataDir, ulid))
-	require.NoError(t, err)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
 	defer r.Close()
 
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
 			it, err := r.SeriesChunkIterator(tc.ref, tc.mint, tc.maxt)
-			require.NoError(t, err)
+			if err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
 			got := collectIterator(t, it)
-			assert.Equal(t, len(tc.wantSamples), len(got), "sample count")
+			if len(got) != len(tc.wantSamples) {
+				t.Errorf("sample count: got %v, want %v", len(got), len(tc.wantSamples))
+			}
 			for i, want := range tc.wantSamples {
-				assert.Equal(t, want.t, got[i].t, "sample %d t", i)
-				assert.Equal(t, want.vBits, got[i].vBits, "sample %d v", i)
+				if got[i].t != want.t {
+					t.Errorf("sample %d t: got %v, want %v", i, got[i].t, want.t)
+				}
+				if got[i].vBits != want.vBits {
+					t.Errorf("sample %d v: got %v, want %v", i, got[i].vBits, want.vBits)
+				}
 			}
 		})
 	}
@@ -296,13 +346,21 @@ func TestBlockMetaTimeBounds(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			dataDir := t.TempDir()
 			ulid, err := Flush(dataDir, tc.series)
-			require.NoError(t, err)
+			if err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
 			r, err := Open(filepath.Join(dataDir, ulid))
-			require.NoError(t, err)
+			if err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
 			defer r.Close()
 
-			assert.Equal(t, tc.wantMinT, r.Meta.MinTime, "MinTime")
-			assert.Equal(t, tc.wantMaxT, r.Meta.MaxTime, "MaxTime")
+			if got, want := r.Meta.MinTime, tc.wantMinT; got != want {
+				t.Errorf("MinTime: got %v, want %v", got, want)
+			}
+			if got, want := r.Meta.MaxTime, tc.wantMaxT; got != want {
+				t.Errorf("MaxTime: got %v, want %v", got, want)
+			}
 		})
 	}
 }
@@ -310,11 +368,15 @@ func TestBlockMetaTimeBounds(t *testing.T) {
 func TestULIDRoundTrip(t *testing.T) {
 	for i := 0; i < 100; i++ {
 		u := newULID()
-		assert.Equal(t, 26, len(u), "ULID length")
+		if len(u) != 26 {
+			t.Errorf("ULID length: got %v, want %v", len(u), 26)
+		}
 
 		// Should parse without error.
 		_, err := parseULID(u)
-		assert.NoError(t, err, "parse ULID %q", u)
+		if err != nil {
+			t.Errorf("parse ULID %q: %v", u, err)
+		}
 	}
 }
 
@@ -329,10 +391,14 @@ func TestBlockCorruption(t *testing.T) {
 			corruptFunc: func(t *testing.T, blockDir string, chunkRef index.ChunkRef) {
 				chunkPath := filepath.Join(blockDir, chunksDirName, segmentName(int(chunkRef.Segment())))
 				data, err := os.ReadFile(chunkPath)
-				require.NoError(t, err)
+				if err != nil {
+					t.Fatalf("unexpected error: %v", err)
+				}
 				off := int(chunkRef.Offset()) + chunkEntryHeaderLen + 1
 				data[off] ^= 0xFF
-				require.NoError(t, os.WriteFile(chunkPath, data, 0644))
+				if err := os.WriteFile(chunkPath, data, 0644); err != nil {
+					t.Fatalf("unexpected error: %v", err)
+				}
 			},
 			wantErr: ErrCorruptChunk,
 		},
@@ -341,7 +407,9 @@ func TestBlockCorruption(t *testing.T) {
 			corruptFunc: func(t *testing.T, blockDir string, chunkRef index.ChunkRef) {
 				chunkPath := filepath.Join(blockDir, chunksDirName, segmentName(int(chunkRef.Segment())))
 				data, err := os.ReadFile(chunkPath)
-				require.NoError(t, err)
+				if err != nil {
+					t.Fatalf("unexpected error: %v", err)
+				}
 				// Corrupt the last byte of the CRC.
 				off := int(chunkRef.Offset()) + chunkEntryHeaderLen
 				// Read dataLen to find CRC position.
@@ -349,7 +417,9 @@ func TestBlockCorruption(t *testing.T) {
 					int(data[chunkRef.Offset()+2])*256 + int(data[chunkRef.Offset()+3])
 				crcOff := off + dataLen + 3 // last byte of CRC
 				data[crcOff] ^= 0xFF
-				require.NoError(t, os.WriteFile(chunkPath, data, 0644))
+				if err := os.WriteFile(chunkPath, data, 0644); err != nil {
+					t.Fatalf("unexpected error: %v", err)
+				}
 			},
 			wantErr: ErrCorruptChunk,
 		},
@@ -367,24 +437,34 @@ func TestBlockCorruption(t *testing.T) {
 				},
 			}
 			ulid, err := Flush(dataDir, flushData)
-			require.NoError(t, err)
+			if err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
 
 			blockDir := filepath.Join(dataDir, ulid)
 			r, err := Open(blockDir)
-			require.NoError(t, err)
+			if err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
 			series := r.Series()
-			require.Equal(t, 1, len(series))
+			if len(series) != 1 {
+				t.Fatalf("got %v, want %v", len(series), 1)
+			}
 			chunkRef := series[0].Chunks[0].Ref
 			r.Close()
 
 			tc.corruptFunc(t, blockDir, chunkRef)
 
 			r, err = Open(blockDir)
-			require.NoError(t, err)
+			if err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
 			defer r.Close()
 
 			_, err = r.ChunkIterator(chunkRef)
-			assert.Equal(t, tc.wantErr, err)
+			if err != tc.wantErr {
+				t.Errorf("got %v, want %v", err, tc.wantErr)
+			}
 		})
 	}
 }

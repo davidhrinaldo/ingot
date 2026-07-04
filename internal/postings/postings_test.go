@@ -1,9 +1,8 @@
 package postings
 
 import (
+	"reflect"
 	"testing"
-
-	"github.com/stretchr/testify/assert"
 )
 
 func TestIntersect(t *testing.T) {
@@ -25,7 +24,9 @@ func TestIntersect(t *testing.T) {
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
 			got := Intersect(tc.lists...)
-			assert.Equal(t, tc.want, got)
+			if !reflect.DeepEqual(got, tc.want) {
+				t.Errorf("got %v, want %v", got, tc.want)
+			}
 		})
 	}
 }
@@ -49,7 +50,9 @@ func TestUnion(t *testing.T) {
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
 			got := Union(tc.lists...)
-			assert.Equal(t, tc.want, got)
+			if !reflect.DeepEqual(got, tc.want) {
+				t.Errorf("got %v, want %v", got, tc.want)
+			}
 		})
 	}
 }
@@ -73,7 +76,9 @@ func TestWithout(t *testing.T) {
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
 			got := Without(tc.full, tc.remove)
-			assert.Equal(t, tc.want, got)
+			if !reflect.DeepEqual(got, tc.want) {
+				t.Errorf("got %v, want %v", got, tc.want)
+			}
 		})
 	}
 }

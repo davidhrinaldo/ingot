@@ -2,11 +2,10 @@ package index
 
 import (
 	"bytes"
+	"reflect"
 	"testing"
 
 	"git.dvdt.dev/david/ingot/labels"
-	"github.com/stretchr/testify/assert"
-	"github.com/stretchr/testify/require"
 )
 
 func writeIndex(t *testing.T, entries []SeriesEntry) []byte {
@@ -17,7 +16,9 @@ func writeIndex(t *testing.T, entries []SeriesEntry) []byte {
 		w.AddSeries(e)
 	}
 	_, err := w.WriteTo()
-	require.NoError(t, err)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
 	return buf.Bytes()
 }
 
@@ -81,41 +82,74 @@ func TestIndexRoundTrip(t *testing.T) {
 			data := writeIndex(t, tc.entries)
 
 			r, err := NewReader(data)
-			require.NoError(t, err)
+			if err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
 
 			// Verify series count and content.
 			gotSeries := r.Series()
-			require.Equal(t, len(tc.entries), len(gotSeries))
+			if len(gotSeries) != len(tc.entries) {
+				t.Fatalf("got %v, want %v", len(gotSeries), len(tc.entries))
+			}
 
 			for i, want := range tc.entries {
 				got := gotSeries[i]
-				assert.Equal(t, want.Ref, got.Ref, "series %d ref", i)
-				assert.Equal(t, want.Labels, got.Labels, "series %d labels", i)
-				require.Equal(t, len(want.Chunks), len(got.Chunks), "series %d chunk count", i)
+				if got.Ref != want.Ref {
+					t.Errorf("series %d ref: got %v, want %v", i, got.Ref, want.Ref)
+				}
+				if !reflect.DeepEqual(got.Labels, want.Labels) {
+					t.Errorf("series %d labels: got %v, want %v", i, got.Labels, want.Labels)
+				}
+				if len(got.Chunks) != len(want.Chunks) {
+					t.Fatalf("series %d chunk count: got %v, want %v", i, len(got.Chunks), len(want.Chunks))
+				}
 				for j, wc := range want.Chunks {
-					assert.Equal(t, wc.MinT, got.Chunks[j].MinT, "series %d chunk %d minT", i, j)
-					assert.Equal(t, wc.MaxT, got.Chunks[j].MaxT, "series %d chunk %d maxT", i, j)
-					assert.Equal(t, wc.Ref, got.Chunks[j].Ref, "series %d chunk %d ref", i, j)
+					if got.Chunks[j].MinT != wc.MinT {
+						t.Errorf("series %d chunk %d minT: got %v, want %v", i, j, got.Chunks[j].MinT, wc.MinT)
+					}
+					if got.Chunks[j].MaxT != wc.MaxT {
+						t.Errorf("series %d chunk %d maxT: got %v, want %v", i, j, got.Chunks[j].MaxT, wc.MaxT)
+					}
+					if got.Chunks[j].Ref != wc.Ref {
+						t.Errorf("series %d chunk %d ref: got %v, want %v", i, j, got.Chunks[j].Ref, wc.Ref)
+					}
 				}
 
 				// SeriesByRef lookup.
 				byRef, ok := r.SeriesByRef(want.Ref)
-				assert.True(t, ok, "series %d lookup by ref", i)
-				assert.Equal(t, want.Ref, byRef.Ref)
+				if !ok {
+					t.Errorf("series %d lookup by ref: got false, want true", i)
+				}
+				if byRef.Ref != want.Ref {
+					t.Errorf("got %v, want %v", byRef.Ref, want.Ref)
+				}
 			}
 
 			// Verify postings.
 			for _, e := range tc.entries {
 				for _, l := range e.Labels {
 					refs := r.Postings(l.Name, l.Value)
-					assert.Contains(t, refs, e.Ref, "postings for %s=%s should contain ref %d", l.Name, l.Value, e.Ref)
+					found := false
+					for _, ref := range refs {
+						if ref == e.Ref {
+							found = true
+							break
+						}
+					}
+					if !found {
+						t.Errorf("postings for %s=%s should contain ref %d, got %v", l.Name, l.Value, e.Ref, refs)
+					}
 				}
 			}
 
 			// Verify missing lookups return empty/false.
 			_, ok := r.SeriesByRef(999999)
-			assert.False(t, ok)
-			assert.Nil(t, r.Postings("nonexistent", "value"))
+			if ok {
+				t.Errorf("got true, want false")
+			}
+			if refs := r.Postings("nonexistent", "value"); refs != nil {
+				t.Errorf("got %v, want nil", refs)
+			}
 		})
 	}
 }
@@ -129,13 +163,23 @@ func TestIndexPostingsSorted(t *testing.T) {
 
 	data := writeIndex(t, entries)
 	r, err := NewReader(data)
-	require.NoError(t, err)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
 
 	refs := r.Postings("room", "office")
-	require.Equal(t, 3, len(refs))
-	assert.Equal(t, uint64(2), refs[0])
-	assert.Equal(t, uint64(5), refs[1])
-	assert.Equal(t, uint64(8), refs[2])
+	if len(refs) != 3 {
+		t.Fatalf("got %v, want %v", len(refs), 3)
+	}
+	if refs[0] != uint64(2) {
+		t.Errorf("got %v, want %v", refs[0], uint64(2))
+	}
+	if refs[1] != uint64(5) {
+		t.Errorf("got %v, want %v", refs[1], uint64(5))
+	}
+	if refs[2] != uint64(8) {
+		t.Errorf("got %v, want %v", refs[2], uint64(8))
+	}
 }
 
 func TestIndexChunkRefEncoding(t *testing.T) {
@@ -153,8 +197,12 @@ func TestIndexChunkRefEncoding(t *testing.T) {
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
 			ref := NewChunkRef(tc.segment, tc.offset)
-			assert.Equal(t, tc.segment, ref.Segment())
-			assert.Equal(t, tc.offset, ref.Offset())
+			if ref.Segment() != tc.segment {
+				t.Errorf("got %v, want %v", ref.Segment(), tc.segment)
+			}
+			if ref.Offset() != tc.offset {
+				t.Errorf("got %v, want %v", ref.Offset(), tc.offset)
+			}
 		})
 	}
 }
@@ -168,7 +216,9 @@ func TestIndexLabelValues(t *testing.T) {
 
 	data := writeIndex(t, entries)
 	r, err := NewReader(data)
-	require.NoError(t, err)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
 
 	tests := []struct {
 		name     string
@@ -183,7 +233,9 @@ func TestIndexLabelValues(t *testing.T) {
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
 			got := r.LabelValues(tc.label)
-			assert.Equal(t, tc.wantVals, got)
+			if !reflect.DeepEqual(got, tc.wantVals) {
+				t.Errorf("got %v, want %v", got, tc.wantVals)
+			}
 		})
 	}
 }
@@ -197,10 +249,14 @@ func TestIndexAllPostings(t *testing.T) {
 
 	data := writeIndex(t, entries)
 	r, err := NewReader(data)
-	require.NoError(t, err)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
 
 	refs := r.AllPostings()
-	assert.Equal(t, []uint64{2, 5, 8}, refs)
+	if !reflect.DeepEqual(refs, []uint64{2, 5, 8}) {
+		t.Errorf("got %v, want %v", refs, []uint64{2, 5, 8})
+	}
 }
 
 func TestIndexCorruptData(t *testing.T) {
@@ -246,7 +302,9 @@ func TestIndexCorruptData(t *testing.T) {
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
 			_, err := NewReader(tc.data)
-			assert.Equal(t, tc.wantErr, err)
+			if err != tc.wantErr {
+				t.Errorf("got %v, want %v", err, tc.wantErr)
+			}
 		})
 	}
 }
