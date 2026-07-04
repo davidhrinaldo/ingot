@@ -5,7 +5,7 @@ import (
 	"hash/crc32"
 	"sort"
 
-	"git.dvdt.dev/david/ingot/labels"
+	"github.com/davidhrinaldo/ingot/labels"
 )
 
 // Reader reads an index from a byte slice (typically mmap'd).

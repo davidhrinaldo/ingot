@@ -1,7 +1,7 @@
 package ingot
 
 import (
-	"git.dvdt.dev/david/ingot/labels"
+	"github.com/davidhrinaldo/ingot/labels"
 )
 
 // Self-instrumentation metric names.

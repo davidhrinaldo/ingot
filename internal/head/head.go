@@ -8,10 +8,10 @@ import (
 	"sort"
 	"sync/atomic"
 
-	"git.dvdt.dev/david/ingot/internal/block"
-	"git.dvdt.dev/david/ingot/internal/chunkenc"
-	"git.dvdt.dev/david/ingot/internal/wal"
-	"git.dvdt.dev/david/ingot/labels"
+	"github.com/davidhrinaldo/ingot/internal/block"
+	"github.com/davidhrinaldo/ingot/internal/chunkenc"
+	"github.com/davidhrinaldo/ingot/internal/wal"
+	"github.com/davidhrinaldo/ingot/labels"
 )
 
 // Head is the in-memory store for active series and their chunks.

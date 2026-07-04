@@ -6,7 +6,7 @@ import (
 	"reflect"
 	"testing"
 
-	"git.dvdt.dev/david/ingot/labels"
+	"github.com/davidhrinaldo/ingot/labels"
 )
 
 // collectRecords replays all records from a WAL directory.

@@ -8,8 +8,8 @@ import (
 	"net/http/httptest"
 	"testing"
 
-	"git.dvdt.dev/david/ingot"
-	"git.dvdt.dev/david/ingot/labels"
+	"github.com/davidhrinaldo/ingot"
+	"github.com/davidhrinaldo/ingot/labels"
 )
 
 func openTestDB(t *testing.T) *ingot.DB {

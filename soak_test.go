@@ -10,7 +10,7 @@ import (
 	"testing"
 	"time"
 
-	"git.dvdt.dev/david/ingot/labels"
+	"github.com/davidhrinaldo/ingot/labels"
 )
 
 // TestSoak simulates 48h of ingestion at 15s intervals across 10k series,

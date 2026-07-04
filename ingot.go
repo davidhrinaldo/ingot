@@ -11,13 +11,13 @@ import (
 	"sync/atomic"
 	"time"
 
-	"git.dvdt.dev/david/ingot/internal/block"
-	"git.dvdt.dev/david/ingot/internal/chunkenc"
-	"git.dvdt.dev/david/ingot/internal/compact"
-	"git.dvdt.dev/david/ingot/internal/head"
-	"git.dvdt.dev/david/ingot/internal/postings"
-	"git.dvdt.dev/david/ingot/internal/wal"
-	"git.dvdt.dev/david/ingot/labels"
+	"github.com/davidhrinaldo/ingot/internal/block"
+	"github.com/davidhrinaldo/ingot/internal/chunkenc"
+	"github.com/davidhrinaldo/ingot/internal/compact"
+	"github.com/davidhrinaldo/ingot/internal/head"
+	"github.com/davidhrinaldo/ingot/internal/postings"
+	"github.com/davidhrinaldo/ingot/internal/wal"
+	"github.com/davidhrinaldo/ingot/labels"
 )
 
 // Default compaction level durations in milliseconds.

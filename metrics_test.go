@@ -4,7 +4,7 @@ import (
 	"math"
 	"testing"
 
-	"git.dvdt.dev/david/ingot/labels"
+	"github.com/davidhrinaldo/ingot/labels"
 )
 
 func TestCollectMetrics(t *testing.T) {

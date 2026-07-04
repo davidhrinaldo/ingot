@@ -3,7 +3,7 @@ package head
 import (
 	"sync"
 
-	"git.dvdt.dev/david/ingot/labels"
+	"github.com/davidhrinaldo/ingot/labels"
 )
 
 const numStripes = 128

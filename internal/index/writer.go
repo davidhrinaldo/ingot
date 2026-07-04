@@ -6,7 +6,7 @@ import (
 	"io"
 	"sort"
 
-	"git.dvdt.dev/david/ingot/labels"
+	"github.com/davidhrinaldo/ingot/labels"
 )
 
 var castagnoliTable = crc32.MakeTable(crc32.Castagnoli)

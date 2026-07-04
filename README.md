@@ -51,7 +51,7 @@ I needed a library to store time-series data locally and the options out there d
 ## Install
 
 ```sh
-go get git.dvdt.dev/david/ingot
+go get github.com/davidhrinaldo/ingot
 ```
 
 ## Features

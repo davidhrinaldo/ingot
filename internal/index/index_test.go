@@ -5,7 +5,7 @@ import (
 	"reflect"
 	"testing"
 
-	"git.dvdt.dev/david/ingot/labels"
+	"github.com/davidhrinaldo/ingot/labels"
 )
 
 func writeIndex(t *testing.T, entries []SeriesEntry) []byte {

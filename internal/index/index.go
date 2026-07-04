@@ -11,7 +11,7 @@ package index
 import (
 	"errors"
 
-	"git.dvdt.dev/david/ingot/labels"
+	"github.com/davidhrinaldo/ingot/labels"
 )
 
 const (

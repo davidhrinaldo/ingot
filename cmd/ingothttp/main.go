@@ -19,7 +19,7 @@ import (
 	"os/signal"
 	"syscall"
 
-	"git.dvdt.dev/david/ingot"
+	"github.com/davidhrinaldo/ingot"
 )
 
 func main() {

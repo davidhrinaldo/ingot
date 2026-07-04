@@ -7,7 +7,7 @@ import (
 	"testing"
 	"time"
 
-	"git.dvdt.dev/david/ingot/labels"
+	"github.com/davidhrinaldo/ingot/labels"
 )
 
 // sample is a test convenience type.

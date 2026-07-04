@@ -3,8 +3,8 @@ package head
 import (
 	"sync"
 
-	"git.dvdt.dev/david/ingot/internal/chunkenc"
-	"git.dvdt.dev/david/ingot/labels"
+	"github.com/davidhrinaldo/ingot/internal/chunkenc"
+	"github.com/davidhrinaldo/ingot/labels"
 )
 
 const samplesPerChunk = 120

@@ -6,9 +6,9 @@ import (
 	"strings"
 	"testing"
 
-	"git.dvdt.dev/david/ingot/internal/block"
-	"git.dvdt.dev/david/ingot/internal/chunkenc"
-	"git.dvdt.dev/david/ingot/labels"
+	"github.com/davidhrinaldo/ingot/internal/block"
+	"github.com/davidhrinaldo/ingot/internal/chunkenc"
+	"github.com/davidhrinaldo/ingot/labels"
 )
 
 func makeChunk(t *testing.T, samples []struct{ t int64; v float64 }) []byte {

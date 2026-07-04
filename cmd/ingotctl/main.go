@@ -19,9 +19,9 @@ import (
 	"text/tabwriter"
 	"time"
 
-	"git.dvdt.dev/david/ingot/internal/block"
-	"git.dvdt.dev/david/ingot/internal/index"
-	"git.dvdt.dev/david/ingot/labels"
+	"github.com/davidhrinaldo/ingot/internal/block"
+	"github.com/davidhrinaldo/ingot/internal/index"
+	"github.com/davidhrinaldo/ingot/labels"
 )
 
 func main() {

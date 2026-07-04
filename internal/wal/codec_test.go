@@ -6,7 +6,7 @@ import (
 	"reflect"
 	"testing"
 
-	"git.dvdt.dev/david/ingot/labels"
+	"github.com/davidhrinaldo/ingot/labels"
 )
 
 func TestSeriesRecord(t *testing.T) {

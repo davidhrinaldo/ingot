@@ -10,8 +10,8 @@ import (
 	"sort"
 	"syscall"
 
-	"git.dvdt.dev/david/ingot/internal/chunkenc"
-	"git.dvdt.dev/david/ingot/internal/index"
+	"github.com/davidhrinaldo/ingot/internal/chunkenc"
+	"github.com/davidhrinaldo/ingot/internal/index"
 )
 
 var (

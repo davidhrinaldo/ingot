@@ -7,7 +7,7 @@ import (
 	"os"
 	"path/filepath"
 
-	"git.dvdt.dev/david/ingot/internal/index"
+	"github.com/davidhrinaldo/ingot/internal/index"
 )
 
 // ValidationError describes a single integrity issue found during validation.

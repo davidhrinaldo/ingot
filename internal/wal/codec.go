@@ -5,7 +5,7 @@ import (
 	"errors"
 	"math"
 
-	"git.dvdt.dev/david/ingot/labels"
+	"github.com/davidhrinaldo/ingot/labels"
 )
 
 var ErrShortPayload = errors.New("wal: payload too short")

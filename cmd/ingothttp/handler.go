@@ -7,8 +7,8 @@ import (
 	"net/http"
 	"strconv"
 
-	"git.dvdt.dev/david/ingot"
-	"git.dvdt.dev/david/ingot/labels"
+	"github.com/davidhrinaldo/ingot"
+	"github.com/davidhrinaldo/ingot/labels"
 )
 
 type handler struct {

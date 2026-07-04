@@ -7,7 +7,7 @@ import (
 	"strings"
 	"testing"
 
-	"git.dvdt.dev/david/ingot/labels"
+	"github.com/davidhrinaldo/ingot/labels"
 )
 
 func TestValidate(t *testing.T) {

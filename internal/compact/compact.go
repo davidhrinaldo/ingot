@@ -5,8 +5,8 @@ import (
 	"fmt"
 	"sort"
 
-	"git.dvdt.dev/david/ingot/internal/block"
-	"git.dvdt.dev/david/ingot/labels"
+	"github.com/davidhrinaldo/ingot/internal/block"
+	"github.com/davidhrinaldo/ingot/labels"
 )
 
 // Clock returns the current time in milliseconds since epoch.

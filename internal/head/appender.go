@@ -3,8 +3,8 @@ package head
 import (
 	"errors"
 
-	"git.dvdt.dev/david/ingot/internal/wal"
-	"git.dvdt.dev/david/ingot/labels"
+	"github.com/davidhrinaldo/ingot/internal/wal"
+	"github.com/davidhrinaldo/ingot/labels"
 )
 
 var (
