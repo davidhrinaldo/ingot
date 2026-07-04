@@ -8,6 +8,7 @@ import (
 	"path/filepath"
 	"sort"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"git.dvdt.dev/david/ingot/internal/block"
@@ -37,6 +38,9 @@ type DB struct {
 	compactCtx    context.Context
 	compactCancel context.CancelFunc
 	compactWg     sync.WaitGroup
+
+	compactionCount atomic.Int64  // incremented on each successful compaction
+	metricsR        metricsRefs   // cached series refs for self-instrumentation
 }
 
 // Options configures a DB.
@@ -237,6 +241,7 @@ func (db *DB) RunCompaction() error {
 		}
 	}
 
+	db.compactionCount.Add(1)
 	return nil
 }
 
@@ -292,6 +297,7 @@ func (db *DB) compactLoop() {
 		case <-db.compactCtx.Done():
 			return
 		case <-ticker.C:
+			db.collectMetrics()
 			db.autoFlush()
 			db.RunCompaction()
 			db.ApplyRetention()
@@ -304,6 +310,28 @@ func (db *DB) autoFlush() {
 	now := db.opts.clock()()
 	cutoff := now - db.opts.blockDurationMs()
 	db.FlushOlderThan(cutoff)
+}
+
+// DBStats holds summary statistics for the database.
+type DBStats struct {
+	HeadSeries  int
+	HeadChunks  int
+	Blocks      int
+	Compactions int
+}
+
+// Stats returns a snapshot of database statistics.
+func (db *DB) Stats() DBStats {
+	hs := db.head.Stats()
+	db.mu.RLock()
+	numBlocks := len(db.blocks)
+	db.mu.RUnlock()
+	return DBStats{
+		HeadSeries:  hs.NumSeries,
+		HeadChunks:  hs.NumActiveChunks,
+		Blocks:      numBlocks,
+		Compactions: int(db.compactionCount.Load()),
+	}
 }
 
 // Close closes the DB, releasing all resources.

@@ -3,6 +3,7 @@ package wal
 import (
 	"os"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -45,6 +46,8 @@ type WAL struct {
 	segmentIdx int
 	segmentOff int64
 	buf        []byte
+
+	lastSyncDur atomic.Int64 // nanoseconds of last fsync
 
 	done chan struct{}
 	wg   sync.WaitGroup
@@ -164,7 +167,21 @@ func (w *WAL) Replay() (*Reader, error) {
 func (w *WAL) Sync() error {
 	w.mu.Lock()
 	defer w.mu.Unlock()
-	return w.segment.Sync()
+	return w.timedSync()
+}
+
+// LastSyncDuration returns the duration of the most recent fsync in seconds.
+func (w *WAL) LastSyncDuration() float64 {
+	ns := w.lastSyncDur.Load()
+	return float64(ns) / 1e9
+}
+
+// timedSync fsyncs the segment and records the duration. Caller must hold w.mu.
+func (w *WAL) timedSync() error {
+	start := time.Now()
+	err := w.segment.Sync()
+	w.lastSyncDur.Store(int64(time.Since(start)))
+	return err
 }
 
 // Truncate deletes all segments with index less than below.
@@ -244,7 +261,7 @@ func (w *WAL) syncLoop(interval time.Duration) {
 			return
 		case <-ticker.C:
 			w.mu.Lock()
-			w.segment.Sync()
+			w.timedSync()
 			w.mu.Unlock()
 		}
 	}

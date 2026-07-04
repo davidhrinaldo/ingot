@@ -272,3 +272,29 @@ func (h *Head) AllPostings() []uint64 {
 func (h *Head) DataDir() string {
 	return h.dataDir
 }
+
+// Stats returns a snapshot of head statistics.
+func (h *Head) Stats() HeadStats {
+	var s HeadStats
+	h.series.forEach(func(ms *memSeries) {
+		s.NumSeries++
+		ms.mu.Lock()
+		if ms.chunk != nil && ms.chunk.NumSamples() > 0 {
+			s.NumActiveChunks++
+		}
+		s.NumActiveChunks += len(ms.sealed)
+		ms.mu.Unlock()
+	})
+	return s
+}
+
+// HeadStats holds a snapshot of head statistics.
+type HeadStats struct {
+	NumSeries      int
+	NumActiveChunks int
+}
+
+// WALSyncDuration returns the duration of the most recent WAL fsync in seconds.
+func (h *Head) WALSyncDuration() float64 {
+	return h.wal.LastSyncDuration()
+}
