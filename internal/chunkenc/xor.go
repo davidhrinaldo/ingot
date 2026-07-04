@@ -28,6 +28,15 @@ func NewXORChunk() *XORChunk {
 	return &XORChunk{b: bstream{stream: make([]byte, 2), count: 0}}
 }
 
+// XORChunkFromBytes creates a read-only XORChunk from raw bytes.
+// The data must include the 2-byte sample count header (as returned by Bytes).
+// The returned chunk supports Iterator, NumSamples, and Bytes but not Appender.
+func XORChunkFromBytes(data []byte) *XORChunk {
+	cp := make([]byte, len(data))
+	copy(cp, data)
+	return &XORChunk{b: bstream{stream: cp}}
+}
+
 func (c *XORChunk) NumSamples() int {
 	return int(binary.BigEndian.Uint16(c.b.bytes()))
 }

@@ -70,6 +70,18 @@ func (sm *seriesMap) set(hash uint64, s *memSeries) {
 	rs.mu.Unlock()
 }
 
+// forEach calls fn for every series in the map. The series lock is NOT held.
+func (sm *seriesMap) forEach(fn func(s *memSeries)) {
+	for i := range sm.refStripes {
+		rs := &sm.refStripes[i]
+		rs.mu.RLock()
+		for _, s := range rs.m {
+			fn(s)
+		}
+		rs.mu.RUnlock()
+	}
+}
+
 // remove deletes a series from both maps.
 func (sm *seriesMap) remove(hash uint64, s *memSeries) {
 	hs := &sm.hashStripes[hash%numStripes]

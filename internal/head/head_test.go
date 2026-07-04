@@ -2,10 +2,12 @@ package head
 
 import (
 	"math"
+	"os"
 	"path/filepath"
 	"sync"
 	"testing"
 
+	"git.dvdt.dev/david/ingot/internal/block"
 	"git.dvdt.dev/david/ingot/internal/wal"
 	"git.dvdt.dev/david/ingot/labels"
 	"github.com/stretchr/testify/assert"
@@ -430,6 +432,181 @@ func TestWALReplay(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestFlushOlderThan(t *testing.T) {
+	tests := []struct {
+		name            string
+		numSamples      int // samples per series (each at 15s intervals)
+		flushMaxT       int64
+		wantBlockSeries int // number of series in the block
+		wantBlockExists bool
+	}{
+		{
+			name:            "flush_sealed_chunks",
+			numSamples:      250, // 2 sealed chunks (120 each) + 10 active
+			flushMaxT:       math.MaxInt64,
+			wantBlockSeries: 1,
+			wantBlockExists: true,
+		},
+		{
+			name:            "nothing_to_flush",
+			numSamples:      50, // only active chunk, no sealed
+			flushMaxT:       math.MaxInt64,
+			wantBlockSeries: 0,
+			wantBlockExists: false,
+		},
+		{
+			name:            "partial_flush_by_time",
+			numSamples:      250,
+			flushMaxT:       120 * 15000, // only flush first sealed chunk
+			wantBlockSeries: 1,
+			wantBlockExists: true,
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			h := openHead(t)
+
+			// Append samples.
+			app := h.Appender()
+			ref, err := app.Append(0, []labels.Label{{Name: "__name__", Value: "temp"}}, 0, 0)
+			require.NoError(t, err)
+			for i := 1; i < tc.numSamples; i++ {
+				_, err = app.Append(ref, nil, int64(i*15000), float64(i))
+				require.NoError(t, err)
+			}
+			require.NoError(t, app.Commit())
+
+			// Flush.
+			ulid, err := h.FlushOlderThan(tc.flushMaxT)
+			require.NoError(t, err)
+
+			if !tc.wantBlockExists {
+				assert.Empty(t, ulid)
+				return
+			}
+
+			assert.NotEmpty(t, ulid)
+
+			// Verify block exists and is readable.
+			blockDir := filepath.Join(h.DataDir(), ulid)
+			br, err := block.Open(blockDir)
+			require.NoError(t, err)
+			defer br.Close()
+
+			assert.Equal(t, tc.wantBlockSeries, br.Meta.Stats.NumSeries)
+
+			// Verify block data is correct by iterating.
+			if tc.wantBlockSeries > 0 {
+				it, err := br.SeriesChunkIterator(ref, math.MinInt64, math.MaxInt64)
+				require.NoError(t, err)
+				count := 0
+				for it.Next() {
+					count++
+				}
+				require.NoError(t, it.Err())
+				assert.Greater(t, count, 0, "block should contain samples")
+			}
+
+			// Head should still have its active chunk data.
+			allSamples := collectSamples(t, h, ref, math.MinInt64, math.MaxInt64)
+			assert.Greater(t, len(allSamples), 0, "head should still have active chunk")
+		})
+	}
+}
+
+func TestFlushThenContinueAppending(t *testing.T) {
+	h := openHead(t)
+
+	// Append enough to seal two chunks (240 samples), plus a few more.
+	app := h.Appender()
+	ref, err := app.Append(0, []labels.Label{{Name: "__name__", Value: "temp"}}, 0, 0)
+	require.NoError(t, err)
+	for i := 1; i < 250; i++ {
+		_, err = app.Append(ref, nil, int64(i*15000), float64(i))
+		require.NoError(t, err)
+	}
+	require.NoError(t, app.Commit())
+
+	// Flush sealed chunks.
+	ulid, err := h.FlushOlderThan(math.MaxInt64)
+	require.NoError(t, err)
+	require.NotEmpty(t, ulid)
+
+	// Continue appending after flush.
+	app = h.Appender()
+	for i := 250; i < 260; i++ {
+		_, err = app.Append(ref, nil, int64(i*15000), float64(i))
+		require.NoError(t, err)
+	}
+	require.NoError(t, app.Commit())
+
+	// Head should have the active chunk data (unflushed).
+	allSamples := collectSamples(t, h, ref, math.MinInt64, math.MaxInt64)
+	assert.Greater(t, len(allSamples), 0)
+
+	// Block should have the flushed data.
+	blockDir := filepath.Join(h.DataDir(), ulid)
+	br, err := block.Open(blockDir)
+	require.NoError(t, err)
+	defer br.Close()
+
+	it, err := br.SeriesChunkIterator(ref, math.MinInt64, math.MaxInt64)
+	require.NoError(t, err)
+	blockCount := 0
+	for it.Next() {
+		blockCount++
+	}
+	require.NoError(t, it.Err())
+	assert.Equal(t, 240, blockCount, "block should contain 2 sealed chunks of 120 samples each")
+}
+
+func TestFlushWALTruncation(t *testing.T) {
+	dir := t.TempDir()
+	walDir := filepath.Join(dir, "wal")
+
+	h, err := Open(walDir, wal.Options{})
+	require.NoError(t, err)
+
+	// Append enough to seal chunks.
+	app := h.Appender()
+	ref, err := app.Append(0, []labels.Label{{Name: "__name__", Value: "temp"}}, 0, 0)
+	require.NoError(t, err)
+	for i := 1; i < 250; i++ {
+		_, err = app.Append(ref, nil, int64(i*15000), float64(i))
+		require.NoError(t, err)
+	}
+	require.NoError(t, app.Commit())
+
+	// Count WAL segments before flush.
+	walEntries, err := os.ReadDir(walDir)
+	require.NoError(t, err)
+	segsBefore := len(walEntries)
+
+	// Flush.
+	_, err = h.FlushOlderThan(math.MaxInt64)
+	require.NoError(t, err)
+
+	// WAL segments should have been truncated (or at least not grown).
+	walEntries, err = os.ReadDir(walDir)
+	require.NoError(t, err)
+	segsAfter := len(walEntries)
+	assert.LessOrEqual(t, segsAfter, segsBefore, "WAL should be truncated after flush")
+
+	require.NoError(t, h.Close())
+
+	// Re-open: head should recover from WAL (only unflushed data).
+	h2, err := Open(walDir, wal.Options{})
+	require.NoError(t, err)
+	defer h2.Close()
+
+	// The re-opened head should be functional.
+	app = h2.Appender()
+	_, err = app.Append(0, []labels.Label{{Name: "__name__", Value: "new_series"}}, 5000000, 42.0)
+	require.NoError(t, err)
+	require.NoError(t, app.Commit())
 }
 
 func TestConcurrentAppend(t *testing.T) {

@@ -298,6 +298,58 @@ func TestXORChunk(t *testing.T) {
 	}
 }
 
+func TestXORChunkFromBytes(t *testing.T) {
+	rnd := rand.New(rand.NewSource(99))
+
+	tests := []struct {
+		name    string
+		samples [][2]float64
+	}{
+		{"single", [][2]float64{{1000, 71.3}}},
+		{"two", [][2]float64{{1000, 71.3}, {1015, 71.4}}},
+		{"full_chunk", func() [][2]float64 {
+			out := make([][2]float64, 120)
+			ts, v := int64(0), 70.0
+			for i := range out {
+				out[i] = [2]float64{float64(ts), v}
+				ts += 15000 + int64(rnd.Intn(100)) - 50
+				v += rnd.Float64() - 0.5
+			}
+			return out
+		}()},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			orig := NewXORChunk()
+			a, _ := orig.Appender()
+			for _, s := range tc.samples {
+				a.Append(int64(s[0]), s[1])
+			}
+
+			reconstituted := XORChunkFromBytes(orig.Bytes())
+
+			assert.Equal(t, orig.NumSamples(), reconstituted.NumSamples())
+			assert.Equal(t, orig.Bytes(), reconstituted.Bytes())
+
+			// Verify iteration produces identical samples.
+			it := reconstituted.Iterator()
+			for i, s := range tc.samples {
+				assert.True(t, it.Next(), "sample %d", i)
+				gotT, gotV := it.At()
+				assert.Equal(t, int64(s[0]), gotT, "sample %d t", i)
+				assert.Equal(t, math.Float64bits(s[1]), math.Float64bits(gotV), "sample %d v", i)
+			}
+			assert.False(t, it.Next())
+			assert.NoError(t, it.Err())
+
+			// Appender on non-empty reconstituted chunk should fail.
+			_, err := reconstituted.Appender()
+			assert.Error(t, err)
+		})
+	}
+}
+
 func FuzzXORIterator(f *testing.F) {
 	c := NewXORChunk()
 	a, _ := c.Appender()

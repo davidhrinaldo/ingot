@@ -4,8 +4,10 @@ package head
 
 import (
 	"fmt"
+	"path/filepath"
 	"sync/atomic"
 
+	"git.dvdt.dev/david/ingot/internal/block"
 	"git.dvdt.dev/david/ingot/internal/chunkenc"
 	"git.dvdt.dev/david/ingot/internal/wal"
 	"git.dvdt.dev/david/ingot/labels"
@@ -13,6 +15,7 @@ import (
 
 // Head is the in-memory store for active series and their chunks.
 type Head struct {
+	dataDir string // parent directory containing WAL and block dirs
 	series  *seriesMap
 	wal     *wal.WAL
 	nextRef atomic.Uint64
@@ -23,6 +26,7 @@ type Head struct {
 }
 
 // Open creates or recovers a Head backed by a WAL in walDir.
+// The dataDir (parent of walDir) is used for writing blocks.
 func Open(walDir string, walOpts wal.Options) (*Head, error) {
 	w, err := wal.Open(walDir, walOpts)
 	if err != nil {
@@ -30,8 +34,9 @@ func Open(walDir string, walOpts wal.Options) (*Head, error) {
 	}
 
 	h := &Head{
-		series: newSeriesMap(),
-		wal:    w,
+		dataDir: filepath.Dir(walDir),
+		series:  newSeriesMap(),
+		wal:     w,
 	}
 
 	if err := h.replay(); err != nil {
@@ -144,4 +149,72 @@ func (h *Head) MaxTime() int64 { return h.maxTime.Load() }
 // Close syncs and closes the WAL.
 func (h *Head) Close() error {
 	return h.wal.Close()
+}
+
+// FlushOlderThan collects all sealed chunks with maxT <= threshold from all
+// series, writes them to an immutable block, and truncates the WAL.
+//
+// The ordering invariant is enforced: block fsync -> meta.json write -> WAL truncate.
+// Returns the block ULID (empty string if nothing to flush) and any error.
+func (h *Head) FlushOlderThan(maxT int64) (string, error) {
+	var flushData []block.SeriesFlush
+
+	h.series.forEach(func(s *memSeries) {
+		s.mu.Lock()
+		defer s.mu.Unlock()
+
+		var toFlush []chunkMeta
+		var remaining []chunkMeta
+		for _, cm := range s.sealed {
+			if cm.maxT <= maxT {
+				toFlush = append(toFlush, cm)
+			} else {
+				remaining = append(remaining, cm)
+			}
+		}
+		if len(toFlush) == 0 {
+			return
+		}
+
+		sf := block.SeriesFlush{
+			Ref:    s.ref,
+			Labels: s.labels,
+		}
+		for _, cm := range toFlush {
+			sf.Chunks = append(sf.Chunks, block.ChunkData{
+				MinT: cm.minT,
+				MaxT: cm.maxT,
+				Data: append([]byte(nil), cm.chunk.Bytes()...),
+			})
+		}
+		flushData = append(flushData, sf)
+
+		// Clear flushed chunks from the series.
+		s.sealed = remaining
+	})
+
+	if len(flushData) == 0 {
+		return "", nil
+	}
+
+	// Write block. Flush handles: chunk files + index + fsync + meta.json.
+	ulid, err := block.Flush(h.dataDir, flushData)
+	if err != nil {
+		return "", fmt.Errorf("head: flush block: %w", err)
+	}
+
+	// WAL truncation: safe because the block is fully fsynced.
+	// Truncate all segments below the current one — the flushed data is now
+	// in the block and doesn't need WAL replay.
+	lastSeg := h.wal.LastSegment()
+	if err := h.wal.Truncate(lastSeg); err != nil {
+		return ulid, fmt.Errorf("head: truncate WAL: %w", err)
+	}
+
+	return ulid, nil
+}
+
+// DataDir returns the data directory (parent of WAL dir).
+func (h *Head) DataDir() string {
+	return h.dataDir
 }
