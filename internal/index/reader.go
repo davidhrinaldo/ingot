@@ -3,6 +3,7 @@ package index
 import (
 	"encoding/binary"
 	"hash/crc32"
+	"sort"
 
 	"git.dvdt.dev/david/ingot/labels"
 )
@@ -212,4 +213,30 @@ func (r *Reader) SeriesByRef(ref uint64) (SeriesEntry, bool) {
 // Postings returns sorted series refs for the given label pair.
 func (r *Reader) Postings(name, value string) []uint64 {
 	return r.postings[labelPair{name, value}]
+}
+
+// LabelValues returns sorted unique values for the given label name.
+func (r *Reader) LabelValues(name string) []string {
+	seen := make(map[string]struct{})
+	for key := range r.postings {
+		if key.name == name {
+			seen[key.value] = struct{}{}
+		}
+	}
+	vals := make([]string, 0, len(seen))
+	for v := range seen {
+		vals = append(vals, v)
+	}
+	sort.Strings(vals)
+	return vals
+}
+
+// AllPostings returns sorted refs for all series in the index.
+func (r *Reader) AllPostings() []uint64 {
+	refs := make([]uint64, len(r.series))
+	for i, s := range r.series {
+		refs[i] = s.Ref
+	}
+	sort.Slice(refs, func(i, j int) bool { return refs[i] < refs[j] })
+	return refs
 }

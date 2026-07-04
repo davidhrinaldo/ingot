@@ -105,6 +105,16 @@ func (r *Reader) Labels(ref uint64) ([]labels.Label, bool) {
 	return entry.Labels, true
 }
 
+// LabelValues returns sorted unique values for the given label name.
+func (r *Reader) LabelValues(name string) []string {
+	return r.idx.LabelValues(name)
+}
+
+// AllPostings returns sorted refs for all series in the block.
+func (r *Reader) AllPostings() []uint64 {
+	return r.idx.AllPostings()
+}
+
 // Close releases all resources (munmaps chunk files).
 func (r *Reader) Close() error {
 	return r.chunks.close()

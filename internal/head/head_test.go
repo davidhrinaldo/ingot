@@ -609,6 +609,79 @@ func TestFlushWALTruncation(t *testing.T) {
 	require.NoError(t, app.Commit())
 }
 
+func TestHeadPostings(t *testing.T) {
+	h := openHead(t)
+
+	// Add three series.
+	app := h.Appender()
+	_, err := app.Append(0, []labels.Label{{Name: "__name__", Value: "temp"}, {Name: "room", Value: "office"}}, 1000, 1.0)
+	require.NoError(t, err)
+	_, err = app.Append(0, []labels.Label{{Name: "__name__", Value: "humidity"}, {Name: "room", Value: "office"}}, 1000, 2.0)
+	require.NoError(t, err)
+	_, err = app.Append(0, []labels.Label{{Name: "__name__", Value: "temp"}, {Name: "room", Value: "kitchen"}}, 1000, 3.0)
+	require.NoError(t, err)
+	require.NoError(t, app.Commit())
+
+	tests := []struct {
+		name     string
+		label    string
+		value    string
+		wantRefs []uint64
+	}{
+		{name: "match_name_temp", label: "__name__", value: "temp", wantRefs: []uint64{1, 3}},
+		{name: "match_room_office", label: "room", value: "office", wantRefs: []uint64{1, 2}},
+		{name: "match_name_humidity", label: "__name__", value: "humidity", wantRefs: []uint64{2}},
+		{name: "no_match", label: "__name__", value: "pressure", wantRefs: nil},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			got := h.Postings(tc.label, tc.value)
+			assert.Equal(t, tc.wantRefs, got)
+		})
+	}
+}
+
+func TestHeadLabelValues(t *testing.T) {
+	h := openHead(t)
+
+	app := h.Appender()
+	_, err := app.Append(0, []labels.Label{{Name: "__name__", Value: "temp"}, {Name: "room", Value: "office"}}, 1000, 1.0)
+	require.NoError(t, err)
+	_, err = app.Append(0, []labels.Label{{Name: "__name__", Value: "humidity"}, {Name: "room", Value: "office"}}, 1000, 2.0)
+	require.NoError(t, err)
+	_, err = app.Append(0, []labels.Label{{Name: "__name__", Value: "temp"}, {Name: "room", Value: "kitchen"}}, 1000, 3.0)
+	require.NoError(t, err)
+	require.NoError(t, app.Commit())
+
+	assert.Equal(t, []string{"humidity", "temp"}, h.LabelValues("__name__"))
+	assert.Equal(t, []string{"kitchen", "office"}, h.LabelValues("room"))
+	assert.Equal(t, []string{}, h.LabelValues("nonexistent"))
+}
+
+func TestHeadLabelsAndAllPostings(t *testing.T) {
+	h := openHead(t)
+
+	app := h.Appender()
+	_, err := app.Append(0, []labels.Label{{Name: "__name__", Value: "temp"}}, 1000, 1.0)
+	require.NoError(t, err)
+	_, err = app.Append(0, []labels.Label{{Name: "__name__", Value: "humidity"}}, 1000, 2.0)
+	require.NoError(t, err)
+	require.NoError(t, app.Commit())
+
+	// Labels
+	ls, ok := h.Labels(1)
+	assert.True(t, ok)
+	assert.Equal(t, []labels.Label{{Name: "__name__", Value: "temp"}}, ls)
+
+	_, ok = h.Labels(999)
+	assert.False(t, ok)
+
+	// AllPostings
+	refs := h.AllPostings()
+	assert.Equal(t, []uint64{1, 2}, refs)
+}
+
 func TestConcurrentAppend(t *testing.T) {
 	tests := []struct {
 		name                string

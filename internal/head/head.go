@@ -5,6 +5,7 @@ package head
 import (
 	"fmt"
 	"path/filepath"
+	"sort"
 	"sync/atomic"
 
 	"git.dvdt.dev/david/ingot/internal/block"
@@ -212,6 +213,59 @@ func (h *Head) FlushOlderThan(maxT int64) (string, error) {
 	}
 
 	return ulid, nil
+}
+
+// Postings returns sorted series refs where the series has label name=value.
+func (h *Head) Postings(name, value string) []uint64 {
+	var refs []uint64
+	h.series.forEach(func(s *memSeries) {
+		for _, l := range s.labels {
+			if l.Name == name && l.Value == value {
+				refs = append(refs, s.ref)
+				break
+			}
+		}
+	})
+	sort.Slice(refs, func(i, j int) bool { return refs[i] < refs[j] })
+	return refs
+}
+
+// LabelValues returns sorted unique values for the given label name.
+func (h *Head) LabelValues(name string) []string {
+	seen := make(map[string]struct{})
+	h.series.forEach(func(s *memSeries) {
+		for _, l := range s.labels {
+			if l.Name == name {
+				seen[l.Value] = struct{}{}
+				break
+			}
+		}
+	})
+	vals := make([]string, 0, len(seen))
+	for v := range seen {
+		vals = append(vals, v)
+	}
+	sort.Strings(vals)
+	return vals
+}
+
+// Labels returns the labels for a series by ref.
+func (h *Head) Labels(ref uint64) ([]labels.Label, bool) {
+	s := h.series.getByRef(ref)
+	if s == nil {
+		return nil, false
+	}
+	return s.labels, true
+}
+
+// AllPostings returns sorted refs for all series in the head.
+func (h *Head) AllPostings() []uint64 {
+	var refs []uint64
+	h.series.forEach(func(s *memSeries) {
+		refs = append(refs, s.ref)
+	})
+	sort.Slice(refs, func(i, j int) bool { return refs[i] < refs[j] })
+	return refs
 }
 
 // DataDir returns the data directory (parent of WAL dir).

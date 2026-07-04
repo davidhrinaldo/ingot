@@ -159,6 +159,50 @@ func TestIndexChunkRefEncoding(t *testing.T) {
 	}
 }
 
+func TestIndexLabelValues(t *testing.T) {
+	entries := []SeriesEntry{
+		{Ref: 1, Labels: []labels.Label{{Name: "__name__", Value: "temp"}, {Name: "room", Value: "office"}}, Chunks: []ChunkMeta{{MinT: 0, MaxT: 1, Ref: 0}}},
+		{Ref: 2, Labels: []labels.Label{{Name: "__name__", Value: "humidity"}, {Name: "room", Value: "office"}}, Chunks: []ChunkMeta{{MinT: 0, MaxT: 1, Ref: 0}}},
+		{Ref: 3, Labels: []labels.Label{{Name: "__name__", Value: "temp"}, {Name: "room", Value: "kitchen"}}, Chunks: []ChunkMeta{{MinT: 0, MaxT: 1, Ref: 0}}},
+	}
+
+	data := writeIndex(t, entries)
+	r, err := NewReader(data)
+	require.NoError(t, err)
+
+	tests := []struct {
+		name     string
+		label    string
+		wantVals []string
+	}{
+		{name: "name_values", label: "__name__", wantVals: []string{"humidity", "temp"}},
+		{name: "room_values", label: "room", wantVals: []string{"kitchen", "office"}},
+		{name: "missing_label", label: "nonexistent", wantVals: []string{}},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			got := r.LabelValues(tc.label)
+			assert.Equal(t, tc.wantVals, got)
+		})
+	}
+}
+
+func TestIndexAllPostings(t *testing.T) {
+	entries := []SeriesEntry{
+		{Ref: 5, Labels: []labels.Label{{Name: "__name__", Value: "a"}}, Chunks: []ChunkMeta{{MinT: 0, MaxT: 1, Ref: 0}}},
+		{Ref: 2, Labels: []labels.Label{{Name: "__name__", Value: "b"}}, Chunks: []ChunkMeta{{MinT: 0, MaxT: 1, Ref: 0}}},
+		{Ref: 8, Labels: []labels.Label{{Name: "__name__", Value: "c"}}, Chunks: []ChunkMeta{{MinT: 0, MaxT: 1, Ref: 0}}},
+	}
+
+	data := writeIndex(t, entries)
+	r, err := NewReader(data)
+	require.NoError(t, err)
+
+	refs := r.AllPostings()
+	assert.Equal(t, []uint64{2, 5, 8}, refs)
+}
+
 func TestIndexCorruptData(t *testing.T) {
 	tests := []struct {
 		name    string
