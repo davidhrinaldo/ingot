@@ -8,6 +8,18 @@ import (
 	"math/bits"
 )
 
+// ChunkAppender appends samples to a chunk.
+type ChunkAppender interface {
+	Append(t int64, v float64)
+}
+
+// ChunkIterator iterates over samples in a chunk.
+type ChunkIterator interface {
+	Next() bool
+	At() (int64, float64)
+	Err() error
+}
+
 type XORChunk struct {
 	b bstream
 }
@@ -20,7 +32,7 @@ func (c *XORChunk) NumSamples() int {
 	return int(binary.BigEndian.Uint16(c.b.bytes()))
 }
 
-func (c *XORChunk) Appender() (*xorAppender, error) {
+func (c *XORChunk) Appender() (ChunkAppender, error) {
 	if c.NumSamples() > 0 {
 		return nil, errors.New("chunkenc: appender on non-empty chunk")
 	}
@@ -134,7 +146,7 @@ func (a *xorAppender) writeVDelta(v float64) {
 
 // Iterator decodes the chunk. Snapshot semantics: it reads the byte slice
 // as it exists at creation; don't append concurrently.
-func (c *XORChunk) Iterator() *xorIterator {
+func (c *XORChunk) Iterator() ChunkIterator {
 	return &xorIterator{
 		br:    newBReader(c.b.bytes()[2:]),
 		total: uint16(c.NumSamples()),
