@@ -8,6 +8,7 @@ import (
 	"testing"
 
 	"git.dvdt.dev/david/ingot/internal/chunkenc"
+	"git.dvdt.dev/david/ingot/internal/index"
 	"git.dvdt.dev/david/ingot/labels"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -181,13 +182,49 @@ func TestBlockRoundTrip(t *testing.T) {
 	}
 }
 
-func TestBlockMultipleChunksPerSeries(t *testing.T) {
-	dataDir := t.TempDir()
-
+func TestBlockSeriesChunkIterator(t *testing.T) {
 	chunk1Samples := []sample{s(1000, 1.0), s(1015, 2.0), s(1030, 3.0)}
 	chunk2Samples := []sample{s(2000, 4.0), s(2015, 5.0), s(2030, 6.0)}
-	allSamples := append(chunk1Samples, chunk2Samples...)
 
+	tests := []struct {
+		name        string
+		ref         uint64
+		mint        int64
+		maxt        int64
+		wantSamples []sample
+	}{
+		{
+			name:        "full_range",
+			ref:         1,
+			mint:        math.MinInt64,
+			maxt:        math.MaxInt64,
+			wantSamples: append(chunk1Samples, chunk2Samples...),
+		},
+		{
+			name:        "second_chunk_only",
+			ref:         1,
+			mint:        2000,
+			maxt:        3000,
+			wantSamples: chunk2Samples,
+		},
+		{
+			name:        "no_overlap",
+			ref:         1,
+			mint:        5000,
+			maxt:        6000,
+			wantSamples: nil,
+		},
+		{
+			name:        "unknown_ref",
+			ref:         999,
+			mint:        math.MinInt64,
+			maxt:        math.MaxInt64,
+			wantSamples: nil,
+		},
+	}
+
+	// Setup: create a block with two chunks for series ref=1.
+	dataDir := t.TempDir()
 	flushData := []SeriesFlush{
 		{
 			Ref:    1,
@@ -198,71 +235,76 @@ func TestBlockMultipleChunksPerSeries(t *testing.T) {
 			},
 		},
 	}
-
 	ulid, err := Flush(dataDir, flushData)
 	require.NoError(t, err)
-
 	r, err := Open(filepath.Join(dataDir, ulid))
 	require.NoError(t, err)
 	defer r.Close()
 
-	// Full range.
-	it, err := r.SeriesChunkIterator(1, math.MinInt64, math.MaxInt64)
-	require.NoError(t, err)
-	got := collectIterator(t, it)
-	require.Equal(t, len(allSamples), len(got))
-	for i, want := range allSamples {
-		assert.Equal(t, want.t, got[i].t, "sample %d t", i)
-		assert.Equal(t, want.vBits, got[i].vBits, "sample %d v", i)
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			it, err := r.SeriesChunkIterator(tc.ref, tc.mint, tc.maxt)
+			require.NoError(t, err)
+			got := collectIterator(t, it)
+			assert.Equal(t, len(tc.wantSamples), len(got), "sample count")
+			for i, want := range tc.wantSamples {
+				assert.Equal(t, want.t, got[i].t, "sample %d t", i)
+				assert.Equal(t, want.vBits, got[i].vBits, "sample %d v", i)
+			}
+		})
 	}
-
-	// Query only second chunk's range.
-	it, err = r.SeriesChunkIterator(1, 2000, 3000)
-	require.NoError(t, err)
-	got = collectIterator(t, it)
-	require.Equal(t, len(chunk2Samples), len(got))
-	for i, want := range chunk2Samples {
-		assert.Equal(t, want.t, got[i].t, "sample %d t", i)
-		assert.Equal(t, want.vBits, got[i].vBits, "sample %d v", i)
-	}
-
-	// Query with no overlap.
-	it, err = r.SeriesChunkIterator(1, 5000, 6000)
-	require.NoError(t, err)
-	got = collectIterator(t, it)
-	assert.Empty(t, got)
-
-	// Unknown ref.
-	it, err = r.SeriesChunkIterator(999, math.MinInt64, math.MaxInt64)
-	require.NoError(t, err)
-	assert.False(t, it.Next())
 }
 
 func TestBlockMetaTimeBounds(t *testing.T) {
-	dataDir := t.TempDir()
-
-	flushData := []SeriesFlush{
+	tests := []struct {
+		name     string
+		series   []SeriesFlush
+		wantMinT int64
+		wantMaxT int64
+	}{
 		{
-			Ref:    1,
-			Labels: []labels.Label{{Name: "__name__", Value: "a"}},
-			Chunks: []ChunkData{{MinT: 500, MaxT: 1000, Data: makeChunk(t, []sample{s(500, 1.0), s(1000, 2.0)})}},
+			name: "two_series_different_ranges",
+			series: []SeriesFlush{
+				{Ref: 1, Labels: []labels.Label{{Name: "__name__", Value: "a"}}, Chunks: []ChunkData{{MinT: 500, MaxT: 1000, Data: makeChunkFromPairs([]int64{500, 1000}, []float64{1.0, 2.0})}}},
+				{Ref: 2, Labels: []labels.Label{{Name: "__name__", Value: "b"}}, Chunks: []ChunkData{{MinT: 200, MaxT: 800, Data: makeChunkFromPairs([]int64{200, 800}, []float64{3.0, 4.0})}}},
+			},
+			wantMinT: 200,
+			wantMaxT: 1000,
 		},
 		{
-			Ref:    2,
-			Labels: []labels.Label{{Name: "__name__", Value: "b"}},
-			Chunks: []ChunkData{{MinT: 200, MaxT: 800, Data: makeChunk(t, []sample{s(200, 3.0), s(800, 4.0)})}},
+			name: "single_series",
+			series: []SeriesFlush{
+				{Ref: 1, Labels: []labels.Label{{Name: "__name__", Value: "a"}}, Chunks: []ChunkData{{MinT: 100, MaxT: 500, Data: makeChunkFromPairs([]int64{100, 500}, []float64{1.0, 2.0})}}},
+			},
+			wantMinT: 100,
+			wantMaxT: 500,
+		},
+		{
+			name: "multiple_chunks",
+			series: []SeriesFlush{
+				{Ref: 1, Labels: []labels.Label{{Name: "__name__", Value: "a"}}, Chunks: []ChunkData{
+					{MinT: 100, MaxT: 200, Data: makeChunkFromPairs([]int64{100, 200}, []float64{1.0, 2.0})},
+					{MinT: 300, MaxT: 900, Data: makeChunkFromPairs([]int64{300, 900}, []float64{3.0, 4.0})},
+				}},
+			},
+			wantMinT: 100,
+			wantMaxT: 900,
 		},
 	}
 
-	ulid, err := Flush(dataDir, flushData)
-	require.NoError(t, err)
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			dataDir := t.TempDir()
+			ulid, err := Flush(dataDir, tc.series)
+			require.NoError(t, err)
+			r, err := Open(filepath.Join(dataDir, ulid))
+			require.NoError(t, err)
+			defer r.Close()
 
-	r, err := Open(filepath.Join(dataDir, ulid))
-	require.NoError(t, err)
-	defer r.Close()
-
-	assert.Equal(t, int64(200), r.Meta.MinTime)
-	assert.Equal(t, int64(1000), r.Meta.MaxTime)
+			assert.Equal(t, tc.wantMinT, r.Meta.MinTime, "MinTime")
+			assert.Equal(t, tc.wantMaxT, r.Meta.MaxTime, "MaxTime")
+		})
+	}
 }
 
 func TestULIDRoundTrip(t *testing.T) {
@@ -276,57 +318,83 @@ func TestULIDRoundTrip(t *testing.T) {
 	}
 }
 
-func TestCorruptChunkCRC(t *testing.T) {
-	dataDir := t.TempDir()
-
-	samples := []sample{s(1000, 71.3), s(1015, 71.4)}
-	flushData := []SeriesFlush{
+func TestBlockCorruption(t *testing.T) {
+	tests := []struct {
+		name        string
+		corruptFunc func(t *testing.T, blockDir string, chunkRef index.ChunkRef)
+		wantErr     error
+	}{
 		{
-			Ref:    1,
-			Labels: []labels.Label{{Name: "__name__", Value: "temp"}},
-			Chunks: []ChunkData{{MinT: 1000, MaxT: 1015, Data: makeChunk(t, samples)}},
+			name: "corrupt_chunk_data_byte",
+			corruptFunc: func(t *testing.T, blockDir string, chunkRef index.ChunkRef) {
+				chunkPath := filepath.Join(blockDir, chunksDirName, segmentName(int(chunkRef.Segment())))
+				data, err := os.ReadFile(chunkPath)
+				require.NoError(t, err)
+				off := int(chunkRef.Offset()) + chunkEntryHeaderLen + 1
+				data[off] ^= 0xFF
+				require.NoError(t, os.WriteFile(chunkPath, data, 0644))
+			},
+			wantErr: ErrCorruptChunk,
+		},
+		{
+			name: "corrupt_chunk_crc",
+			corruptFunc: func(t *testing.T, blockDir string, chunkRef index.ChunkRef) {
+				chunkPath := filepath.Join(blockDir, chunksDirName, segmentName(int(chunkRef.Segment())))
+				data, err := os.ReadFile(chunkPath)
+				require.NoError(t, err)
+				// Corrupt the last byte of the CRC.
+				off := int(chunkRef.Offset()) + chunkEntryHeaderLen
+				// Read dataLen to find CRC position.
+				dataLen := int(data[chunkRef.Offset()])*16777216 + int(data[chunkRef.Offset()+1])*65536 +
+					int(data[chunkRef.Offset()+2])*256 + int(data[chunkRef.Offset()+3])
+				crcOff := off + dataLen + 3 // last byte of CRC
+				data[crcOff] ^= 0xFF
+				require.NoError(t, os.WriteFile(chunkPath, data, 0644))
+			},
+			wantErr: ErrCorruptChunk,
 		},
 	}
 
-	ulid, err := Flush(dataDir, flushData)
-	require.NoError(t, err)
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			dataDir := t.TempDir()
+			samples := []sample{s(1000, 71.3), s(1015, 71.4)}
+			flushData := []SeriesFlush{
+				{
+					Ref:    1,
+					Labels: []labels.Label{{Name: "__name__", Value: "temp"}},
+					Chunks: []ChunkData{{MinT: 1000, MaxT: 1015, Data: makeChunk(t, samples)}},
+				},
+			}
+			ulid, err := Flush(dataDir, flushData)
+			require.NoError(t, err)
 
-	// Open block, find the chunk ref, then corrupt the chunk file.
-	blockDir := filepath.Join(dataDir, ulid)
-	r, err := Open(blockDir)
-	require.NoError(t, err)
+			blockDir := filepath.Join(dataDir, ulid)
+			r, err := Open(blockDir)
+			require.NoError(t, err)
+			series := r.Series()
+			require.Equal(t, 1, len(series))
+			chunkRef := series[0].Chunks[0].Ref
+			r.Close()
 
-	series := r.Series()
-	require.Equal(t, 1, len(series))
-	chunkRef := series[0].Chunks[0].Ref
-	r.Close()
+			tc.corruptFunc(t, blockDir, chunkRef)
 
-	// Corrupt chunk data on disk.
-	chunkSeg := chunkRef.Segment()
-	chunkPath := filepath.Join(blockDir, chunksDirName, segmentName(int(chunkSeg)))
+			r, err = Open(blockDir)
+			require.NoError(t, err)
+			defer r.Close()
 
-	// Read, corrupt a data byte, write back.
-	chunkFile, err := readFileBytes(chunkPath)
-	require.NoError(t, err)
-	off := int(chunkRef.Offset()) + chunkEntryHeaderLen + 1 // corrupt a data byte
-	if off < len(chunkFile) {
-		chunkFile[off] ^= 0xFF
+			_, err = r.ChunkIterator(chunkRef)
+			assert.Equal(t, tc.wantErr, err)
+		})
 	}
-	require.NoError(t, writeFileBytes(chunkPath, chunkFile))
-
-	// Re-open and try to read the corrupt chunk.
-	r, err = Open(blockDir)
-	require.NoError(t, err)
-	defer r.Close()
-
-	_, err = r.ChunkIterator(chunkRef)
-	assert.Equal(t, ErrCorruptChunk, err)
 }
 
-func readFileBytes(path string) ([]byte, error) {
-	return os.ReadFile(path)
-}
-
-func writeFileBytes(path string, data []byte) error {
-	return os.WriteFile(path, data, 0644)
+// makeChunkFromPairs creates a chunk from timestamp/value slices.
+func makeChunkFromPairs(ts []int64, vs []float64) []byte {
+	c := chunkenc.NewXORChunk()
+	a, _ := c.Appender()
+	for i := range ts {
+		a.Append(ts[i], vs[i])
+	}
+	return append([]byte(nil), c.Bytes()...)
 }

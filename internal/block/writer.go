@@ -30,6 +30,16 @@ type SeriesFlush struct {
 //
 // Returns the block ULID and any error.
 func Flush(dataDir string, series []SeriesFlush) (string, error) {
+	return flushBlock(dataDir, series, 1, nil)
+}
+
+// FlushCompacted writes a new immutable block from compacted series data,
+// recording the compaction level and source block ULIDs.
+func FlushCompacted(dataDir string, series []SeriesFlush, level int, sources []string) (string, error) {
+	return flushBlock(dataDir, series, level, sources)
+}
+
+func flushBlock(dataDir string, series []SeriesFlush, level int, sources []string) (string, error) {
 	ulid := newULID()
 	blockDir := filepath.Join(dataDir, ulid)
 
@@ -49,7 +59,12 @@ func Flush(dataDir string, series []SeriesFlush) (string, error) {
 	)
 	meta.ULID = ulid
 	meta.Version = 1
-	meta.Compaction = CompactionInfo{Level: 1, Sources: []string{ulid}}
+	meta.Compaction = CompactionInfo{Level: level}
+	if sources != nil {
+		meta.Compaction.Sources = sources
+	} else {
+		meta.Compaction.Sources = []string{ulid}
+	}
 	meta.MinTime = int64(^uint64(0) >> 1) // max int64
 	meta.MaxTime = int64(0)
 

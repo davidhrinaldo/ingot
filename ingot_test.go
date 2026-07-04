@@ -2,7 +2,9 @@ package ingot
 
 import (
 	"math"
+	"os"
 	"testing"
+	"time"
 
 	"git.dvdt.dev/david/ingot/labels"
 	"github.com/stretchr/testify/assert"
@@ -467,81 +469,256 @@ type queryCase struct {
 	matchers []*labels.Matcher
 }
 
-func TestDBAppenderAPI(t *testing.T) {
-	db := openTestDB(t)
+func TestDBLifecycle(t *testing.T) {
+	tests := []struct {
+		name            string
+		setup           func(t *testing.T, dir string) *DB
+		wantSampleCount int
+		wantSeriesCount int
+		matchers        []*labels.Matcher
+		mint            int64
+		maxt            int64
+	}{
+		{
+			name: "append_and_query_back",
+			setup: func(t *testing.T, dir string) *DB {
+				db, err := Open(dir, Options{})
+				require.NoError(t, err)
+				app := db.Appender()
+				ref, err := app.Append(0, labels.FromStrings("__name__", "temp", "room", "office"), 1000, 71.3)
+				require.NoError(t, err)
+				_, err = app.Append(ref, nil, 2000, 71.4)
+				require.NoError(t, err)
+				require.NoError(t, app.Commit())
+				return db
+			},
+			wantSampleCount: 2,
+			wantSeriesCount: 1,
+			matchers:        []*labels.Matcher{labels.MustNewMatcher(labels.MatchEqual, "room", "office")},
+			mint:            math.MinInt64,
+			maxt:            math.MaxInt64,
+		},
+		{
+			name: "reopen_with_blocks",
+			setup: func(t *testing.T, dir string) *DB {
+				db, err := Open(dir, Options{})
+				require.NoError(t, err)
+				app := db.Appender()
+				ref, err := app.Append(0, labels.FromStrings("__name__", "temp"), 0, 0)
+				require.NoError(t, err)
+				for i := 1; i < 250; i++ {
+					_, err = app.Append(ref, nil, int64(i*15000), float64(i))
+					require.NoError(t, err)
+				}
+				require.NoError(t, app.Commit())
+				_, err = db.FlushOlderThan(math.MaxInt64)
+				require.NoError(t, err)
+				require.NoError(t, db.Close())
 
-	app := db.Appender()
-	ref, err := app.Append(0, labels.FromStrings("__name__", "temp", "room", "office"), 1000, 71.3)
-	require.NoError(t, err)
-	assert.NotZero(t, ref)
+				db2, err := Open(dir, Options{})
+				require.NoError(t, err)
+				return db2
+			},
+			wantSampleCount: 250,
+			wantSeriesCount: 1,
+			matchers:        []*labels.Matcher{labels.MustNewMatcher(labels.MatchEqual, "__name__", "temp")},
+			mint:            math.MinInt64,
+			maxt:            math.MaxInt64,
+		},
+		{
+			name: "compacted_blocks_queryable",
+			setup: func(t *testing.T, dir string) *DB {
+				db, err := Open(dir, Options{})
+				require.NoError(t, err)
+				const samplesPerBlock = 130
+				ref := uint64(0)
+				for b := 0; b < 4; b++ {
+					app := db.Appender()
+					for i := 0; i < samplesPerBlock; i++ {
+						ts := int64((b*samplesPerBlock + i) * 15000)
+						r, err := app.Append(ref, labels.FromStrings("__name__", "temp"), ts, float64(ts))
+						require.NoError(t, err)
+						ref = r
+					}
+					require.NoError(t, app.Commit())
+					_, err := db.FlushOlderThan(math.MaxInt64)
+					require.NoError(t, err)
+				}
+				require.NoError(t, db.RunCompaction())
+				return db
+			},
+			wantSampleCount: 520,
+			wantSeriesCount: 1,
+			matchers:        []*labels.Matcher{labels.MustNewMatcher(labels.MatchEqual, "__name__", "temp")},
+			mint:            math.MinInt64,
+			maxt:            math.MaxInt64,
+		},
+		{
+			name: "retention_drops_old_keeps_recent",
+			setup: func(t *testing.T, dir string) *DB {
+				now := int64(100 * 3600 * 1000)
+				db, err := Open(dir, Options{
+					Retention: 24 * time.Hour,
+					Clock:     func() int64 { return now },
+				})
+				require.NoError(t, err)
+				// Old data (50 hours ago).
+				app := db.Appender()
+				ref, err := app.Append(0, labels.FromStrings("__name__", "old"), 50*3600*1000, 1.0)
+				require.NoError(t, err)
+				for i := 1; i < 250; i++ {
+					_, err = app.Append(ref, nil, int64(50*3600*1000+i*15000), float64(i))
+					require.NoError(t, err)
+				}
+				require.NoError(t, app.Commit())
+				_, err = db.FlushOlderThan(math.MaxInt64)
+				require.NoError(t, err)
+				// Recent data (1 hour ago).
+				app = db.Appender()
+				ref2, err := app.Append(0, labels.FromStrings("__name__", "recent"), 99*3600*1000, 1.0)
+				require.NoError(t, err)
+				for i := 1; i < 250; i++ {
+					_, err = app.Append(ref2, nil, int64(99*3600*1000+i*15000), float64(i))
+					require.NoError(t, err)
+				}
+				require.NoError(t, app.Commit())
+				_, err = db.FlushOlderThan(math.MaxInt64)
+				require.NoError(t, err)
+				db.ApplyRetention()
+				return db
+			},
+			wantSampleCount: 250,
+			wantSeriesCount: 1,
+			matchers:        []*labels.Matcher{labels.MustNewMatcher(labels.MatchEqual, "__name__", "recent")},
+			mint:            math.MinInt64,
+			maxt:            math.MaxInt64,
+		},
+	}
 
-	_, err = app.Append(ref, nil, 2000, 71.4)
-	require.NoError(t, err)
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			dir := t.TempDir()
+			db := tc.setup(t, dir)
+			defer db.Close()
 
-	require.NoError(t, app.Commit())
+			q, err := db.Querier(tc.mint, tc.maxt)
+			require.NoError(t, err)
+			defer q.Close()
 
-	// Query back.
-	q, err := db.Querier(math.MinInt64, math.MaxInt64)
-	require.NoError(t, err)
-	defer q.Close()
-
-	ss := q.Select(labels.MustNewMatcher(labels.MatchEqual, "room", "office"))
-	require.True(t, ss.Next())
-	s := ss.At()
-	assert.Equal(t, labels.FromStrings("__name__", "temp", "room", "office"), s.Labels())
-
-	it := s.Iterator()
-	require.True(t, it.Next())
-	st, sv := it.At()
-	assert.Equal(t, int64(1000), st)
-	assert.Equal(t, 71.3, sv)
-
-	require.True(t, it.Next())
-	st, sv = it.At()
-	assert.Equal(t, int64(2000), st)
-	assert.Equal(t, 71.4, sv)
-
-	assert.False(t, it.Next())
-	assert.False(t, ss.Next())
+			ss := q.Select(tc.matchers...)
+			seriesCount := 0
+			sampleCount := 0
+			for ss.Next() {
+				seriesCount++
+				it := ss.At().Iterator()
+				for it.Next() {
+					sampleCount++
+				}
+				require.NoError(t, it.Err())
+			}
+			require.NoError(t, ss.Err())
+			assert.Equal(t, tc.wantSeriesCount, seriesCount, "series count")
+			assert.Equal(t, tc.wantSampleCount, sampleCount, "sample count")
+		})
+	}
 }
 
-func TestDBReopenWithBlocks(t *testing.T) {
-	dir := t.TempDir()
-
-	// Write data, flush, close.
-	db, err := Open(dir, Options{})
-	require.NoError(t, err)
-
-	app := db.Appender()
-	ref, err := app.Append(0, labels.FromStrings("__name__", "temp"), 0, 0)
-	require.NoError(t, err)
-	for i := 1; i < 250; i++ {
-		_, err = app.Append(ref, nil, int64(i*15000), float64(i))
-		require.NoError(t, err)
+func TestQueryDuringCompaction(t *testing.T) {
+	tests := []struct {
+		name            string
+		numBlocks       int
+		samplesPerBlock int
+	}{
+		{
+			name:            "four_blocks",
+			numBlocks:       4,
+			samplesPerBlock: 130,
+		},
+		{
+			name:            "two_blocks",
+			numBlocks:       2,
+			samplesPerBlock: 130,
+		},
 	}
-	require.NoError(t, app.Commit())
 
-	_, err = db.FlushOlderThan(math.MaxInt64)
-	require.NoError(t, err)
-	require.NoError(t, db.Close())
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			dir := t.TempDir()
+			db, err := Open(dir, Options{})
+			require.NoError(t, err)
+			defer db.Close()
 
-	// Reopen.
-	db2, err := Open(dir, Options{})
-	require.NoError(t, err)
-	defer db2.Close()
+			ref := uint64(0)
+			for b := 0; b < tc.numBlocks; b++ {
+				app := db.Appender()
+				for i := 0; i < tc.samplesPerBlock; i++ {
+					ts := int64((b*tc.samplesPerBlock + i) * 15000)
+					r, err := app.Append(ref, labels.FromStrings("__name__", "temp"), ts, float64(ts))
+					require.NoError(t, err)
+					ref = r
+				}
+				require.NoError(t, app.Commit())
+				_, err := db.FlushOlderThan(math.MaxInt64)
+				require.NoError(t, err)
+			}
 
-	// Should find data in block.
-	q, err := db2.Querier(math.MinInt64, math.MaxInt64)
-	require.NoError(t, err)
-	defer q.Close()
+			// Snapshot source block dirs.
+			db.mu.RLock()
+			sourceDirs := make([]string, len(db.blocks))
+			for i, b := range db.blocks {
+				sourceDirs[i] = b.Dir()
+			}
+			db.mu.RUnlock()
 
-	ss := q.Select(labels.MustNewMatcher(labels.MatchEqual, "__name__", "temp"))
-	require.True(t, ss.Next())
-	it := ss.At().Iterator()
-	count := 0
-	for it.Next() {
-		count++
+			// Start query holding refs on all blocks.
+			q, err := db.Querier(math.MinInt64, math.MaxInt64)
+			require.NoError(t, err)
+
+			ss := q.Select(labels.MustNewMatcher(labels.MatchEqual, "__name__", "temp"))
+			require.True(t, ss.Next())
+			it := ss.At().Iterator()
+			require.True(t, it.Next())
+
+			// Compact while query is open.
+			err = db.RunCompaction()
+			require.NoError(t, err)
+
+			// Source dirs still exist (query holds refs).
+			for _, d := range sourceDirs {
+				_, statErr := os.Stat(d)
+				assert.NoError(t, statErr, "source dir should exist while query holds ref")
+			}
+
+			// Finish iterating — all data still readable.
+			count := 1
+			for it.Next() {
+				count++
+			}
+			require.NoError(t, it.Err())
+			assert.Equal(t, tc.samplesPerBlock*tc.numBlocks, count, "all samples readable during compaction")
+
+			// Close querier — source dirs should be deleted.
+			require.NoError(t, q.Close())
+			for _, d := range sourceDirs {
+				_, statErr := os.Stat(d)
+				assert.True(t, os.IsNotExist(statErr), "source dir should be deleted after query close")
+			}
+
+			// Compacted block still queryable.
+			q2, err := db.Querier(math.MinInt64, math.MaxInt64)
+			require.NoError(t, err)
+			defer q2.Close()
+			ss2 := q2.Select(labels.MustNewMatcher(labels.MatchEqual, "__name__", "temp"))
+			count = 0
+			for ss2.Next() {
+				it2 := ss2.At().Iterator()
+				for it2.Next() {
+					count++
+				}
+				require.NoError(t, it2.Err())
+			}
+			require.NoError(t, ss2.Err())
+			assert.Equal(t, tc.samplesPerBlock*tc.numBlocks, count, "compacted block has all samples")
+		})
 	}
-	require.NoError(t, it.Err())
-	assert.Equal(t, 250, count, "should find all samples: 240 from block + 10 from head WAL replay")
 }

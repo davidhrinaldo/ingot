@@ -2,6 +2,7 @@
 package ingot
 
 import (
+	"context"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -11,25 +12,58 @@ import (
 
 	"git.dvdt.dev/david/ingot/internal/block"
 	"git.dvdt.dev/david/ingot/internal/chunkenc"
+	"git.dvdt.dev/david/ingot/internal/compact"
 	"git.dvdt.dev/david/ingot/internal/head"
 	"git.dvdt.dev/david/ingot/internal/postings"
 	"git.dvdt.dev/david/ingot/internal/wal"
 	"git.dvdt.dev/david/ingot/labels"
 )
 
+// Default compaction level durations in milliseconds.
+var defaultLevels = []int64{
+	2 * 3600 * 1000,  // 2h
+	8 * 3600 * 1000,  // 8h
+	32 * 3600 * 1000, // 32h
+}
+
 // DB is an embedded time-series database.
 type DB struct {
-	dataDir string
-	opts    Options
-	head    *head.Head
-	blocks  []*block.Reader // sorted by MinTime
-	mu      sync.RWMutex    // protects blocks slice
+	dataDir       string
+	opts          Options
+	head          *head.Head
+	blocks        []*block.Reader // sorted by MinTime
+	mu            sync.RWMutex    // protects blocks slice
+	compactor     *compact.Compactor
+	compactCtx    context.Context
+	compactCancel context.CancelFunc
+	compactWg     sync.WaitGroup
 }
 
 // Options configures a DB.
 type Options struct {
 	Retention     time.Duration
 	BlockDuration time.Duration
+	// Clock returns the current time in milliseconds. Defaults to
+	// time.Now().UnixMilli(). Injected for testing with simulated time.
+	Clock func() int64
+}
+
+func (o *Options) clock() func() int64 {
+	if o.Clock != nil {
+		return o.Clock
+	}
+	return func() int64 { return time.Now().UnixMilli() }
+}
+
+func (o *Options) blockDurationMs() int64 {
+	if o.BlockDuration == 0 {
+		return defaultLevels[0] // 2h default
+	}
+	return o.BlockDuration.Milliseconds()
+}
+
+func (o *Options) retentionMs() int64 {
+	return o.Retention.Milliseconds()
 }
 
 // Open opens or creates a DB at the given directory.
@@ -44,16 +78,27 @@ func Open(dataDir string, opts Options) (*DB, error) {
 		return nil, fmt.Errorf("ingot: open head: %w", err)
 	}
 
+	ctx, cancel := context.WithCancel(context.Background())
+
 	db := &DB{
-		dataDir: dataDir,
-		opts:    opts,
-		head:    h,
+		dataDir:       dataDir,
+		opts:          opts,
+		head:          h,
+		compactCtx:    ctx,
+		compactCancel: cancel,
 	}
 
+	db.compactor = compact.New(dataDir, defaultLevels, opts.retentionMs(), opts.clock())
+
 	if err := db.loadBlocks(); err != nil {
+		cancel()
 		h.Close()
 		return nil, fmt.Errorf("ingot: load blocks: %w", err)
 	}
+
+	// Start background compaction goroutine.
+	db.compactWg.Add(1)
+	go db.compactLoop()
 
 	return db, nil
 }
@@ -99,6 +144,7 @@ func (db *DB) Querier(mint, maxt int64) (*Querier, error) {
 	var overlapping []*block.Reader
 	for _, b := range db.blocks {
 		if b.Meta.MaxTime >= mint && b.Meta.MinTime <= maxt {
+			b.Ref()
 			overlapping = append(overlapping, b)
 		}
 	}
@@ -139,8 +185,132 @@ func (db *DB) FlushOlderThan(maxT int64) (string, error) {
 	return ulid, nil
 }
 
+// RunCompaction performs a single compaction cycle. Exported for testing.
+func (db *DB) RunCompaction() error {
+	db.mu.RLock()
+	snapshot := make([]*block.Reader, len(db.blocks))
+	copy(snapshot, db.blocks)
+	db.mu.RUnlock()
+
+	group := db.compactor.Plan(snapshot)
+	if group == nil {
+		return nil
+	}
+
+	newULID, err := db.compactor.Compact(group.Sources)
+	if err != nil {
+		return fmt.Errorf("ingot: compact: %w", err)
+	}
+
+	newBlock, err := block.Open(filepath.Join(db.dataDir, newULID))
+	if err != nil {
+		return fmt.Errorf("ingot: open compacted block: %w", err)
+	}
+
+	// Build a set of source ULIDs for fast lookup.
+	sourceSet := make(map[string]struct{}, len(group.Sources))
+	for _, s := range group.Sources {
+		sourceSet[s.Meta.ULID] = struct{}{}
+	}
+
+	// Swap blocks under short lock.
+	db.mu.Lock()
+	var remaining []*block.Reader
+	for _, b := range db.blocks {
+		if _, ok := sourceSet[b.Meta.ULID]; !ok {
+			remaining = append(remaining, b)
+		}
+	}
+	remaining = append(remaining, newBlock)
+	sort.Slice(remaining, func(i, j int) bool {
+		return remaining[i].Meta.MinTime < remaining[j].Meta.MinTime
+	})
+	db.blocks = remaining
+	db.mu.Unlock()
+
+	// Condemn and release source blocks.
+	for _, src := range group.Sources {
+		dir := src.Dir()
+		src.Condemn()
+		if src.Release() {
+			os.RemoveAll(dir)
+		}
+	}
+
+	return nil
+}
+
+// ApplyRetention drops blocks whose data is older than the retention window.
+// Exported for testing.
+func (db *DB) ApplyRetention() {
+	if db.opts.Retention == 0 {
+		return
+	}
+
+	db.mu.RLock()
+	snapshot := make([]*block.Reader, len(db.blocks))
+	copy(snapshot, db.blocks)
+	db.mu.RUnlock()
+
+	expired := db.compactor.Expired(snapshot)
+	if len(expired) == 0 {
+		return
+	}
+
+	expiredSet := make(map[string]struct{}, len(expired))
+	for _, b := range expired {
+		expiredSet[b.Meta.ULID] = struct{}{}
+	}
+
+	db.mu.Lock()
+	var remaining []*block.Reader
+	for _, b := range db.blocks {
+		if _, ok := expiredSet[b.Meta.ULID]; !ok {
+			remaining = append(remaining, b)
+		}
+	}
+	db.blocks = remaining
+	db.mu.Unlock()
+
+	for _, b := range expired {
+		dir := b.Dir()
+		b.Condemn()
+		if b.Release() {
+			os.RemoveAll(dir)
+		}
+	}
+}
+
+// compactLoop runs in a background goroutine, periodically flushing the
+// head and compacting blocks.
+func (db *DB) compactLoop() {
+	defer db.compactWg.Done()
+	ticker := time.NewTicker(1 * time.Minute)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-db.compactCtx.Done():
+			return
+		case <-ticker.C:
+			db.autoFlush()
+			db.RunCompaction()
+			db.ApplyRetention()
+		}
+	}
+}
+
+// autoFlush flushes sealed head chunks older than BlockDuration.
+func (db *DB) autoFlush() {
+	now := db.opts.clock()()
+	cutoff := now - db.opts.blockDurationMs()
+	db.FlushOlderThan(cutoff)
+}
+
 // Close closes the DB, releasing all resources.
 func (db *DB) Close() error {
+	db.compactCancel()
+	db.compactWg.Wait()
+
 	var firstErr error
 	if err := db.head.Close(); err != nil {
 		firstErr = err
@@ -235,8 +405,15 @@ func (q *Querier) Select(matchers ...*labels.Matcher) SeriesSet {
 	return &sliceSeriesSet{series: entries}
 }
 
-// Close is a no-op for now (refcounting is M5).
+// Close releases block references held by this querier.
 func (q *Querier) Close() error {
+	for _, b := range q.blocks {
+		dir := b.Dir()
+		if b.Release() {
+			os.RemoveAll(dir)
+		}
+	}
+	q.blocks = nil
 	return nil
 }
 
@@ -384,15 +561,15 @@ func (s *resultSeries) Iterator() SampleIterator {
 // mergedSampleIterator merges multiple ChunkIterators in order, deduplicating
 // timestamps. Earlier iterators (blocks) win over later ones (head).
 type mergedSampleIterator struct {
-	iters  []chunkenc.ChunkIterator
-	mint   int64
-	maxt   int64
-	cur    int
-	lastT  int64
-	curT   int64
-	curV   float64
+	iters   []chunkenc.ChunkIterator
+	mint    int64
+	maxt    int64
+	cur     int
+	lastT   int64
+	curT    int64
+	curV    float64
 	started bool
-	err    error
+	err     error
 }
 
 func (m *mergedSampleIterator) Next() bool {

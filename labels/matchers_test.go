@@ -51,15 +51,41 @@ func TestMatcherMatches(t *testing.T) {
 	}
 }
 
-func TestNewMatcherBadRegexp(t *testing.T) {
-	_, err := NewMatcher(MatchRegexp, "__name__", "[invalid")
-	assert.Error(t, err)
+func TestNewMatcherErrors(t *testing.T) {
+	tests := []struct {
+		name    string
+		typ     MatchType
+		pattern string
+	}{
+		{name: "bad_regexp_bracket", typ: MatchRegexp, pattern: "[invalid"},
+		{name: "bad_not_regexp_bracket", typ: MatchNotRegexp, pattern: "(unclosed"},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			_, err := NewMatcher(tc.typ, "__name__", tc.pattern)
+			assert.Error(t, err)
+		})
+	}
 }
 
 func TestMustNewMatcherPanics(t *testing.T) {
-	assert.Panics(t, func() {
-		MustNewMatcher(MatchRegexp, "__name__", "[invalid")
-	})
+	tests := []struct {
+		name    string
+		typ     MatchType
+		pattern string
+	}{
+		{name: "bad_regexp", typ: MatchRegexp, pattern: "[invalid"},
+		{name: "bad_not_regexp", typ: MatchNotRegexp, pattern: "(unclosed"},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			assert.Panics(t, func() {
+				MustNewMatcher(tc.typ, "__name__", tc.pattern)
+			})
+		})
+	}
 }
 
 func TestFromStrings(t *testing.T) {
@@ -93,15 +119,38 @@ func TestFromStrings(t *testing.T) {
 	}
 }
 
-func TestFromStringsPanicsOnOdd(t *testing.T) {
-	assert.Panics(t, func() {
-		FromStrings("__name__")
-	})
+func TestFromStringsPanics(t *testing.T) {
+	tests := []struct {
+		name string
+		args []string
+	}{
+		{name: "odd_count_one", args: []string{"__name__"}},
+		{name: "odd_count_three", args: []string{"__name__", "temp", "room"}},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			assert.Panics(t, func() {
+				FromStrings(tc.args...)
+			})
+		})
+	}
 }
 
 func TestMatchTypeString(t *testing.T) {
-	assert.Equal(t, "=", MatchEqual.String())
-	assert.Equal(t, "!=", MatchNotEqual.String())
-	assert.Equal(t, "=~", MatchRegexp.String())
-	assert.Equal(t, "!~", MatchNotRegexp.String())
+	tests := []struct {
+		typ  MatchType
+		want string
+	}{
+		{typ: MatchEqual, want: "="},
+		{typ: MatchNotEqual, want: "!="},
+		{typ: MatchRegexp, want: "=~"},
+		{typ: MatchNotRegexp, want: "!~"},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.want, func(t *testing.T) {
+			assert.Equal(t, tc.want, tc.typ.String())
+		})
+	}
 }

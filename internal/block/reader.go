@@ -3,6 +3,7 @@ package block
 import (
 	"os"
 	"path/filepath"
+	"sync/atomic"
 
 	"git.dvdt.dev/david/ingot/internal/chunkenc"
 	"git.dvdt.dev/david/ingot/internal/index"
@@ -11,10 +12,12 @@ import (
 
 // Reader provides read access to an immutable on-disk block.
 type Reader struct {
-	dir    string
-	Meta   BlockMeta
-	idx    *index.Reader
-	chunks *chunkReader
+	dir       string
+	Meta      BlockMeta
+	idx       *index.Reader
+	chunks    *chunkReader
+	refs      atomic.Int32
+	condemned atomic.Bool
 }
 
 // Open opens a block directory for reading. Chunk files are mmap'd.
@@ -39,12 +42,14 @@ func Open(dir string) (*Reader, error) {
 		return nil, err
 	}
 
-	return &Reader{
+	r := &Reader{
 		dir:    dir,
 		Meta:   meta,
 		idx:    idx,
 		chunks: cr,
-	}, nil
+	}
+	r.refs.Store(1) // DB's ownership ref
+	return r, nil
 }
 
 // Series returns all series entries from the index.
@@ -113,6 +118,30 @@ func (r *Reader) LabelValues(name string) []string {
 // AllPostings returns sorted refs for all series in the block.
 func (r *Reader) AllPostings() []uint64 {
 	return r.idx.AllPostings()
+}
+
+// Dir returns the block directory path.
+func (r *Reader) Dir() string { return r.dir }
+
+// Ref increments the refcount. Called by Querier on snapshot.
+func (r *Reader) Ref() { r.refs.Add(1) }
+
+// Release decrements the refcount. Returns true if the refcount hit zero
+// and the block is condemned (caller should delete the directory).
+func (r *Reader) Release() bool {
+	if r.refs.Add(-1) == 0 {
+		r.Close()
+		return r.condemned.Load()
+	}
+	return false
+}
+
+// Condemn marks the block for directory deletion when refcount reaches zero.
+func (r *Reader) Condemn() { r.condemned.Store(true) }
+
+// RawChunkData returns the raw chunk bytes at the given ref (for compaction).
+func (r *Reader) RawChunkData(ref index.ChunkRef) ([]byte, error) {
+	return r.chunks.chunkData(ref)
 }
 
 // Close releases all resources (munmaps chunk files).

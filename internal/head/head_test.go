@@ -439,29 +439,51 @@ func TestFlushOlderThan(t *testing.T) {
 		name            string
 		numSamples      int // samples per series (each at 15s intervals)
 		flushMaxT       int64
-		wantBlockSeries int // number of series in the block
-		wantBlockExists bool
+		postFlushAppend int   // additional samples to append after flush (0 = none)
+		wantULID        bool  // whether flush produces a block
+		wantBlockSeries int   // number of series in the block (0 if no block)
+		wantBlockCount  int   // samples in the block (0 if no block)
+		wantHeadCount   int   // minimum samples remaining in head after flush
 	}{
 		{
 			name:            "flush_sealed_chunks",
-			numSamples:      250, // 2 sealed chunks (120 each) + 10 active
+			numSamples:      250,
 			flushMaxT:       math.MaxInt64,
+			postFlushAppend: 0,
+			wantULID:        true,
 			wantBlockSeries: 1,
-			wantBlockExists: true,
+			wantBlockCount:  240,
+			wantHeadCount:   10,
 		},
 		{
 			name:            "nothing_to_flush",
-			numSamples:      50, // only active chunk, no sealed
+			numSamples:      50,
 			flushMaxT:       math.MaxInt64,
+			postFlushAppend: 0,
+			wantULID:        false,
 			wantBlockSeries: 0,
-			wantBlockExists: false,
+			wantBlockCount:  0,
+			wantHeadCount:   50,
 		},
 		{
 			name:            "partial_flush_by_time",
 			numSamples:      250,
-			flushMaxT:       120 * 15000, // only flush first sealed chunk
+			flushMaxT:       120 * 15000,
+			postFlushAppend: 0,
+			wantULID:        true,
 			wantBlockSeries: 1,
-			wantBlockExists: true,
+			wantBlockCount:  120,
+			wantHeadCount:   10,
+		},
+		{
+			name:            "flush_then_continue_appending",
+			numSamples:      250,
+			flushMaxT:       math.MaxInt64,
+			postFlushAppend: 10,
+			wantULID:        true,
+			wantBlockSeries: 1,
+			wantBlockCount:  240,
+			wantHeadCount:   10,
 		},
 	}
 
@@ -469,7 +491,6 @@ func TestFlushOlderThan(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			h := openHead(t)
 
-			// Append samples.
 			app := h.Appender()
 			ref, err := app.Append(0, []labels.Label{{Name: "__name__", Value: "temp"}}, 0, 0)
 			require.NoError(t, err)
@@ -479,134 +500,98 @@ func TestFlushOlderThan(t *testing.T) {
 			}
 			require.NoError(t, app.Commit())
 
-			// Flush.
 			ulid, err := h.FlushOlderThan(tc.flushMaxT)
 			require.NoError(t, err)
 
-			if !tc.wantBlockExists {
-				assert.Empty(t, ulid)
-				return
+			// Post-flush appends.
+			if tc.postFlushAppend > 0 {
+				app = h.Appender()
+				for i := tc.numSamples; i < tc.numSamples+tc.postFlushAppend; i++ {
+					_, err = app.Append(ref, nil, int64(i*15000), float64(i))
+					require.NoError(t, err)
+				}
+				require.NoError(t, app.Commit())
 			}
 
-			assert.NotEmpty(t, ulid)
+			// Assert ULID presence.
+			assert.Equal(t, tc.wantULID, ulid != "", "block ULID presence")
 
-			// Verify block exists and is readable.
-			blockDir := filepath.Join(h.DataDir(), ulid)
-			br, err := block.Open(blockDir)
-			require.NoError(t, err)
-			defer br.Close()
-
-			assert.Equal(t, tc.wantBlockSeries, br.Meta.Stats.NumSeries)
-
-			// Verify block data is correct by iterating.
-			if tc.wantBlockSeries > 0 {
+			// Assert block contents.
+			blockCount := 0
+			if ulid != "" {
+				blockDir := filepath.Join(h.DataDir(), ulid)
+				br, err := block.Open(blockDir)
+				require.NoError(t, err)
+				defer br.Close()
+				assert.Equal(t, tc.wantBlockSeries, br.Meta.Stats.NumSeries, "block series count")
 				it, err := br.SeriesChunkIterator(ref, math.MinInt64, math.MaxInt64)
 				require.NoError(t, err)
-				count := 0
 				for it.Next() {
-					count++
+					blockCount++
 				}
 				require.NoError(t, it.Err())
-				assert.Greater(t, count, 0, "block should contain samples")
 			}
+			assert.Equal(t, tc.wantBlockCount, blockCount, "block sample count")
 
-			// Head should still have its active chunk data.
-			allSamples := collectSamples(t, h, ref, math.MinInt64, math.MaxInt64)
-			assert.Greater(t, len(allSamples), 0, "head should still have active chunk")
+			// Assert head still has data.
+			headSamples := collectSamples(t, h, ref, math.MinInt64, math.MaxInt64)
+			assert.GreaterOrEqual(t, len(headSamples), tc.wantHeadCount, "head sample count")
 		})
 	}
 }
 
-func TestFlushThenContinueAppending(t *testing.T) {
-	h := openHead(t)
-
-	// Append enough to seal two chunks (240 samples), plus a few more.
-	app := h.Appender()
-	ref, err := app.Append(0, []labels.Label{{Name: "__name__", Value: "temp"}}, 0, 0)
-	require.NoError(t, err)
-	for i := 1; i < 250; i++ {
-		_, err = app.Append(ref, nil, int64(i*15000), float64(i))
-		require.NoError(t, err)
-	}
-	require.NoError(t, app.Commit())
-
-	// Flush sealed chunks.
-	ulid, err := h.FlushOlderThan(math.MaxInt64)
-	require.NoError(t, err)
-	require.NotEmpty(t, ulid)
-
-	// Continue appending after flush.
-	app = h.Appender()
-	for i := 250; i < 260; i++ {
-		_, err = app.Append(ref, nil, int64(i*15000), float64(i))
-		require.NoError(t, err)
-	}
-	require.NoError(t, app.Commit())
-
-	// Head should have the active chunk data (unflushed).
-	allSamples := collectSamples(t, h, ref, math.MinInt64, math.MaxInt64)
-	assert.Greater(t, len(allSamples), 0)
-
-	// Block should have the flushed data.
-	blockDir := filepath.Join(h.DataDir(), ulid)
-	br, err := block.Open(blockDir)
-	require.NoError(t, err)
-	defer br.Close()
-
-	it, err := br.SeriesChunkIterator(ref, math.MinInt64, math.MaxInt64)
-	require.NoError(t, err)
-	blockCount := 0
-	for it.Next() {
-		blockCount++
-	}
-	require.NoError(t, it.Err())
-	assert.Equal(t, 240, blockCount, "block should contain 2 sealed chunks of 120 samples each")
-}
-
 func TestFlushWALTruncation(t *testing.T) {
-	dir := t.TempDir()
-	walDir := filepath.Join(dir, "wal")
-
-	h, err := Open(walDir, wal.Options{})
-	require.NoError(t, err)
-
-	// Append enough to seal chunks.
-	app := h.Appender()
-	ref, err := app.Append(0, []labels.Label{{Name: "__name__", Value: "temp"}}, 0, 0)
-	require.NoError(t, err)
-	for i := 1; i < 250; i++ {
-		_, err = app.Append(ref, nil, int64(i*15000), float64(i))
-		require.NoError(t, err)
+	tests := []struct {
+		name       string
+		numSamples int
+	}{
+		{name: "250_samples", numSamples: 250},
+		{name: "500_samples", numSamples: 500},
 	}
-	require.NoError(t, app.Commit())
 
-	// Count WAL segments before flush.
-	walEntries, err := os.ReadDir(walDir)
-	require.NoError(t, err)
-	segsBefore := len(walEntries)
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			dir := t.TempDir()
+			walDir := filepath.Join(dir, "wal")
 
-	// Flush.
-	_, err = h.FlushOlderThan(math.MaxInt64)
-	require.NoError(t, err)
+			h, err := Open(walDir, wal.Options{})
+			require.NoError(t, err)
 
-	// WAL segments should have been truncated (or at least not grown).
-	walEntries, err = os.ReadDir(walDir)
-	require.NoError(t, err)
-	segsAfter := len(walEntries)
-	assert.LessOrEqual(t, segsAfter, segsBefore, "WAL should be truncated after flush")
+			app := h.Appender()
+			ref, err := app.Append(0, []labels.Label{{Name: "__name__", Value: "temp"}}, 0, 0)
+			require.NoError(t, err)
+			_ = ref
+			for i := 1; i < tc.numSamples; i++ {
+				_, err = app.Append(ref, nil, int64(i*15000), float64(i))
+				require.NoError(t, err)
+			}
+			require.NoError(t, app.Commit())
 
-	require.NoError(t, h.Close())
+			walEntries, err := os.ReadDir(walDir)
+			require.NoError(t, err)
+			segsBefore := len(walEntries)
 
-	// Re-open: head should recover from WAL (only unflushed data).
-	h2, err := Open(walDir, wal.Options{})
-	require.NoError(t, err)
-	defer h2.Close()
+			_, err = h.FlushOlderThan(math.MaxInt64)
+			require.NoError(t, err)
 
-	// The re-opened head should be functional.
-	app = h2.Appender()
-	_, err = app.Append(0, []labels.Label{{Name: "__name__", Value: "new_series"}}, 5000000, 42.0)
-	require.NoError(t, err)
-	require.NoError(t, app.Commit())
+			walEntries, err = os.ReadDir(walDir)
+			require.NoError(t, err)
+			segsAfter := len(walEntries)
+			assert.LessOrEqual(t, segsAfter, segsBefore, "WAL should be truncated after flush")
+
+			require.NoError(t, h.Close())
+
+			// Re-open: head should be functional.
+			h2, err := Open(walDir, wal.Options{})
+			require.NoError(t, err)
+			defer h2.Close()
+
+			app = h2.Appender()
+			_, err = app.Append(0, []labels.Label{{Name: "__name__", Value: "new_series"}}, 5000000, 42.0)
+			require.NoError(t, err)
+			require.NoError(t, app.Commit())
+		})
+	}
 }
 
 func TestHeadPostings(t *testing.T) {
@@ -642,44 +627,81 @@ func TestHeadPostings(t *testing.T) {
 	}
 }
 
-func TestHeadLabelValues(t *testing.T) {
-	h := openHead(t)
+func TestHeadQueryMethods(t *testing.T) {
+	tests := []struct {
+		name            string
+		series          [][]labels.Label
+		wantLabelValues map[string][]string // label name -> expected values
+		wantLabels      map[uint64][]labels.Label // ref -> expected labels
+		wantAllPostings []uint64
+	}{
+		{
+			name: "multiple_series_with_shared_labels",
+			series: [][]labels.Label{
+				{{Name: "__name__", Value: "temp"}, {Name: "room", Value: "office"}},
+				{{Name: "__name__", Value: "humidity"}, {Name: "room", Value: "office"}},
+				{{Name: "__name__", Value: "temp"}, {Name: "room", Value: "kitchen"}},
+			},
+			wantLabelValues: map[string][]string{
+				"__name__":    {"humidity", "temp"},
+				"room":        {"kitchen", "office"},
+				"nonexistent": {},
+			},
+			wantLabels: map[uint64][]labels.Label{
+				1: {{Name: "__name__", Value: "temp"}, {Name: "room", Value: "office"}},
+				2: {{Name: "__name__", Value: "humidity"}, {Name: "room", Value: "office"}},
+				3: {{Name: "__name__", Value: "temp"}, {Name: "room", Value: "kitchen"}},
+			},
+			wantAllPostings: []uint64{1, 2, 3},
+		},
+		{
+			name: "single_series",
+			series: [][]labels.Label{
+				{{Name: "__name__", Value: "temp"}},
+			},
+			wantLabelValues: map[string][]string{
+				"__name__":    {"temp"},
+				"nonexistent": {},
+			},
+			wantLabels: map[uint64][]labels.Label{
+				1: {{Name: "__name__", Value: "temp"}},
+			},
+			wantAllPostings: []uint64{1},
+		},
+	}
 
-	app := h.Appender()
-	_, err := app.Append(0, []labels.Label{{Name: "__name__", Value: "temp"}, {Name: "room", Value: "office"}}, 1000, 1.0)
-	require.NoError(t, err)
-	_, err = app.Append(0, []labels.Label{{Name: "__name__", Value: "humidity"}, {Name: "room", Value: "office"}}, 1000, 2.0)
-	require.NoError(t, err)
-	_, err = app.Append(0, []labels.Label{{Name: "__name__", Value: "temp"}, {Name: "room", Value: "kitchen"}}, 1000, 3.0)
-	require.NoError(t, err)
-	require.NoError(t, app.Commit())
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			h := openHead(t)
 
-	assert.Equal(t, []string{"humidity", "temp"}, h.LabelValues("__name__"))
-	assert.Equal(t, []string{"kitchen", "office"}, h.LabelValues("room"))
-	assert.Equal(t, []string{}, h.LabelValues("nonexistent"))
-}
+			app := h.Appender()
+			for _, ls := range tc.series {
+				_, err := app.Append(0, ls, 1000, 1.0)
+				require.NoError(t, err)
+			}
+			require.NoError(t, app.Commit())
 
-func TestHeadLabelsAndAllPostings(t *testing.T) {
-	h := openHead(t)
+			// Assert LabelValues.
+			for name, wantVals := range tc.wantLabelValues {
+				got := h.LabelValues(name)
+				assert.Equal(t, wantVals, got, "LabelValues(%q)", name)
+			}
 
-	app := h.Appender()
-	_, err := app.Append(0, []labels.Label{{Name: "__name__", Value: "temp"}}, 1000, 1.0)
-	require.NoError(t, err)
-	_, err = app.Append(0, []labels.Label{{Name: "__name__", Value: "humidity"}}, 1000, 2.0)
-	require.NoError(t, err)
-	require.NoError(t, app.Commit())
+			// Assert Labels by ref.
+			for ref, wantLabels := range tc.wantLabels {
+				ls, ok := h.Labels(ref)
+				assert.True(t, ok, "Labels(%d) should exist", ref)
+				assert.Equal(t, wantLabels, ls, "Labels(%d)", ref)
+			}
 
-	// Labels
-	ls, ok := h.Labels(1)
-	assert.True(t, ok)
-	assert.Equal(t, []labels.Label{{Name: "__name__", Value: "temp"}}, ls)
+			// Unknown ref returns false.
+			_, ok := h.Labels(999)
+			assert.False(t, ok, "Labels(999) should not exist")
 
-	_, ok = h.Labels(999)
-	assert.False(t, ok)
-
-	// AllPostings
-	refs := h.AllPostings()
-	assert.Equal(t, []uint64{1, 2}, refs)
+			// Assert AllPostings.
+			assert.Equal(t, tc.wantAllPostings, h.AllPostings(), "AllPostings")
+		})
+	}
 }
 
 func TestConcurrentAppend(t *testing.T) {
