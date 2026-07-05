@@ -1,7 +1,7 @@
 # Ingot Design Document
 
 ## 1. Problem
-Go programs that need to record metrics locally don't have great options. Prometheus, VictoriaMetrics, and InfluxDB are servers with their own config, ports, and operational overhead. The embedded alternatives are abandoned (tstorage, last updated ~2021) or amount to hand-rolling encoding on top of bbolt/Badger, which are key-val stores with no notion of time.
+Go programs that need to record metrics locally don't have great options. Prometheus, VictoriaMetrics, and InfluxDB are servers with their own config, ports, and operational overhead. The embedded alternatives don't support Gorilla compression (tstorage) or amount to hand-rolling encoding on top of bbolt/Badger, which are key-val stores with no notion of time.
 
 Target users:
 - Edge/IoT - sensor data on a Pi or gateway; buffer locally, sync upstream opportunistically. Can't afford a server dependency.
