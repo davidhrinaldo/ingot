@@ -71,9 +71,12 @@ func (a *xorAppender) Append(t int64, v float64) {
 		a.b.writeBits(math.Float64bits(v), 64)
 
 	case 1:
-		// Second sample: fixed 14-bit first delta, then XOR value.
+		// Second sample: prefix-coded first delta, then XOR value.
+		// The original Gorilla/Prometheus encoding uses a fixed 14-bit
+		// field here, which silently truncates deltas >= 16384ms. We use
+		// a prefix-coded unsigned ladder so arbitrary intervals work.
 		delta := uint64(t - a.t)
-		a.b.writeBits(delta, 14)
+		a.writeUDelta(delta)
 		a.writeVDelta(v)
 		a.tDelta = delta
 
@@ -108,6 +111,26 @@ func (a *xorAppender) Append(t int64, v float64) {
 	a.t = t
 	a.v = v
 	binary.BigEndian.PutUint16(a.b.stream, num+1)
+}
+
+// writeUDelta encodes an unsigned delta using a prefix-coded ladder
+// (14/17/20/64 bit buckets). Same structure as the signed dod ladder
+// but unsigned — the initial timestamp delta is always non-negative.
+func (a *xorAppender) writeUDelta(delta uint64) {
+	switch {
+	case delta < (1 << 14):
+		a.b.writeBits(0b0, 1)
+		a.b.writeBits(delta, 14)
+	case delta < (1 << 17):
+		a.b.writeBits(0b10, 2)
+		a.b.writeBits(delta, 17)
+	case delta < (1 << 20):
+		a.b.writeBits(0b110, 3)
+		a.b.writeBits(delta, 20)
+	default:
+		a.b.writeBits(0b111, 3)
+		a.b.writeBits(delta, 64)
+	}
 }
 
 // bitRange reports whether x fits in an nbits-wide two's-complement field.
@@ -206,9 +229,8 @@ func (it *xorIterator) Next() bool {
 		it.v = math.Float64frombits(v)
 
 	case 1:
-		delta, err := it.br.readBits(14)
-		if err != nil {
-			it.err = err
+		delta := it.readUDelta()
+		if it.err != nil {
 			return false
 		}
 		it.tDelta = delta
@@ -263,6 +285,55 @@ func (it *xorIterator) Next() bool {
 
 	it.read++
 	return true
+}
+
+// readUDelta decodes a prefix-coded unsigned delta (mirrors writeUDelta).
+func (it *xorIterator) readUDelta() uint64 {
+	bit, err := it.br.readBit()
+	if err != nil {
+		it.err = err
+		return 0
+	}
+	if !bit {
+		v, err := it.br.readBits(14)
+		if err != nil {
+			it.err = err
+			return 0
+		}
+		return v
+	}
+	bit, err = it.br.readBit()
+	if err != nil {
+		it.err = err
+		return 0
+	}
+	if !bit {
+		v, err := it.br.readBits(17)
+		if err != nil {
+			it.err = err
+			return 0
+		}
+		return v
+	}
+	bit, err = it.br.readBit()
+	if err != nil {
+		it.err = err
+		return 0
+	}
+	if !bit {
+		v, err := it.br.readBits(20)
+		if err != nil {
+			it.err = err
+			return 0
+		}
+		return v
+	}
+	v, err := it.br.readBits(64)
+	if err != nil {
+		it.err = err
+		return 0
+	}
+	return v
 }
 
 // readSigned reads an nbits two's-complement field and sign-extends it.
