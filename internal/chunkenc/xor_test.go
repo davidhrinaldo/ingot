@@ -199,24 +199,22 @@ func TestXORChunk(t *testing.T) {
 			wantAppenderErr: nonEmptyErr,
 		},
 		{
-			// Header claims 2. Data: 1 valid sample + 14-bit delta + value-changed(1) +
-			// new-window(1), then truncated before leading-zeros field.
-			// Case 1: delta succeeds (it.t updated), readVDelta fails inside
-			// new-window branch at readBits(5).
+			// Header claims 2. Data: 1 valid sample + prefix-coded delta +
+			// value-changed(1), then truncated before new-window bit.
+			// Case 1: delta succeeds (it.t updated), readVDelta fails reading
+			// the new-window bit.
 			name: "truncated_second_vdelta",
 			data: func() []byte {
 				d := make([]byte, 20) // 2 header + 18 data bytes (144 bits)
 				binary.BigEndian.PutUint16(d, 2)
 				binary.BigEndian.PutUint64(d[2:], uint64(1000))
 				binary.BigEndian.PutUint64(d[10:], math.Float64bits(71.3))
-				// Bits 128-141: 14-bit delta = 15 (0b00000000001111)
+				// Bit 128: 0 (prefix: delta fits in 14 bits)
+				// Bits 129-142: delta = 15 (0b00000000001111)
+				// Bit 143: value-changed (1)
 				// Byte 18 (bits 128-135): 0x00
-				// Byte 19 (bits 136-143):
-				//   136-141 = bottom 6 bits of delta (001111)
-				//   142 = value-changed (1)
-				//   143 = new-window (1)
-				//   = 0b00111111 = 0x3F
-				d[19] = 0x3F
+				// Byte 19 (bits 136-143): 0001111 | 1 = 0b00011111 = 0x1F
+				d[19] = 0x1F
 				return d
 			}(),
 			reads: []readOp{
@@ -229,26 +227,32 @@ func TestXORChunk(t *testing.T) {
 		},
 		{
 			// Header claims 3. Data: 2 valid samples (same value, so sample 1
-			// is 14-bit delta + 1-bit value-unchanged = 15 bits). Total data =
-			// 143 bits in 18 bytes (1 padding bit). Sample 2 DoD prefix reads
-			// the padding zero (dod=0, t advances), then readVDelta fails.
+			// is prefix-coded delta (15 bits) + 1-bit value-unchanged = 16 bits).
+			// Sample 2 dod prefix reads zero (dod=0, t advances), value-changed=1,
+			// new-window=1, leading=0, then readBits(6) for sigbits fails.
 			name: "truncated_third_vdelta",
 			data: func() []byte {
-				d := make([]byte, 20) // 2 header + 18 data (144 bits)
+				d := make([]byte, 21) // 2 header + 19 data (152 bits)
 				binary.BigEndian.PutUint16(d, 3)
 				binary.BigEndian.PutUint64(d[2:], uint64(1000))
 				binary.BigEndian.PutUint64(d[10:], math.Float64bits(71.3))
-				// Bits 128-141: 14-bit delta = 15
-				// Bit 142: value-unchanged (0)
-				// Bit 143: padding (0)
-				// Byte 18 = 0x00, Byte 19 = 0b00111100 = 0x3C
-				d[19] = 0x3C
+				// Bit 128: 0 (prefix: delta fits in 14 bits)
+				// Bits 129-142: delta = 15
+				// Bit 143: value-unchanged (0)
+				// Byte 18 = 0x00, Byte 19 = 0b00011110 = 0x1E
+				d[19] = 0x1E
+				// Bit 144: dod=0 (sample 2)
+				// Bit 145: value-changed (1)
+				// Bit 146: new-window (1)
+				// Bits 147-151: leading = 0 (00000)
+				// Byte 20 = 0b01100000 = 0x60
+				d[20] = 0x60
 				return d
 			}(),
 			reads: []readOp{
 				{true, 1000, math.Float64bits(71.3)},
 				{true, 1015, math.Float64bits(71.3)},
-				{false, 1030, math.Float64bits(71.3)}, // dod=0 decoded from padding, vdelta fails
+				{false, 1030, math.Float64bits(71.3)}, // dod=0 decoded, vdelta fails at sigbits read
 			},
 			wantIterErr:     ErrShortStream,
 			maxBytes:        math.MaxInt,
