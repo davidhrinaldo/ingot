@@ -73,9 +73,9 @@ func (s *memSeries) iterator(mint, maxt int64) chunkenc.ChunkIterator {
 	}
 
 	if s.chunk != nil && s.chunk.NumSamples() > 0 && s.chunkMinT <= maxt && s.lastT >= mint {
-		// Snapshot the active chunk bytes for safe concurrent iteration.
-		snap := &chunkenc.XORChunk{}
-		*snap = *s.chunk
+		// Copy-on-read: deep-copy the active chunk's bytes so the
+		// iterator owns its own slice and can't race with appends.
+		snap := chunkenc.XORChunkFromBytes(s.chunk.Bytes())
 		iters = append(iters, snap.Iterator())
 	}
 

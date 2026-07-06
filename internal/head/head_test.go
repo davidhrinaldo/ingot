@@ -910,3 +910,55 @@ func TestConcurrentAppend(t *testing.T) {
 		})
 	}
 }
+
+func TestConcurrentAppendAndQuery(t *testing.T) {
+	h := openHead(t)
+
+	// Create a series and commit an initial sample.
+	app := h.Appender()
+	ls := []labels.Label{{Name: "__name__", Value: "race_test"}}
+	ref, err := app.Append(0, ls, 1000, 1.0)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if err := app.Commit(); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	const iterations = 500
+	var wg sync.WaitGroup
+	wg.Add(2)
+
+	// Writer: keep appending samples.
+	go func() {
+		defer wg.Done()
+		for i := 1; i < iterations; i++ {
+			a := h.Appender()
+			if _, err := a.Append(ref, nil, int64(1000+i*1000), float64(i)); err != nil {
+				t.Errorf("append error: %v", err)
+				return
+			}
+			if err := a.Commit(); err != nil {
+				t.Errorf("commit error: %v", err)
+				return
+			}
+		}
+	}()
+
+	// Reader: keep querying the same series.
+	go func() {
+		defer wg.Done()
+		for i := 0; i < iterations; i++ {
+			it := h.SeriesIterator(ref, math.MinInt64, math.MaxInt64)
+			for it.Next() {
+				it.At()
+			}
+			if it.Err() != nil {
+				t.Errorf("iterator error: %v", it.Err())
+				return
+			}
+		}
+	}()
+
+	wg.Wait()
+}
