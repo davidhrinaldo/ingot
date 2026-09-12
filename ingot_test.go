@@ -198,6 +198,11 @@ func TestAppenderRejectsAppendAfterClose(t *testing.T) {
 			}
 			if got := db.Stats().HeadSeries; got != 0 {
 				t.Fatalf("registered series after close: got %d, want 0", got)
+			}
+		})
+	}
+}
+
 func TestSyncPolicyOptions(t *testing.T) {
 	tests := []struct {
 		name         string
