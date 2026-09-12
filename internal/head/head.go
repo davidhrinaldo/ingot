@@ -29,6 +29,14 @@ type Head struct {
 	minSet  atomic.Bool
 }
 
+type checkpointBlockState uint8
+
+const (
+	checkpointBlockMissing checkpointBlockState = iota
+	checkpointBlockValid
+	checkpointBlockInvalid
+)
+
 // Open creates or recovers a Head backed by a WAL in walDir.
 // The dataDir (parent of walDir) is used for writing blocks.
 func Open(walDir string, walOpts wal.Options) (*Head, error) {
@@ -57,6 +65,7 @@ func (h *Head) replay() error {
 	if err != nil {
 		return err
 	}
+	defer r.Close()
 
 	var acceptedCheckpoint int
 	var checkpoint struct {
@@ -124,8 +133,8 @@ func (h *Head) replay() error {
 			checkpoint.active = false
 			checkpoint.committed = true
 			valid, err := h.checkpointValid(cp)
-			// A later activation record is authoritative even if the source
-			// block has since been compacted, retained, or cannot be opened.
+			// A later activation record can authorize a checkpoint whose source
+			// block has since been compacted or removed by retention.
 			if err != nil {
 				valid = false
 			}
@@ -141,6 +150,13 @@ func (h *Head) replay() error {
 			}
 			if !checkpoint.committed || checkpoint.applied || cp != checkpoint.marker {
 				continue
+			}
+			valid, err := h.activatedCheckpointValid(cp)
+			if err != nil {
+				return fmt.Errorf("head: replay checkpoint activation: %w", err)
+			}
+			if !valid {
+				return fmt.Errorf("head: replay checkpoint activation: source block %q is invalid", cp.BlockULID)
 			}
 			h.applyReplayCheckpoint(checkpoint.series, checkpoint.samples)
 			checkpoint.applied = true
@@ -173,34 +189,59 @@ func (h *Head) applyReplayCheckpoint(series []wal.SeriesRecord, samples [][]wal.
 }
 
 func (h *Head) checkpointValid(cp wal.Checkpoint) (bool, error) {
-	hasOlder, err := h.wal.HasSegmentBefore(cp.StartSegment)
+	state, err := h.checkpointBlockState(cp)
+	return state == checkpointBlockValid, err
+}
+
+func (h *Head) activatedCheckpointValid(cp wal.Checkpoint) (bool, error) {
+	state, err := h.checkpointBlockState(cp)
 	if err != nil {
 		return false, err
 	}
-	if !hasOlder {
-		return true, nil
-	}
-	blockDir := filepath.Join(h.dataDir, cp.BlockULID)
-	br, err := block.Open(blockDir)
-	if err == nil {
-		if br.Meta.ULID != cp.BlockULID {
-			br.Close()
-			return false, nil
+	return state != checkpointBlockInvalid, nil
+}
+
+func (h *Head) activateCheckpoint(cp wal.Checkpoint) error {
+	return h.wal.ActivateCheckpoint(cp, func() error {
+		state, err := h.checkpointBlockState(cp)
+		if err != nil {
+			return err
 		}
-		for _, entry := range br.Series() {
-			for _, chunk := range entry.Chunks {
-				if _, err := br.RawChunkData(chunk.Ref); err != nil {
-					br.Close()
-					return false, err
-				}
+		if state != checkpointBlockValid {
+			return fmt.Errorf("source block %q is not valid", cp.BlockULID)
+		}
+		return nil
+	})
+}
+
+func (h *Head) checkpointBlockState(cp wal.Checkpoint) (checkpointBlockState, error) {
+	blockDir := filepath.Join(h.dataDir, cp.BlockULID)
+	if _, err := os.Stat(blockDir); err != nil {
+		if os.IsNotExist(err) {
+			return checkpointBlockMissing, nil
+		}
+		return checkpointBlockInvalid, err
+	}
+	br, err := block.Open(blockDir)
+	if err != nil {
+		return checkpointBlockInvalid, err
+	}
+	if br.Meta.ULID != cp.BlockULID {
+		br.Close()
+		return checkpointBlockInvalid, nil
+	}
+	for _, entry := range br.Series() {
+		for _, chunk := range entry.Chunks {
+			if _, err := br.RawChunkData(chunk.Ref); err != nil {
+				br.Close()
+				return checkpointBlockInvalid, err
 			}
 		}
-		return true, br.Close()
 	}
-	if os.IsNotExist(err) {
-		return false, nil
+	if err := br.Close(); err != nil {
+		return checkpointBlockInvalid, err
 	}
-	return false, err
+	return checkpointBlockValid, nil
 }
 
 func (h *Head) resetReplayState() {
@@ -374,7 +415,7 @@ func (h *Head) flushOlderThan(maxT int64, install func(string) error) (string, e
 	if err := prepared.Publish(); err != nil {
 		return "", fmt.Errorf("head: publish block: %w", err)
 	}
-	if err := h.wal.ActivateCheckpoint(checkpoint); err != nil {
+	if err := h.activateCheckpoint(checkpoint); err != nil {
 		return prepared.ULID, fmt.Errorf("head: activate WAL checkpoint: %w", err)
 	}
 	if install != nil {
