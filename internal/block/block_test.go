@@ -305,6 +305,60 @@ func TestBlockSeriesChunkIterator(t *testing.T) {
 	}
 }
 
+func TestBlockSeriesChunkIteratorOverlappingChunks(t *testing.T) {
+	first := []sample{s(0, 0), s(50, 1), s(100, 2)}
+	second := []sample{s(50, 20), s(75, 3), s(100, 30), s(150, 4)}
+	dataDir := t.TempDir()
+	ulid, err := Flush(dataDir, []SeriesFlush{{
+		Ref:    1,
+		Labels: labels.FromStrings("__name__", "overlap"),
+		Chunks: []ChunkData{
+			{MinT: 0, MaxT: 100, Data: makeChunk(t, first)},
+			{MinT: 50, MaxT: 150, Data: makeChunk(t, second)},
+		},
+	}})
+	if err != nil {
+		t.Fatalf("flush block: %v", err)
+	}
+	r, err := Open(filepath.Join(dataDir, ulid))
+	if err != nil {
+		t.Fatalf("open block: %v", err)
+	}
+	defer r.Close()
+
+	tests := []struct {
+		name string
+		mint int64
+		maxt int64
+		want []sample
+	}{
+		{
+			name: "full_range_deduplicates_by_chunk_order",
+			mint: math.MinInt64,
+			maxt: math.MaxInt64,
+			want: []sample{s(0, 0), s(50, 1), s(75, 3), s(100, 2), s(150, 4)},
+		},
+		{
+			name: "maxt_inside_both_chunks",
+			mint: 0,
+			maxt: 75,
+			want: []sample{s(0, 0), s(50, 1), s(75, 3)},
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			it, err := r.SeriesChunkIterator(1, tc.mint, tc.maxt)
+			if err != nil {
+				t.Fatalf("create iterator: %v", err)
+			}
+			if got := collectIterator(t, it); !reflect.DeepEqual(got, tc.want) {
+				t.Fatalf("samples: got %v, want %v", got, tc.want)
+			}
+		})
+	}
+}
+
 func TestBlockMetaTimeBounds(t *testing.T) {
 	tests := []struct {
 		name     string

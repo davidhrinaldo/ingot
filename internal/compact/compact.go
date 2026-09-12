@@ -76,12 +76,10 @@ func (c *Compactor) planLevel(blocks []*block.Reader, level int) *CompactionGrou
 		return nil
 	}
 
-	// Sort by MinTime.
+	// Sort by the same precedence used by queries.
 	sorted := make([]*block.Reader, len(blocks))
 	copy(sorted, blocks)
-	sort.Slice(sorted, func(i, j int) bool {
-		return sorted[i].Meta.MinTime < sorted[j].Meta.MinTime
-	})
+	sortBlockReaders(sorted)
 
 	// Determine the max span for the next level.
 	var maxSpan int64
@@ -129,9 +127,15 @@ func (c *Compactor) Compact(sources []*block.Reader) (string, error) {
 		return "", fmt.Errorf("compact: no source blocks")
 	}
 
+	orderedSources := make([]*block.Reader, len(sources))
+	copy(orderedSources, sources)
+	sortBlockReaders(orderedSources)
+
 	merged := make(map[uint64]*mergedEntry)
 
-	for _, src := range sources {
+	// Retain source precedence in chunk order. Block readers perform an
+	// intra-series timestamp merge when these chunk ranges overlap.
+	for _, src := range orderedSources {
 		for _, entry := range src.Series() {
 			me, ok := merged[entry.Ref]
 			if !ok {
@@ -172,8 +176,8 @@ func (c *Compactor) Compact(sources []*block.Reader) (string, error) {
 
 	// Determine new compaction level and collect source ULIDs.
 	maxLevel := 0
-	sourceULIDs := make([]string, 0, len(sources))
-	for _, src := range sources {
+	sourceULIDs := make([]string, 0, len(orderedSources))
+	for _, src := range orderedSources {
 		if src.Meta.Compaction.Level > maxLevel {
 			maxLevel = src.Meta.Compaction.Level
 		}
@@ -181,6 +185,15 @@ func (c *Compactor) Compact(sources []*block.Reader) (string, error) {
 	}
 
 	return block.FlushCompacted(c.dataDir, flushData, maxLevel+1, sourceULIDs)
+}
+
+func sortBlockReaders(readers []*block.Reader) {
+	sort.Slice(readers, func(i, j int) bool {
+		if readers[i].Meta.MinTime != readers[j].Meta.MinTime {
+			return readers[i].Meta.MinTime < readers[j].Meta.MinTime
+		}
+		return readers[i].Meta.ULID < readers[j].Meta.ULID
+	})
 }
 
 // Expired returns blocks whose MaxTime is older than the retention window.
