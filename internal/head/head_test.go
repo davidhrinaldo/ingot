@@ -626,7 +626,7 @@ func TestCommitRevalidatesBatchBeforeWALWrite(t *testing.T) {
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
 			dir := filepath.Join(t.TempDir(), "wal")
-			h, err := Open(dir, wal.Options{SyncInterval: -1})
+			h, err := Open(dir, wal.Options{SyncPolicy: wal.SyncOnCommit})
 			if err != nil {
 				t.Fatalf("open head: %v", err)
 			}
@@ -663,7 +663,7 @@ func TestCommitRevalidatesBatchBeforeWALWrite(t *testing.T) {
 				t.Fatalf("close head: %v", err)
 			}
 
-			h, err = Open(dir, wal.Options{SyncInterval: -1})
+			h, err = Open(dir, wal.Options{SyncPolicy: wal.SyncOnCommit})
 			if err != nil {
 				t.Fatalf("reopen head: %v", err)
 			}
