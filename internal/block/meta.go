@@ -51,5 +51,32 @@ func writeMeta(dir string, m BlockMeta) error {
 	if err != nil {
 		return err
 	}
-	return os.WriteFile(filepath.Join(dir, metaFilename), data, 0644)
+	tmpPath := filepath.Join(dir, metaFilename+".tmp")
+	metaPath := filepath.Join(dir, metaFilename)
+	f, err := os.OpenFile(tmpPath, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0644)
+	if err != nil {
+		return err
+	}
+	removeTmp := true
+	defer func() {
+		if removeTmp {
+			os.Remove(tmpPath)
+		}
+	}()
+	if _, err := f.Write(data); err != nil {
+		f.Close()
+		return err
+	}
+	if err := f.Sync(); err != nil {
+		f.Close()
+		return err
+	}
+	if err := f.Close(); err != nil {
+		return err
+	}
+	if err := os.Rename(tmpPath, metaPath); err != nil {
+		return err
+	}
+	removeTmp = false
+	return nil
 }

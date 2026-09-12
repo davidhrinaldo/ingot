@@ -1,6 +1,7 @@
 package head
 
 import (
+	"fmt"
 	"math"
 	"os"
 	"path/filepath"
@@ -509,16 +510,103 @@ func TestWALReplay(t *testing.T) {
 	}
 }
 
+func TestCommitLogsSharedPendingSeries(t *testing.T) {
+	dir := filepath.Join(t.TempDir(), "wal")
+	h, err := Open(dir, wal.Options{SyncInterval: -1})
+	if err != nil {
+		t.Fatalf("open head: %v", err)
+	}
+
+	labels := []labels.Label{{Name: "__name__", Value: "temp"}}
+	pending := h.Appender()
+	ref, err := pending.Append(0, labels, 1, 1)
+	if err != nil {
+		t.Fatalf("append pending sample: %v", err)
+	}
+	committed := h.Appender()
+	sharedRef, err := committed.Append(0, labels, 2, 2)
+	if err != nil {
+		t.Fatalf("append shared sample: %v", err)
+	}
+	if sharedRef != ref {
+		t.Fatalf("shared ref: got %d, want %d", sharedRef, ref)
+	}
+	if err := pending.Rollback(); err != nil {
+		t.Fatalf("rollback creating appender: %v", err)
+	}
+	if err := committed.Commit(); err != nil {
+		t.Fatalf("commit shared sample: %v", err)
+	}
+	if err := h.Close(); err != nil {
+		t.Fatalf("close head: %v", err)
+	}
+
+	h, err = Open(dir, wal.Options{SyncInterval: -1})
+	if err != nil {
+		t.Fatalf("reopen head: %v", err)
+	}
+	defer h.Close()
+	got := collectSamples(t, h, ref, math.MinInt64, math.MaxInt64)
+	if len(got) != 1 || got[0] != s(2, 2) {
+		t.Fatalf("replayed samples: got %v, want %v", got, []sample{s(2, 2)})
+	}
+}
+
+func TestActivatedCheckpointRecoveryWithoutSourceBlock(t *testing.T) {
+	dir := filepath.Join(t.TempDir(), "wal")
+	opts := wal.Options{SegmentMaxSize: 128, SyncInterval: -1}
+	h, err := Open(dir, opts)
+	if err != nil {
+		t.Fatalf("open head: %v", err)
+	}
+	app := h.Appender()
+	ref, err := app.Append(0, []labels.Label{{Name: "__name__", Value: "temp"}}, 1, 1)
+	if err != nil {
+		t.Fatalf("append first sample: %v", err)
+	}
+	if _, err := app.Append(ref, nil, 2, 2); err != nil {
+		t.Fatalf("append second sample: %v", err)
+	}
+	if err := app.Commit(); err != nil {
+		t.Fatalf("commit: %v", err)
+	}
+
+	cp, err := h.wal.Checkpoint(
+		"removed-block",
+		[]wal.SeriesRecord{{Ref: ref, Labels: []labels.Label{{Name: "__name__", Value: "temp"}}}},
+		[][]wal.RefSample{{{Ref: ref, T: 2, V: 2}}},
+	)
+	if err != nil {
+		t.Fatalf("checkpoint: %v", err)
+	}
+	if err := h.wal.ActivateCheckpoint(cp); err != nil {
+		t.Fatalf("activate checkpoint: %v", err)
+	}
+	if err := h.Close(); err != nil {
+		t.Fatalf("close head: %v", err)
+	}
+
+	h, err = Open(dir, opts)
+	if err != nil {
+		t.Fatalf("reopen head: %v", err)
+	}
+	defer h.Close()
+	got := collectSamples(t, h, ref, math.MinInt64, math.MaxInt64)
+	if len(got) != 1 || got[0] != s(2, 2) {
+		t.Fatalf("replayed samples: got %v, want %v", got, []sample{s(2, 2)})
+	}
+}
+
 func TestFlushOlderThan(t *testing.T) {
 	tests := []struct {
 		name            string
 		numSamples      int // samples per series (each at 15s intervals)
 		flushMaxT       int64
-		postFlushAppend int   // additional samples to append after flush (0 = none)
-		wantULID        bool  // whether flush produces a block
-		wantBlockSeries int   // number of series in the block (0 if no block)
-		wantBlockCount  int   // samples in the block (0 if no block)
-		wantHeadCount   int   // minimum samples remaining in head after flush
+		postFlushAppend int  // additional samples to append after flush (0 = none)
+		wantULID        bool // whether flush produces a block
+		wantBlockSeries int  // number of series in the block (0 if no block)
+		wantBlockCount  int  // samples in the block (0 if no block)
+		wantHeadCount   int  // minimum samples remaining in head after flush
 	}{
 		{
 			name:            "flush_sealed_chunks",
@@ -720,6 +808,214 @@ func TestFlushWALTruncation(t *testing.T) {
 	}
 }
 
+func TestFlushCheckpointRecovery(t *testing.T) {
+	dir := t.TempDir()
+	walDir := filepath.Join(dir, "wal")
+	opts := wal.Options{SegmentMaxSize: 128, SyncInterval: -1}
+	h, err := Open(walDir, opts)
+	if err != nil {
+		t.Fatalf("open head: %v", err)
+	}
+
+	app := h.Appender()
+	tempRef, err := app.Append(0, []labels.Label{{Name: "__name__", Value: "temp"}}, 0, 0)
+	if err != nil {
+		t.Fatalf("append temp: %v", err)
+	}
+	for i := 1; i < 370; i++ {
+		if _, err := app.Append(tempRef, nil, int64(i), float64(i)); err != nil {
+			t.Fatalf("append temp sample %d: %v", i, err)
+		}
+	}
+	humidityRef, err := app.Append(0, []labels.Label{{Name: "__name__", Value: "humidity"}}, 1000, 1000)
+	if err != nil {
+		t.Fatalf("append humidity: %v", err)
+	}
+	for i := 1; i < 50; i++ {
+		if _, err := app.Append(humidityRef, nil, int64(1000+i), float64(1000+i)); err != nil {
+			t.Fatalf("append humidity sample %d: %v", i, err)
+		}
+	}
+	if err := app.Commit(); err != nil {
+		t.Fatalf("commit: %v", err)
+	}
+
+	ulid, err := h.FlushOlderThan(119)
+	if err != nil {
+		t.Fatalf("flush: %v", err)
+	}
+	if ulid == "" {
+		t.Fatal("flush did not create a block")
+	}
+	if err := h.Close(); err != nil {
+		t.Fatalf("close head: %v", err)
+	}
+
+	entries, err := os.ReadDir(walDir)
+	if err != nil {
+		t.Fatalf("read WAL directory: %v", err)
+	}
+	if len(entries) < 2 {
+		t.Fatalf("WAL segment count: got %d, want at least 2", len(entries))
+	}
+
+	h, err = Open(walDir, opts)
+	if err != nil {
+		t.Fatalf("reopen head: %v", err)
+	}
+	defer h.Close()
+
+	tempSamples := collectSamples(t, h, tempRef, math.MinInt64, math.MaxInt64)
+	if len(tempSamples) != 250 {
+		t.Fatalf("replayed temp samples: got %d, want 250", len(tempSamples))
+	}
+	if tempSamples[0] != s(120, 120) || tempSamples[249] != s(369, 369) {
+		t.Fatalf("replayed temp sample range: got %v..%v, want 120..369", tempSamples[0], tempSamples[249])
+	}
+	humiditySamples := collectSamples(t, h, humidityRef, math.MinInt64, math.MaxInt64)
+	if len(humiditySamples) != 50 {
+		t.Fatalf("replayed humidity samples: got %d, want 50", len(humiditySamples))
+	}
+	if got, ok := h.Labels(humidityRef); !ok || !labels.Equal(got, []labels.Label{{Name: "__name__", Value: "humidity"}}) {
+		t.Fatalf("replayed humidity labels: got %v, ok=%v", got, ok)
+	}
+
+	app = h.Appender()
+	if _, err := app.Append(humidityRef, nil, 2000, 2000); err != nil {
+		t.Fatalf("append by recovered ref: %v", err)
+	}
+	if err := app.Commit(); err != nil {
+		t.Fatalf("commit by recovered ref: %v", err)
+	}
+}
+
+func TestCheckpointRecoveryAcrossBlockPublication(t *testing.T) {
+	dir := t.TempDir()
+	walDir := filepath.Join(dir, "wal")
+	opts := wal.Options{SegmentMaxSize: 128, SyncInterval: -1}
+	h, err := Open(walDir, opts)
+	if err != nil {
+		t.Fatalf("open head: %v", err)
+	}
+
+	app := h.Appender()
+	ref, err := app.Append(0, []labels.Label{{Name: "__name__", Value: "temp"}}, 0, 0)
+	if err != nil {
+		t.Fatalf("append: %v", err)
+	}
+	for i := 1; i < 250; i++ {
+		if _, err := app.Append(ref, nil, int64(i), float64(i)); err != nil {
+			t.Fatalf("append sample %d: %v", i, err)
+		}
+	}
+	if err := app.Commit(); err != nil {
+		t.Fatalf("commit: %v", err)
+	}
+
+	series := h.series.getByRef(ref)
+	series.mu.Lock()
+	flushData := []block.SeriesFlush{{Ref: ref, Labels: series.labels}}
+	for _, cm := range series.sealed {
+		flushData[0].Chunks = append(flushData[0].Chunks, block.ChunkData{
+			MinT: cm.minT,
+			MaxT: cm.maxT,
+			Data: append([]byte(nil), cm.chunk.Bytes()...),
+		})
+	}
+	series.mu.Unlock()
+	prepared, err := block.PrepareFlush(dir, flushData)
+	if err != nil {
+		t.Fatalf("prepare block: %v", err)
+	}
+
+	remaining := make([]wal.RefSample, 0, 10)
+	for i := 240; i < 250; i++ {
+		remaining = append(remaining, wal.RefSample{Ref: ref, T: int64(i), V: float64(i)})
+	}
+	checkpoint, err := h.wal.Checkpoint(
+		prepared.ULID,
+		[]wal.SeriesRecord{{Ref: ref, Labels: []labels.Label{{Name: "__name__", Value: "temp"}}}},
+		[][]wal.RefSample{remaining},
+	)
+	if err != nil {
+		t.Fatalf("checkpoint: %v", err)
+	}
+	if err := h.Close(); err != nil {
+		t.Fatalf("close before publication: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(dir, prepared.ULID, "meta.json")); !os.IsNotExist(err) {
+		t.Fatalf("block visible before publication: %v", err)
+	}
+
+	// Before block publication, recovery must ignore the checkpoint and retain
+	// the original WAL state.
+	h, err = Open(walDir, opts)
+	if err != nil {
+		t.Fatalf("reopen before publication: %v", err)
+	}
+	if got := len(collectSamples(t, h, ref, math.MinInt64, math.MaxInt64)); got != 250 {
+		t.Fatalf("samples before publication: got %d, want 250", got)
+	}
+	if err := h.Close(); err != nil {
+		t.Fatalf("close recovered head: %v", err)
+	}
+
+	if err := prepared.Publish(); err != nil {
+		t.Fatalf("publish block: %v", err)
+	}
+	br, err := block.Open(filepath.Join(dir, prepared.ULID))
+	if err != nil {
+		t.Fatalf("open published block: %v", err)
+	}
+	it, err := br.SeriesChunkIterator(ref, math.MinInt64, math.MaxInt64)
+	if err != nil {
+		br.Close()
+		t.Fatalf("read published block: %v", err)
+	}
+	blockSamples := 0
+	for it.Next() {
+		blockSamples++
+	}
+	if err := it.Err(); err != nil {
+		br.Close()
+		t.Fatalf("iterate published block: %v", err)
+	}
+	if err := br.Close(); err != nil {
+		t.Fatalf("close published block: %v", err)
+	}
+	if blockSamples != 240 {
+		t.Fatalf("published block samples: got %d, want 240", blockSamples)
+	}
+
+	// After publication, the exact same committed checkpoint becomes the
+	// recovery boundary even if old segments have not yet been deleted.
+	h, err = Open(walDir, opts)
+	if err != nil {
+		t.Fatalf("reopen after publication: %v", err)
+	}
+	if got := len(collectSamples(t, h, ref, math.MinInt64, math.MaxInt64)); got != 10 {
+		t.Fatalf("samples after publication: got %d, want 10", got)
+	}
+	for i := 1; i < checkpoint.StartSegment; i++ {
+		path := filepath.Join(walDir, fmt.Sprintf("%08d", i))
+		if _, err := os.Stat(path); !os.IsNotExist(err) {
+			t.Fatalf("pre-checkpoint segment %d still exists after recovery", i)
+		}
+	}
+	if err := h.Close(); err != nil {
+		t.Fatalf("close after publication: %v", err)
+	}
+
+	h, err = Open(walDir, opts)
+	if err != nil {
+		t.Fatalf("reopen after truncation: %v", err)
+	}
+	defer h.Close()
+	if got := len(collectSamples(t, h, ref, math.MinInt64, math.MaxInt64)); got != 10 {
+		t.Fatalf("samples after truncation: got %d, want 10", got)
+	}
+}
+
 func TestHeadPostings(t *testing.T) {
 	h := openHead(t)
 
@@ -767,8 +1063,8 @@ func TestHeadQueryMethods(t *testing.T) {
 	tests := []struct {
 		name            string
 		series          [][]labels.Label
-		wantLabelValues map[string][]string          // label name -> expected values
-		wantLabels      map[uint64][]labels.Label    // ref -> expected labels
+		wantLabelValues map[string][]string       // label name -> expected values
+		wantLabels      map[uint64][]labels.Label // ref -> expected labels
 		wantAllPostings []uint64
 	}{
 		{

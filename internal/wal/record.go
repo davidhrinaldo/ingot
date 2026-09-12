@@ -14,8 +14,13 @@ import (
 type RecordType byte
 
 const (
-	RecordSeries  RecordType = 1
-	RecordSamples RecordType = 2
+	RecordSeries             RecordType = 1
+	RecordSamples            RecordType = 2
+	RecordCheckpointBegin    RecordType = 3
+	RecordCheckpointSeries   RecordType = 4
+	RecordCheckpointSamples  RecordType = 5
+	RecordCheckpointCommit   RecordType = 6
+	RecordCheckpointActivate RecordType = 7
 )
 
 const (
@@ -75,6 +80,34 @@ func DecodeRecord(b []byte) (typ RecordType, payload []byte, consumed int, err e
 	}
 
 	return typ, b[recordHeaderSize : recordHeaderSize+payloadLen], total, nil
+}
+
+// Checkpoint identifies a complete head snapshot and the block whose
+// publication makes that snapshot safe to recover from.
+type Checkpoint struct {
+	StartSegment int
+	BlockULID    string
+}
+
+// EncodeCheckpoint appends a checkpoint marker payload to dst.
+func EncodeCheckpoint(dst []byte, cp Checkpoint) []byte {
+	dst = grow(dst, 8+len(cp.BlockULID))
+	off := len(dst) - 8 - len(cp.BlockULID)
+	binary.BigEndian.PutUint64(dst[off:], uint64(cp.StartSegment))
+	copy(dst[off+8:], cp.BlockULID)
+	return dst
+}
+
+// DecodeCheckpoint decodes a checkpoint marker payload.
+func DecodeCheckpoint(b []byte) (Checkpoint, error) {
+	if len(b) <= 8 {
+		return Checkpoint{}, ErrInvalidRecord
+	}
+	start := binary.BigEndian.Uint64(b[:8])
+	if start == 0 || start > uint64(^uint(0)>>1) {
+		return Checkpoint{}, ErrInvalidRecord
+	}
+	return Checkpoint{StartSegment: int(start), BlockULID: string(b[8:])}, nil
 }
 
 // grow appends n zero bytes to dst and returns the extended slice.

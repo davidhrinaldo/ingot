@@ -48,6 +48,8 @@ func (a *Appender) appendByLabels(ls []labels.Label, t int64, v float64) (uint64
 	}
 
 	hash := labels.Hash(ls)
+	a.head.commitMu.Lock()
+	defer a.head.commitMu.Unlock()
 	s := a.head.series.getByHash(hash, ls)
 
 	if s == nil {
@@ -60,6 +62,8 @@ func (a *Appender) appendByLabels(ls []labels.Label, t int64, v float64) (uint64
 		a.head.series.set(hash, s)
 		a.newSeries = append(a.newSeries, wal.SeriesRecord{Ref: ref, Labels: s.labels})
 		a.newHashes = append(a.newHashes, hash)
+	} else if !s.walLogged && !a.ownsSeries(s.ref) {
+		s.sharedPending = true
 	}
 
 	if err := a.checkTimestamp(s.ref, t); err != nil {
@@ -71,10 +75,16 @@ func (a *Appender) appendByLabels(ls []labels.Label, t int64, v float64) (uint64
 }
 
 func (a *Appender) appendByRef(ref uint64, t int64, v float64) (uint64, error) {
+	a.head.commitMu.Lock()
 	s := a.head.series.getByRef(ref)
 	if s == nil {
+		a.head.commitMu.Unlock()
 		return 0, ErrSeriesNotFound
 	}
+	if !s.walLogged && !a.ownsSeries(ref) {
+		s.sharedPending = true
+	}
+	a.head.commitMu.Unlock()
 
 	if err := a.checkTimestamp(ref, t); err != nil {
 		return 0, err
@@ -114,11 +124,23 @@ func (a *Appender) Commit() error {
 		return ErrAppenderClosed
 	}
 	a.closed = true
+	a.head.commitMu.Lock()
+	defer a.head.commitMu.Unlock()
 
-	// WAL: series records first, then samples.
-	if len(a.newSeries) > 0 {
-		if err := a.head.wal.LogSeries(a.newSeries); err != nil {
-			return err
+	// A series may have been created by another appender that has not committed.
+	// Log unresolved definitions here so samples never precede their series.
+	seen := make(map[uint64]struct{}, len(a.samples))
+	for _, sample := range a.samples {
+		if _, ok := seen[sample.Ref]; ok {
+			continue
+		}
+		seen[sample.Ref] = struct{}{}
+		s := a.head.series.getByRef(sample.Ref)
+		if s != nil && !s.walLogged {
+			if err := a.head.wal.LogSeries([]wal.SeriesRecord{{Ref: s.ref, Labels: s.labels}}); err != nil {
+				return err
+			}
+			s.walLogged = true
 		}
 	}
 	if len(a.samples) > 0 {
@@ -142,11 +164,19 @@ func (a *Appender) Rollback() error {
 		return ErrAppenderClosed
 	}
 	a.closed = true
+	a.head.commitMu.Lock()
+	defer a.head.commitMu.Unlock()
 
 	// Remove new series that were registered but never committed.
 	for i, rec := range a.newSeries {
 		s := a.head.series.getByRef(rec.Ref)
-		if s != nil && !s.hasData {
+		if s == nil {
+			continue
+		}
+		s.mu.Lock()
+		hasData := s.hasData
+		s.mu.Unlock()
+		if !hasData && !s.walLogged && !s.sharedPending {
 			a.head.series.remove(a.newHashes[i], s)
 		}
 	}
@@ -155,6 +185,15 @@ func (a *Appender) Rollback() error {
 	a.newHashes = nil
 	a.samples = nil
 	return nil
+}
+
+func (a *Appender) ownsSeries(ref uint64) bool {
+	for _, rec := range a.newSeries {
+		if rec.Ref == ref {
+			return true
+		}
+	}
+	return false
 }
 
 func copyLabels(ls []labels.Label) []labels.Label {

@@ -2,6 +2,7 @@ package wal
 
 import (
 	"os"
+	"path/filepath"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -59,6 +60,9 @@ func Open(dir string, opts Options) (*WAL, error) {
 	if err := os.MkdirAll(dir, 0755); err != nil {
 		return nil, err
 	}
+	if err := syncDir(filepath.Dir(dir)); err != nil {
+		return nil, err
+	}
 
 	// Recover existing segments.
 	if err := recover(dir); err != nil {
@@ -85,6 +89,10 @@ func Open(dir string, opts Options) (*WAL, error) {
 			return nil, err
 		}
 		w.segment = f
+		if err := syncDir(dir); err != nil {
+			f.Close()
+			return nil, err
+		}
 	} else {
 		// Append to the last segment.
 		idx := segs[len(segs)-1]
@@ -157,6 +165,59 @@ func (w *WAL) LogSamples(samples []RefSample) error {
 	return w.Log(RecordSamples, payload)
 }
 
+// Checkpoint writes and fsyncs a complete snapshot of the live head into new
+// WAL segments. Older segments must remain in place until the block identified
+// by blockULID has been published durably.
+func (w *WAL) Checkpoint(blockULID string, series []SeriesRecord, samples [][]RefSample) (Checkpoint, error) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+
+	if err := w.rotate(); err != nil {
+		return Checkpoint{}, err
+	}
+	startSegment := w.segmentIdx
+	cp := Checkpoint{StartSegment: startSegment, BlockULID: blockULID}
+	marker := EncodeCheckpoint(nil, cp)
+	if err := w.logLocked(RecordCheckpointBegin, marker); err != nil {
+		return Checkpoint{}, err
+	}
+	for _, rec := range series {
+		if err := w.logLocked(RecordCheckpointSeries, EncodeSeriesRecord(nil, rec)); err != nil {
+			return Checkpoint{}, err
+		}
+	}
+	for _, batch := range samples {
+		if len(batch) == 0 {
+			continue
+		}
+		if err := w.logLocked(RecordCheckpointSamples, EncodeSamplesRecord(nil, batch)); err != nil {
+			return Checkpoint{}, err
+		}
+	}
+	if err := w.logLocked(RecordCheckpointCommit, marker); err != nil {
+		return Checkpoint{}, err
+	}
+	if err := w.timedSync(); err != nil {
+		return Checkpoint{}, err
+	}
+	if err := syncDir(w.dir); err != nil {
+		return Checkpoint{}, err
+	}
+	return cp, nil
+}
+
+// ActivateCheckpoint records that the checkpoint's block was published. Once
+// this record is durable, recovery does not depend on the source block existing.
+func (w *WAL) ActivateCheckpoint(cp Checkpoint) error {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+
+	if err := w.logLocked(RecordCheckpointActivate, EncodeCheckpoint(nil, cp)); err != nil {
+		return err
+	}
+	return w.timedSync()
+}
+
 // Replay returns a Reader over all WAL segments. The caller must Close
 // the reader when done.
 func (w *WAL) Replay() (*Reader, error) {
@@ -174,6 +235,15 @@ func (w *WAL) Sync() error {
 func (w *WAL) LastSyncDuration() float64 {
 	ns := w.lastSyncDur.Load()
 	return float64(ns) / 1e9
+}
+
+// HasSegmentBefore reports whether a WAL segment predating index still exists.
+func (w *WAL) HasSegmentBefore(index int) (bool, error) {
+	segs, err := listSegments(w.dir)
+	if err != nil {
+		return false, err
+	}
+	return len(segs) > 0 && segs[0] < index, nil
 }
 
 // timedSync fsyncs the segment and records the duration. Caller must hold w.mu.
@@ -202,7 +272,7 @@ func (w *WAL) Truncate(below int) error {
 			return err
 		}
 	}
-	return nil
+	return syncDir(w.dir)
 }
 
 // LastSegment returns the index of the current active segment.
@@ -247,7 +317,20 @@ func (w *WAL) rotate() error {
 	}
 	w.segment = f
 	w.segmentOff = 0
-	return nil
+	return syncDir(w.dir)
+}
+
+// logLocked writes a record while w.mu is held.
+func (w *WAL) logLocked(typ RecordType, payload []byte) error {
+	w.buf = EncodeRecord(w.buf[:0], typ, payload)
+	if w.segmentOff+int64(len(w.buf)) > int64(w.opts.segmentMaxSize()) {
+		if err := w.rotate(); err != nil {
+			return err
+		}
+	}
+	n, err := w.segment.Write(w.buf)
+	w.segmentOff += int64(n)
+	return err
 }
 
 func (w *WAL) syncLoop(interval time.Duration) {
@@ -265,4 +348,13 @@ func (w *WAL) syncLoop(interval time.Duration) {
 			w.mu.Unlock()
 		}
 	}
+}
+
+func syncDir(dir string) error {
+	d, err := os.Open(filepath.Clean(dir))
+	if err != nil {
+		return err
+	}
+	defer d.Close()
+	return d.Sync()
 }
