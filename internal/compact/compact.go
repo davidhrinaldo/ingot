@@ -162,6 +162,12 @@ func (c *Compactor) Compact(sources []*block.Reader) (string, error) {
 	// Build flush data sorted by ref for deterministic output.
 	flushData := make([]block.SeriesFlush, 0, len(merged))
 	for _, me := range merged {
+		sort.SliceStable(me.chunks, func(i, j int) bool {
+			if me.chunks[i].MinT != me.chunks[j].MinT {
+				return me.chunks[i].MinT < me.chunks[j].MinT
+			}
+			return me.chunks[i].MaxT < me.chunks[j].MaxT
+		})
 		flushData = append(flushData, block.SeriesFlush{
 			Ref:    me.ref,
 			Labels: me.labels,

@@ -263,6 +263,30 @@ func TestCompact(t *testing.T) {
 			},
 			wantLevel: 3,
 		},
+		{
+			name: "sort_series_chunks_independently_of_source_blocks",
+			sourceBlocks: []sourceBlock{
+				{
+					level: 1,
+					series: []seriesData{
+						{ref: 1, labels: labels.FromStrings("__name__", "shared"), samples: []sample{{3000, 3.0}, {4000, 4.0}}},
+						{ref: 2, labels: labels.FromStrings("__name__", "early"), samples: []sample{{0, 0.0}}},
+					},
+				},
+				{
+					level: 1,
+					series: []seriesData{
+						{ref: 1, labels: labels.FromStrings("__name__", "shared"), samples: []sample{{1000, 1.0}, {2000, 2.0}}},
+					},
+				},
+			},
+			wantSeriesRefs: []uint64{1, 2},
+			wantSamples: map[uint64][]sample{
+				1: {{1000, 1.0}, {2000, 2.0}, {3000, 3.0}, {4000, 4.0}},
+				2: {{0, 0.0}},
+			},
+			wantLevel: 2,
+		},
 	}
 
 	for _, tc := range tests {
