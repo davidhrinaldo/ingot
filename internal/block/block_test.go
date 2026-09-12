@@ -266,6 +266,65 @@ func TestBlockLabelLengthLimitAndOwnership(t *testing.T) {
 	}
 }
 
+func TestBlockSeriesResultsAreDefensive(t *testing.T) {
+	wantLabels := labels.FromStrings("__name__", "temp", "room", "office")
+	dataDir := t.TempDir()
+	ulid, err := Flush(dataDir, []SeriesFlush{{
+		Ref:    1,
+		Labels: wantLabels,
+		Chunks: []ChunkData{{MinT: 1, MaxT: 1, Data: makeChunk(t, []sample{s(1, 1)})}},
+	}})
+	if err != nil {
+		t.Fatalf("flush block: %v", err)
+	}
+	r, err := Open(filepath.Join(dataDir, ulid))
+	if err != nil {
+		t.Fatalf("open block: %v", err)
+	}
+	defer r.Close()
+
+	entries := r.Series()
+	if len(entries) != 1 || len(entries[0].Chunks) != 1 {
+		t.Fatalf("series: %v", entries)
+	}
+	wantChunk := entries[0].Chunks[0]
+	entries[0].Ref = 99
+	entries[0].Labels[0].Value = "changed"
+	entries[0].Chunks[0] = index.ChunkMeta{}
+
+	entry, ok := r.SeriesByRef(1)
+	if !ok {
+		t.Fatal("series by ref not found")
+	}
+	entry.Labels[0].Value = "changed-again"
+	entry.Chunks[0] = index.ChunkMeta{}
+
+	entries = r.Series()
+	if len(entries) != 1 || entries[0].Ref != 1 {
+		t.Fatalf("reader series identity changed: %v", entries)
+	}
+	if !reflect.DeepEqual(entries[0].Labels, wantLabels) {
+		t.Fatalf("reader labels changed: got %v, want %v", entries[0].Labels, wantLabels)
+	}
+	if !reflect.DeepEqual(entries[0].Chunks, []index.ChunkMeta{wantChunk}) {
+		t.Fatalf("reader chunks changed: got %v, want %v", entries[0].Chunks, wantChunk)
+	}
+	entry, ok = r.SeriesByRef(1)
+	if !ok || !reflect.DeepEqual(entry.Labels, wantLabels) || !reflect.DeepEqual(entry.Chunks, []index.ChunkMeta{wantChunk}) {
+		t.Fatalf("series by ref changed: got %v, ok=%v", entry, ok)
+	}
+	if got := r.Postings("__name__", "temp"); !reflect.DeepEqual(got, []uint64{1}) {
+		t.Fatalf("postings changed: %v", got)
+	}
+	it, err := r.SeriesChunkIterator(1, math.MinInt64, math.MaxInt64)
+	if err != nil {
+		t.Fatalf("series iterator: %v", err)
+	}
+	if got := collectIterator(t, it); !reflect.DeepEqual(got, []sample{s(1, 1)}) {
+		t.Fatalf("samples changed: %v", got)
+	}
+}
+
 func TestBlockSeriesChunkIterator(t *testing.T) {
 	chunk1Samples := []sample{s(1000, 1.0), s(1015, 2.0), s(1030, 3.0)}
 	chunk2Samples := []sample{s(2000, 4.0), s(2015, 5.0), s(2030, 6.0)}

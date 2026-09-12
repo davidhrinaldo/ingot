@@ -3,6 +3,7 @@ package index
 import (
 	"bytes"
 	"errors"
+	"fmt"
 	"reflect"
 	"strings"
 	"testing"
@@ -37,6 +38,52 @@ func TestWriterRejectsOversizedLabelBeforeWriting(t *testing.T) {
 	}
 	if buf.Len() != 0 {
 		t.Fatalf("wrote %d bytes before rejecting oversized label", buf.Len())
+	}
+}
+
+func TestWriterLabelCountLimit(t *testing.T) {
+	tests := []struct {
+		name    string
+		count   int
+		wantErr error
+	}{
+		{name: "65535", count: 1<<16 - 1},
+		{name: "65536", count: 1 << 16, wantErr: labels.ErrTooManyLabels},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			ls := make([]labels.Label, tc.count)
+			for i := range ls {
+				ls[i].Name = fmt.Sprintf("label_%05d", i)
+			}
+
+			var buf bytes.Buffer
+			w := NewWriter(&buf)
+			w.AddSeries(SeriesEntry{Ref: 1, Labels: ls})
+			n, err := w.WriteTo()
+			if !errors.Is(err, tc.wantErr) {
+				t.Fatalf("write error: got %v, want %v", err, tc.wantErr)
+			}
+			if tc.wantErr != nil {
+				if n != 0 || buf.Len() != 0 {
+					t.Fatalf("wrote %d bytes before rejecting %d labels", buf.Len(), tc.count)
+				}
+				return
+			}
+
+			r, err := NewReader(buf.Bytes())
+			if err != nil {
+				t.Fatalf("read index: %v", err)
+			}
+			entries := r.Series()
+			if len(entries) != 1 {
+				t.Fatalf("series count after read: got %d, want 1", len(entries))
+			}
+			if len(entries[0].Labels) != tc.count {
+				t.Fatalf("label count after read: got %d, want %d", len(entries[0].Labels), tc.count)
+			}
+		})
 	}
 }
 

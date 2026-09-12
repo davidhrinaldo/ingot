@@ -52,14 +52,29 @@ func Open(dir string) (*Reader, error) {
 	return r, nil
 }
 
-// Series returns all series entries from the index.
+// Series returns copies of all series entries from the index.
 func (r *Reader) Series() []index.SeriesEntry {
-	return r.idx.Series()
+	entries := r.idx.Series()
+	result := make([]index.SeriesEntry, len(entries))
+	for i, entry := range entries {
+		result[i] = cloneSeriesEntry(entry)
+	}
+	return result
 }
 
-// SeriesByRef looks up a series by ref.
+// SeriesByRef looks up a series by ref and returns a copy.
 func (r *Reader) SeriesByRef(ref uint64) (index.SeriesEntry, bool) {
-	return r.idx.SeriesByRef(ref)
+	entry, ok := r.idx.SeriesByRef(ref)
+	if !ok {
+		return index.SeriesEntry{}, false
+	}
+	return cloneSeriesEntry(entry), true
+}
+
+func cloneSeriesEntry(entry index.SeriesEntry) index.SeriesEntry {
+	entry.Labels = append([]labels.Label(nil), entry.Labels...)
+	entry.Chunks = append([]index.ChunkMeta(nil), entry.Chunks...)
+	return entry
 }
 
 // Postings returns sorted series refs matching label name=value.
