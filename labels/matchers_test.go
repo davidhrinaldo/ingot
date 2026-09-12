@@ -1,6 +1,7 @@
 package labels
 
 import (
+	"errors"
 	"reflect"
 	"testing"
 )
@@ -73,6 +74,20 @@ func TestNewMatcherErrors(t *testing.T) {
 	}
 }
 
+func TestNewMatcherRejectsUnsupportedType(t *testing.T) {
+	_, err := NewMatcher(MatchType(99), "__name__", "temp")
+	if !errors.Is(err, ErrInvalidMatchType) {
+		t.Fatalf("got %v, want %v", err, ErrInvalidMatchType)
+	}
+}
+
+func TestNilMatcherDoesNotMatch(t *testing.T) {
+	var m *Matcher
+	if m.Matches("") {
+		t.Fatal("nil matcher matched")
+	}
+}
+
 func TestMustNewMatcherPanics(t *testing.T) {
 	tests := []struct {
 		name    string
@@ -81,6 +96,7 @@ func TestMustNewMatcherPanics(t *testing.T) {
 	}{
 		{name: "bad_regexp", typ: MatchRegexp, pattern: "[invalid"},
 		{name: "bad_not_regexp", typ: MatchNotRegexp, pattern: "(unclosed"},
+		{name: "unsupported_type", typ: MatchType(99)},
 	}
 
 	for _, tc := range tests {

@@ -44,7 +44,7 @@ func (a *Appender) Append(ref uint64, ls []labels.Label, t int64, v float64) (ui
 }
 
 func (a *Appender) appendByLabels(ls []labels.Label, t int64, v float64) (uint64, error) {
-	ls = labels.Sort(ls)
+	ls = labels.Sort(copyLabels(ls))
 	if err := labels.Validate(ls); err != nil {
 		return 0, err
 	}

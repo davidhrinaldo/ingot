@@ -9,6 +9,8 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+
+	"github.com/davidhrinaldo/ingot/labels"
 )
 
 // SyncPolicy controls when WAL writes are made durable.
@@ -228,6 +230,11 @@ func (w *WAL) Log(typ RecordType, payload []byte) error {
 // LogSeries encodes and writes a series record.
 func (w *WAL) LogSeries(recs []SeriesRecord) error {
 	for _, rec := range recs {
+		if err := labels.Validate(rec.Labels); err != nil {
+			return err
+		}
+	}
+	for _, rec := range recs {
 		payload := EncodeSeriesRecord(nil, rec)
 		if err := w.Log(RecordSeries, payload); err != nil {
 			return err
@@ -246,6 +253,12 @@ func (w *WAL) LogSamples(samples []RefSample) error {
 // WAL segments. Older segments must remain in place until the block identified
 // by blockULID has been published durably.
 func (w *WAL) Checkpoint(blockULID string, series []SeriesRecord, samples [][]RefSample) (Checkpoint, error) {
+	for _, rec := range series {
+		if err := labels.Validate(rec.Labels); err != nil {
+			return Checkpoint{}, err
+		}
+	}
+
 	w.mu.Lock()
 	defer w.mu.Unlock()
 	if err := w.previousFailure(); err != nil {

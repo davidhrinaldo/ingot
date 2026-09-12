@@ -430,7 +430,8 @@ type Querier struct {
 	blocks     []*block.Reader
 }
 
-// Select returns a SeriesSet matching the given matchers.
+// Select returns a SeriesSet matching the given matchers. A nil matcher,
+// unsupported match type, or uninitialized regexp matcher produces an empty set.
 func (q *Querier) Select(matchers ...*labels.Matcher) SeriesSet {
 	// Collect refs from all sources, keyed by ref.
 	type seriesSource struct {
@@ -499,67 +500,47 @@ func (q *Querier) Close() error {
 }
 
 func resolveBlockPostings(b *block.Reader, matchers []*labels.Matcher) []uint64 {
-	if len(matchers) == 0 {
-		return b.AllPostings()
-	}
-	var lists [][]uint64
-	for _, m := range matchers {
-		var refs []uint64
-		switch m.Type {
-		case labels.MatchEqual:
-			refs = b.Postings(m.Name, m.Value)
-		case labels.MatchNotEqual:
-			refs = postings.Without(b.AllPostings(), b.Postings(m.Name, m.Value))
-		case labels.MatchRegexp:
-			var parts [][]uint64
-			for _, v := range b.LabelValues(m.Name) {
-				if m.Matches(v) {
-					parts = append(parts, b.Postings(m.Name, v))
-				}
-			}
-			refs = postings.Union(parts...)
-		case labels.MatchNotRegexp:
-			var matching [][]uint64
-			for _, v := range b.LabelValues(m.Name) {
-				if !m.Matches(v) { // m.Matches returns false for values matching the regex
-					matching = append(matching, b.Postings(m.Name, v))
-				}
-			}
-			refs = postings.Without(b.AllPostings(), postings.Union(matching...))
-		}
-		lists = append(lists, refs)
-	}
-	return postings.Intersect(lists...)
+	return resolvePostings(b, matchers)
 }
 
 func resolveHeadPostings(h *head.Snapshot, matchers []*labels.Matcher) []uint64 {
+	return resolvePostings(h, matchers)
+}
+
+type labelPostings interface {
+	Postings(name, value string) []uint64
+	LabelValues(name string) []string
+	AllPostings() []uint64
+}
+
+func resolvePostings(src labelPostings, matchers []*labels.Matcher) []uint64 {
 	if len(matchers) == 0 {
-		return h.AllPostings()
+		return src.AllPostings()
 	}
+	all := src.AllPostings()
 	var lists [][]uint64
 	for _, m := range matchers {
-		var refs []uint64
+		if m == nil {
+			return nil
+		}
 		switch m.Type {
-		case labels.MatchEqual:
-			refs = h.Postings(m.Name, m.Value)
-		case labels.MatchNotEqual:
-			refs = postings.Without(h.AllPostings(), h.Postings(m.Name, m.Value))
-		case labels.MatchRegexp:
-			var parts [][]uint64
-			for _, v := range h.LabelValues(m.Name) {
-				if m.Matches(v) {
-					parts = append(parts, h.Postings(m.Name, v))
-				}
+		case labels.MatchEqual, labels.MatchNotEqual, labels.MatchRegexp, labels.MatchNotRegexp:
+		default:
+			return nil
+		}
+
+		var present, matching [][]uint64
+		for _, value := range src.LabelValues(m.Name) {
+			refs := src.Postings(m.Name, value)
+			present = append(present, refs)
+			if m.Matches(value) {
+				matching = append(matching, refs)
 			}
-			refs = postings.Union(parts...)
-		case labels.MatchNotRegexp:
-			var matching [][]uint64
-			for _, v := range h.LabelValues(m.Name) {
-				if !m.Matches(v) {
-					matching = append(matching, h.Postings(m.Name, v))
-				}
-			}
-			refs = postings.Without(h.AllPostings(), postings.Union(matching...))
+		}
+		refs := postings.Union(matching...)
+		if m.Matches("") {
+			absent := postings.Without(all, postings.Union(present...))
+			refs = postings.Union(refs, absent)
 		}
 		lists = append(lists, refs)
 	}
@@ -614,7 +595,7 @@ type resultSeries struct {
 }
 
 func (s *resultSeries) Labels() []labels.Label {
-	return s.labels
+	return append([]labels.Label(nil), s.labels...)
 }
 
 func (s *resultSeries) Iterator() SampleIterator {
