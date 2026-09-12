@@ -1,6 +1,9 @@
 package wal
 
 import (
+	"errors"
+	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"sync"
@@ -10,6 +13,16 @@ import (
 	"github.com/davidhrinaldo/ingot/labels"
 )
 
+// SyncPolicy controls when WAL writes are made durable.
+type SyncPolicy uint8
+
+const (
+	// SyncOnCommit fsyncs the WAL when a commit completes.
+	SyncOnCommit SyncPolicy = iota
+	// SyncPeriodic fsyncs the WAL in a background goroutine.
+	SyncPeriodic
+)
+
 // Options configures WAL behavior.
 type Options struct {
 	// SegmentMaxSize is the maximum size of a single segment file in bytes.
@@ -17,9 +30,22 @@ type Options struct {
 	// Default: 128 MiB.
 	SegmentMaxSize int
 
-	// SyncInterval controls background fsync frequency.
-	// Default (zero): 1s. Negative: sync on every Log call.
+	// SyncPolicy controls whether commits or a background goroutine fsync.
+	// The default is SyncOnCommit.
+	SyncPolicy SyncPolicy
+
+	// SyncInterval controls background fsync frequency when SyncPolicy is
+	// SyncPeriodic. The default is 1s.
 	SyncInterval time.Duration
+
+	// sync is overridden by tests that exercise fsync failures.
+	sync func(*os.File) error
+	// File operations below are overridden by fault-injection tests.
+	write         func(*os.File, []byte) (int, error)
+	close         func(*os.File) error
+	createSegment func(string, int) (*os.File, error)
+	syncDir       func(string) error
+	remove        func(string) error
 }
 
 func (o *Options) segmentMaxSize() int {
@@ -30,13 +56,68 @@ func (o *Options) segmentMaxSize() int {
 }
 
 func (o *Options) syncInterval() time.Duration {
-	if o.SyncInterval < 0 {
-		return -1 // sync-per-write sentinel
+	if o.SyncPolicy != SyncPeriodic {
+		return 0
 	}
-	if o.SyncInterval == 0 {
+	if o.SyncInterval <= 0 {
 		return time.Second
 	}
 	return o.SyncInterval
+}
+
+func (o *Options) validate() error {
+	if o.SyncPolicy != SyncOnCommit && o.SyncPolicy != SyncPeriodic {
+		return fmt.Errorf("wal: invalid sync policy %d", o.SyncPolicy)
+	}
+	if o.SyncInterval < 0 {
+		return fmt.Errorf("wal: sync interval must not be negative")
+	}
+	if o.SyncPolicy == SyncOnCommit && o.SyncInterval != 0 {
+		return fmt.Errorf("wal: sync interval requires periodic sync policy")
+	}
+	return nil
+}
+
+func (o *Options) fsync(f *os.File) error {
+	if o.sync != nil {
+		return o.sync(f)
+	}
+	return f.Sync()
+}
+
+func (o *Options) writeTo(f *os.File, b []byte) (int, error) {
+	if o.write != nil {
+		return o.write(f, b)
+	}
+	return f.Write(b)
+}
+
+func (o *Options) closeFile(f *os.File) error {
+	if o.close != nil {
+		return o.close(f)
+	}
+	return f.Close()
+}
+
+func (o *Options) create(dir string, index int) (*os.File, error) {
+	if o.createSegment != nil {
+		return o.createSegment(dir, index)
+	}
+	return createSegment(dir, index)
+}
+
+func (o *Options) syncDirectory(dir string) error {
+	if o.syncDir != nil {
+		return o.syncDir(dir)
+	}
+	return syncDir(dir)
+}
+
+func (o *Options) removeFile(path string) error {
+	if o.remove != nil {
+		return o.remove(path)
+	}
+	return os.Remove(path)
 }
 
 // WAL is a segmented write-ahead log.
@@ -49,6 +130,7 @@ type WAL struct {
 	segmentIdx int
 	segmentOff int64
 	buf        []byte
+	poisonErr  error
 
 	lastSyncDur atomic.Int64 // nanoseconds of last fsync
 
@@ -56,13 +138,16 @@ type WAL struct {
 	wg   sync.WaitGroup
 }
 
-// Open opens or creates a WAL in dir. If segments already exist, it runs
-// recovery (truncating at the first corrupt record) before returning.
+// Open opens or creates a WAL in dir. Recovery repairs an incomplete final
+// record and rejects CRC corruption in every segment.
 func Open(dir string, opts Options) (*WAL, error) {
+	if err := opts.validate(); err != nil {
+		return nil, err
+	}
 	if err := os.MkdirAll(dir, 0755); err != nil {
 		return nil, err
 	}
-	if err := syncDir(filepath.Dir(dir)); err != nil {
+	if err := opts.syncDirectory(filepath.Dir(dir)); err != nil {
 		return nil, err
 	}
 
@@ -86,13 +171,13 @@ func Open(dir string, opts Options) (*WAL, error) {
 	if len(segs) == 0 {
 		// Fresh WAL.
 		w.segmentIdx = 1
-		f, err := createSegment(dir, 1)
+		f, err := opts.create(dir, 1)
 		if err != nil {
 			return nil, err
 		}
 		w.segment = f
-		if err := syncDir(dir); err != nil {
-			f.Close()
+		if err := opts.syncDirectory(dir); err != nil {
+			opts.closeFile(f)
 			return nil, err
 		}
 	} else {
@@ -126,6 +211,9 @@ func Open(dir string, opts Options) (*WAL, error) {
 func (w *WAL) Log(typ RecordType, payload []byte) error {
 	w.mu.Lock()
 	defer w.mu.Unlock()
+	if err := w.previousFailure(); err != nil {
+		return err
+	}
 
 	w.buf = EncodeRecord(w.buf[:0], typ, payload)
 
@@ -136,18 +224,7 @@ func (w *WAL) Log(typ RecordType, payload []byte) error {
 		}
 	}
 
-	n, err := w.segment.Write(w.buf)
-	w.segmentOff += int64(n)
-	if err != nil {
-		return err
-	}
-
-	// Sync-per-write mode.
-	if w.opts.syncInterval() < 0 {
-		return w.segment.Sync()
-	}
-
-	return nil
+	return w.writeRecordLocked()
 }
 
 // LogSeries encodes and writes a series record.
@@ -184,6 +261,9 @@ func (w *WAL) Checkpoint(blockULID string, series []SeriesRecord, samples [][]Re
 
 	w.mu.Lock()
 	defer w.mu.Unlock()
+	if err := w.previousFailure(); err != nil {
+		return Checkpoint{}, err
+	}
 
 	if err := w.rotate(); err != nil {
 		return Checkpoint{}, err
@@ -213,22 +293,45 @@ func (w *WAL) Checkpoint(blockULID string, series []SeriesRecord, samples [][]Re
 	if err := w.timedSync(); err != nil {
 		return Checkpoint{}, err
 	}
-	if err := syncDir(w.dir); err != nil {
-		return Checkpoint{}, err
+	if err := w.opts.syncDirectory(w.dir); err != nil {
+		return Checkpoint{}, w.poison(fmt.Errorf("wal: sync directory after checkpoint: %w", err))
 	}
 	return cp, nil
 }
 
-// ActivateCheckpoint records that the checkpoint's block was published. Once
-// this record is durable, recovery does not depend on the source block existing.
-func (w *WAL) ActivateCheckpoint(cp Checkpoint) error {
+// ActivateCheckpoint records that the checkpoint's block was published. It
+// validates the source while holding the WAL lock so callers cannot append the
+// activation record before validation succeeds.
+func (w *WAL) ActivateCheckpoint(cp Checkpoint, validateSource func() error) error {
 	w.mu.Lock()
 	defer w.mu.Unlock()
+	if err := w.previousFailure(); err != nil {
+		return err
+	}
+	if validateSource == nil {
+		return fmt.Errorf("wal: checkpoint source validator is required")
+	}
+	if err := validateSource(); err != nil {
+		return fmt.Errorf("wal: validate checkpoint source: %w", err)
+	}
 
 	if err := w.logLocked(RecordCheckpointActivate, EncodeCheckpoint(nil, cp)); err != nil {
 		return err
 	}
 	return w.timedSync()
+}
+
+// Commit completes the current WAL commit according to the sync policy.
+func (w *WAL) Commit() error {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	if err := w.previousFailure(); err != nil {
+		return err
+	}
+	if w.opts.SyncPolicy == SyncOnCommit {
+		return w.timedSync()
+	}
+	return nil
 }
 
 // Replay returns a Reader over all WAL segments. The caller must Close
@@ -241,6 +344,9 @@ func (w *WAL) Replay() (*Reader, error) {
 func (w *WAL) Sync() error {
 	w.mu.Lock()
 	defer w.mu.Unlock()
+	if err := w.previousFailure(); err != nil {
+		return err
+	}
 	return w.timedSync()
 }
 
@@ -250,27 +356,24 @@ func (w *WAL) LastSyncDuration() float64 {
 	return float64(ns) / 1e9
 }
 
-// HasSegmentBefore reports whether a WAL segment predating index still exists.
-func (w *WAL) HasSegmentBefore(index int) (bool, error) {
-	segs, err := listSegments(w.dir)
-	if err != nil {
-		return false, err
-	}
-	return len(segs) > 0 && segs[0] < index, nil
-}
-
 // timedSync fsyncs the segment and records the duration. Caller must hold w.mu.
 func (w *WAL) timedSync() error {
 	start := time.Now()
-	err := w.segment.Sync()
+	err := w.opts.fsync(w.segment)
 	w.lastSyncDur.Store(int64(time.Since(start)))
-	return err
+	if err != nil {
+		return w.poison(fmt.Errorf("wal: sync segment %08d: %w", w.segmentIdx, err))
+	}
+	return nil
 }
 
 // Truncate deletes all segments with index less than below.
 func (w *WAL) Truncate(below int) error {
 	w.mu.Lock()
 	defer w.mu.Unlock()
+	if err := w.previousFailure(); err != nil {
+		return err
+	}
 
 	segs, err := listSegments(w.dir)
 	if err != nil {
@@ -281,11 +384,14 @@ func (w *WAL) Truncate(below int) error {
 		if idx >= below {
 			break
 		}
-		if err := os.Remove(segmentPath(w.dir, idx)); err != nil {
-			return err
+		if err := w.opts.removeFile(segmentPath(w.dir, idx)); err != nil {
+			return w.poison(fmt.Errorf("wal: remove segment %08d: %w", idx, err))
 		}
 	}
-	return syncDir(w.dir)
+	if err := w.opts.syncDirectory(w.dir); err != nil {
+		return w.poison(fmt.Errorf("wal: sync directory after truncation: %w", err))
+	}
+	return nil
 }
 
 // LastSegment returns the index of the current active segment.
@@ -304,33 +410,40 @@ func (w *WAL) Close() error {
 	defer w.mu.Unlock()
 
 	if w.segment == nil {
-		return nil
+		return w.poisonErr
 	}
-	if err := w.segment.Sync(); err != nil {
-		w.segment.Close()
-		return err
+	previousErr := w.poisonErr
+	syncErr := w.timedSync()
+	closeErr := w.opts.closeFile(w.segment)
+	if closeErr != nil {
+		closeErr = w.poison(fmt.Errorf("wal: close segment %08d: %w", w.segmentIdx, closeErr))
 	}
-	return w.segment.Close()
+	w.segment = nil
+	return errors.Join(previousErr, syncErr, closeErr)
 }
 
 // rotate fsyncs the current segment, closes it, and creates a new one.
 // Caller must hold w.mu.
 func (w *WAL) rotate() error {
-	if err := w.segment.Sync(); err != nil {
+	if err := w.timedSync(); err != nil {
 		return err
 	}
-	if err := w.segment.Close(); err != nil {
-		return err
+	if err := w.opts.closeFile(w.segment); err != nil {
+		return w.poison(fmt.Errorf("wal: close segment %08d during rotation: %w", w.segmentIdx, err))
 	}
 
-	w.segmentIdx++
-	f, err := createSegment(w.dir, w.segmentIdx)
+	next := w.segmentIdx + 1
+	f, err := w.opts.create(w.dir, next)
 	if err != nil {
-		return err
+		return w.poison(fmt.Errorf("wal: create segment %08d during rotation: %w", next, err))
 	}
 	w.segment = f
+	w.segmentIdx = next
 	w.segmentOff = 0
-	return syncDir(w.dir)
+	if err := w.opts.syncDirectory(w.dir); err != nil {
+		return w.poison(fmt.Errorf("wal: sync directory after rotation: %w", err))
+	}
+	return nil
 }
 
 // logLocked writes a record while w.mu is held.
@@ -341,8 +454,34 @@ func (w *WAL) logLocked(typ RecordType, payload []byte) error {
 			return err
 		}
 	}
-	n, err := w.segment.Write(w.buf)
-	w.segmentOff += int64(n)
+	return w.writeRecordLocked()
+}
+
+func (w *WAL) writeRecordLocked() error {
+	n, err := w.opts.writeTo(w.segment, w.buf)
+	if n > 0 {
+		w.segmentOff += int64(n)
+	}
+	if err != nil {
+		return w.poison(fmt.Errorf("wal: write segment %08d: %w", w.segmentIdx, err))
+	}
+	if n != len(w.buf) {
+		return w.poison(fmt.Errorf("wal: write segment %08d: %w: wrote %d of %d bytes", w.segmentIdx, io.ErrShortWrite, n, len(w.buf)))
+	}
+	return nil
+}
+
+func (w *WAL) previousFailure() error {
+	if w.poisonErr == nil {
+		return nil
+	}
+	return fmt.Errorf("wal: unusable after previous failure: %w", w.poisonErr)
+}
+
+func (w *WAL) poison(err error) error {
+	if err != nil && w.poisonErr == nil {
+		w.poisonErr = err
+	}
 	return err
 }
 
@@ -357,7 +496,9 @@ func (w *WAL) syncLoop(interval time.Duration) {
 			return
 		case <-ticker.C:
 			w.mu.Lock()
-			w.timedSync()
+			if w.poisonErr == nil {
+				w.timedSync()
+			}
 			w.mu.Unlock()
 		}
 	}

@@ -1,6 +1,7 @@
 package block
 
 import (
+	"container/heap"
 	"os"
 	"path/filepath"
 	"sync/atomic"
@@ -87,8 +88,8 @@ func (r *Reader) ChunkIterator(ref index.ChunkRef) (chunkenc.ChunkIterator, erro
 	return r.chunks.chunkIterator(ref)
 }
 
-// SeriesChunkIterator returns an iterator over all chunks for a series in a
-// time range. Chunks are iterated in order.
+// SeriesChunkIterator returns a chronological iterator over all chunks for a
+// series in a time range. Earlier chunk entries win duplicate timestamps.
 func (r *Reader) SeriesChunkIterator(ref uint64, mint, maxt int64) (chunkenc.ChunkIterator, error) {
 	entry, ok := r.idx.SeriesByRef(ref)
 	if !ok {
@@ -110,10 +111,7 @@ func (r *Reader) SeriesChunkIterator(ref uint64, mint, maxt int64) (chunkenc.Chu
 	if len(iters) == 0 {
 		return &emptyIterator{}, nil
 	}
-	if len(iters) == 1 {
-		return iters[0], nil
-	}
-	return &multiIterator{iters: iters}, nil
+	return &multiIterator{iters: iters, mint: mint, maxt: maxt}, nil
 }
 
 // Labels returns the labels for a series by ref.
@@ -164,34 +162,103 @@ func (r *Reader) Close() error {
 	return r.chunks.close()
 }
 
-// multiIterator chains multiple ChunkIterators in order.
+// multiIterator merges chunks by timestamp. The chunk's index in iters is its
+// precedence, so duplicate values from earlier chunks win.
 type multiIterator struct {
-	iters []chunkenc.ChunkIterator
-	cur   int
+	iters       []chunkenc.ChunkIterator
+	mint        int64
+	maxt        int64
+	heap        chunkIteratorHeap
+	curT        int64
+	curV        float64
+	initialized bool
+	err         error
 }
 
 func (m *multiIterator) Next() bool {
-	for m.cur < len(m.iters) {
-		if m.iters[m.cur].Next() {
-			return true
+	if m.err != nil {
+		return false
+	}
+	if !m.initialized {
+		m.initialized = true
+		heap.Init(&m.heap)
+		for source := range m.iters {
+			m.advance(source)
 		}
-		if m.iters[m.cur].Err() != nil {
+		if m.err != nil {
 			return false
 		}
-		m.cur++
 	}
-	return false
+	if len(m.heap) == 0 {
+		return false
+	}
+
+	next := heap.Pop(&m.heap).(chunkIteratorHead)
+	m.curT, m.curV = next.t, next.v
+	m.advance(next.source)
+
+	for len(m.heap) > 0 && m.heap[0].t == m.curT {
+		duplicate := heap.Pop(&m.heap).(chunkIteratorHead)
+		m.advance(duplicate.source)
+	}
+	return true
+}
+
+func (m *multiIterator) advance(source int) {
+	it := m.iters[source]
+	for it.Next() {
+		t, v := it.At()
+		if t < m.mint {
+			continue
+		}
+		if t > m.maxt {
+			return
+		}
+		heap.Push(&m.heap, chunkIteratorHead{source: source, t: t, v: v})
+		return
+	}
+	if err := it.Err(); err != nil {
+		m.err = err
+	}
 }
 
 func (m *multiIterator) At() (int64, float64) {
-	return m.iters[m.cur].At()
+	return m.curT, m.curV
 }
 
 func (m *multiIterator) Err() error {
-	if m.cur < len(m.iters) {
-		return m.iters[m.cur].Err()
+	return m.err
+}
+
+type chunkIteratorHead struct {
+	source int
+	t      int64
+	v      float64
+}
+
+type chunkIteratorHeap []chunkIteratorHead
+
+func (h chunkIteratorHeap) Len() int { return len(h) }
+
+func (h chunkIteratorHeap) Less(i, j int) bool {
+	if h[i].t != h[j].t {
+		return h[i].t < h[j].t
 	}
-	return nil
+	return h[i].source < h[j].source
+}
+
+func (h chunkIteratorHeap) Swap(i, j int) { h[i], h[j] = h[j], h[i] }
+
+func (h *chunkIteratorHeap) Push(x any) {
+	*h = append(*h, x.(chunkIteratorHead))
+}
+
+func (h *chunkIteratorHeap) Pop() any {
+	old := *h
+	n := len(old)
+	x := old[n-1]
+	*h = old[:n-1]
+	return x
 }
 
 type emptyIterator struct{}
