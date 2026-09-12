@@ -2,6 +2,7 @@
 package ingot
 
 import (
+	"container/heap"
 	"context"
 	"fmt"
 	"os"
@@ -32,7 +33,7 @@ type DB struct {
 	dataDir       string
 	opts          Options
 	head          *head.Head
-	blocks        []*block.Reader // sorted by MinTime
+	blocks        []*block.Reader // sorted by MinTime, then ULID
 	mu            sync.RWMutex    // protects blocks slice
 	compactor     *compact.Compactor
 	compactCtx    context.Context
@@ -50,6 +51,44 @@ type Options struct {
 	// Clock returns the current time in milliseconds. Defaults to
 	// time.Now().UnixMilli(). Injected for testing with simulated time.
 	Clock func() int64
+	// SyncPolicy controls WAL fsync behavior. The zero value, SyncOnCommit,
+	// makes a successful Commit durable before it returns.
+	SyncPolicy SyncPolicy
+	// SyncInterval controls fsync frequency for SyncPeriodic. Zero uses 1s.
+	SyncInterval time.Duration
+}
+
+// SyncPolicy controls when committed WAL records are fsynced.
+type SyncPolicy uint8
+
+const (
+	// SyncOnCommit fsyncs each appender batch before Commit returns. This is
+	// the default.
+	SyncOnCommit SyncPolicy = iota
+	// SyncPeriodic fsyncs in the background. A process or machine crash may
+	// lose commits made since the last successful background fsync.
+	SyncPeriodic
+)
+
+func (o *Options) walOptions() (wal.Options, error) {
+	switch o.SyncPolicy {
+	case SyncOnCommit:
+		if o.SyncInterval != 0 {
+			return wal.Options{}, fmt.Errorf("SyncInterval requires SyncPeriodic")
+		}
+		return wal.Options{SyncPolicy: wal.SyncOnCommit}, nil
+	case SyncPeriodic:
+		if o.SyncInterval < 0 {
+			return wal.Options{}, fmt.Errorf("SyncInterval must not be negative")
+		}
+		interval := o.SyncInterval
+		if interval == 0 {
+			interval = time.Second
+		}
+		return wal.Options{SyncPolicy: wal.SyncPeriodic, SyncInterval: interval}, nil
+	default:
+		return wal.Options{}, fmt.Errorf("invalid SyncPolicy %d", o.SyncPolicy)
+	}
 }
 
 func (o *Options) clock() func() int64 {
@@ -72,6 +111,10 @@ func (o *Options) retentionMs() int64 {
 
 // Open opens or creates a DB at the given directory.
 func Open(dataDir string, opts Options) (*DB, error) {
+	walOpts, err := opts.walOptions()
+	if err != nil {
+		return nil, fmt.Errorf("ingot: %w", err)
+	}
 	if err := os.MkdirAll(dataDir, 0755); err != nil {
 		return nil, fmt.Errorf("ingot: create data dir: %w", err)
 	}
@@ -80,7 +123,7 @@ func Open(dataDir string, opts Options) (*DB, error) {
 	}
 
 	walDir := filepath.Join(dataDir, "wal")
-	h, err := head.Open(walDir, wal.Options{})
+	h, err := head.Open(walDir, walOpts)
 	if err != nil {
 		return nil, fmt.Errorf("ingot: open head: %w", err)
 	}
@@ -133,9 +176,7 @@ func (db *DB) loadBlocks() error {
 		db.blocks = append(db.blocks, br)
 	}
 
-	sort.Slice(db.blocks, func(i, j int) bool {
-		return db.blocks[i].Meta.MinTime < db.blocks[j].Meta.MinTime
-	})
+	sortBlockReaders(db.blocks)
 
 	return nil
 }
@@ -147,20 +188,22 @@ func (db *DB) Appender() *Appender {
 
 // Querier returns a Querier over [mint, maxt].
 func (db *DB) Querier(mint, maxt int64) (*Querier, error) {
-	db.mu.RLock()
 	var overlapping []*block.Reader
-	for _, b := range db.blocks {
-		if b.Meta.MaxTime >= mint && b.Meta.MinTime <= maxt {
-			b.Ref()
-			overlapping = append(overlapping, b)
+	headSnapshot := db.head.Snapshot(func() {
+		db.mu.RLock()
+		defer db.mu.RUnlock()
+		for _, b := range db.blocks {
+			if b.Meta.MaxTime >= mint && b.Meta.MinTime <= maxt {
+				b.Ref()
+				overlapping = append(overlapping, b)
+			}
 		}
-	}
-	db.mu.RUnlock()
+	})
 
 	return &Querier{
 		mint:   mint,
 		maxt:   maxt,
-		head:   db.head,
+		head:   headSnapshot,
 		blocks: overlapping,
 	}, nil
 }
@@ -174,9 +217,7 @@ func (db *DB) FlushOlderThan(maxT int64) (string, error) {
 		}
 		db.mu.Lock()
 		db.blocks = append(db.blocks, br)
-		sort.Slice(db.blocks, func(i, j int) bool {
-			return db.blocks[i].Meta.MinTime < db.blocks[j].Meta.MinTime
-		})
+		sortBlockReaders(db.blocks)
 		db.mu.Unlock()
 		return nil
 	})
@@ -219,9 +260,7 @@ func (db *DB) RunCompaction() error {
 		}
 	}
 	remaining = append(remaining, newBlock)
-	sort.Slice(remaining, func(i, j int) bool {
-		return remaining[i].Meta.MinTime < remaining[j].Meta.MinTime
-	})
+	sortBlockReaders(remaining)
 	db.blocks = remaining
 	db.mu.Unlock()
 
@@ -353,6 +392,15 @@ func syncDirectory(dir string) error {
 	return d.Sync()
 }
 
+func sortBlockReaders(readers []*block.Reader) {
+	sort.Slice(readers, func(i, j int) bool {
+		if readers[i].Meta.MinTime != readers[j].Meta.MinTime {
+			return readers[i].Meta.MinTime < readers[j].Meta.MinTime
+		}
+		return readers[i].Meta.ULID < readers[j].Meta.ULID
+	})
+}
+
 // Appender buffers samples and new series for atomic commit.
 type Appender struct {
 	inner *head.Appender
@@ -363,7 +411,9 @@ func (a *Appender) Append(ref uint64, ls []labels.Label, t int64, v float64) (ui
 	return a.inner.Append(ref, ls, t, v)
 }
 
-// Commit writes the batch to the WAL and applies it to the head.
+// Commit writes the batch to the WAL according to the configured sync policy,
+// then applies it to the head. With the default SyncOnCommit policy, success
+// means the batch is durable on disk.
 func (a *Appender) Commit() error {
 	return a.inner.Commit()
 }
@@ -376,11 +426,12 @@ func (a *Appender) Rollback() error {
 // Querier queries the DB over a time range.
 type Querier struct {
 	mint, maxt int64
-	head       *head.Head
+	head       *head.Snapshot
 	blocks     []*block.Reader
 }
 
-// Select returns a SeriesSet matching the given matchers.
+// Select returns a SeriesSet matching the given matchers. A nil matcher,
+// unsupported match type, or uninitialized regexp matcher produces an empty set.
 func (q *Querier) Select(matchers ...*labels.Matcher) SeriesSet {
 	// Collect refs from all sources, keyed by ref.
 	type seriesSource struct {
@@ -435,7 +486,7 @@ func (q *Querier) Select(matchers ...*labels.Matcher) SeriesSet {
 	return &sliceSeriesSet{series: entries}
 }
 
-// Close releases block references held by this querier.
+// Close releases snapshot references held by this querier.
 func (q *Querier) Close() error {
 	for _, b := range q.blocks {
 		dir := b.Dir()
@@ -444,71 +495,52 @@ func (q *Querier) Close() error {
 		}
 	}
 	q.blocks = nil
+	q.head = nil
 	return nil
 }
 
 func resolveBlockPostings(b *block.Reader, matchers []*labels.Matcher) []uint64 {
-	if len(matchers) == 0 {
-		return b.AllPostings()
-	}
-	var lists [][]uint64
-	for _, m := range matchers {
-		var refs []uint64
-		switch m.Type {
-		case labels.MatchEqual:
-			refs = b.Postings(m.Name, m.Value)
-		case labels.MatchNotEqual:
-			refs = postings.Without(b.AllPostings(), b.Postings(m.Name, m.Value))
-		case labels.MatchRegexp:
-			var parts [][]uint64
-			for _, v := range b.LabelValues(m.Name) {
-				if m.Matches(v) {
-					parts = append(parts, b.Postings(m.Name, v))
-				}
-			}
-			refs = postings.Union(parts...)
-		case labels.MatchNotRegexp:
-			var matching [][]uint64
-			for _, v := range b.LabelValues(m.Name) {
-				if !m.Matches(v) { // m.Matches returns false for values matching the regex
-					matching = append(matching, b.Postings(m.Name, v))
-				}
-			}
-			refs = postings.Without(b.AllPostings(), postings.Union(matching...))
-		}
-		lists = append(lists, refs)
-	}
-	return postings.Intersect(lists...)
+	return resolvePostings(b, matchers)
 }
 
-func resolveHeadPostings(h *head.Head, matchers []*labels.Matcher) []uint64 {
+func resolveHeadPostings(h *head.Snapshot, matchers []*labels.Matcher) []uint64 {
+	return resolvePostings(h, matchers)
+}
+
+type labelPostings interface {
+	Postings(name, value string) []uint64
+	LabelValues(name string) []string
+	AllPostings() []uint64
+}
+
+func resolvePostings(src labelPostings, matchers []*labels.Matcher) []uint64 {
 	if len(matchers) == 0 {
-		return h.AllPostings()
+		return src.AllPostings()
 	}
+	all := src.AllPostings()
 	var lists [][]uint64
 	for _, m := range matchers {
-		var refs []uint64
+		if m == nil {
+			return nil
+		}
 		switch m.Type {
-		case labels.MatchEqual:
-			refs = h.Postings(m.Name, m.Value)
-		case labels.MatchNotEqual:
-			refs = postings.Without(h.AllPostings(), h.Postings(m.Name, m.Value))
-		case labels.MatchRegexp:
-			var parts [][]uint64
-			for _, v := range h.LabelValues(m.Name) {
-				if m.Matches(v) {
-					parts = append(parts, h.Postings(m.Name, v))
-				}
+		case labels.MatchEqual, labels.MatchNotEqual, labels.MatchRegexp, labels.MatchNotRegexp:
+		default:
+			return nil
+		}
+
+		var present, matching [][]uint64
+		for _, value := range src.LabelValues(m.Name) {
+			refs := src.Postings(m.Name, value)
+			present = append(present, refs)
+			if m.Matches(value) {
+				matching = append(matching, refs)
 			}
-			refs = postings.Union(parts...)
-		case labels.MatchNotRegexp:
-			var matching [][]uint64
-			for _, v := range h.LabelValues(m.Name) {
-				if !m.Matches(v) {
-					matching = append(matching, h.Postings(m.Name, v))
-				}
-			}
-			refs = postings.Without(h.AllPostings(), postings.Union(matching...))
+		}
+		refs := postings.Union(matching...)
+		if m.Matches("") {
+			absent := postings.Without(all, postings.Union(present...))
+			refs = postings.Union(refs, absent)
 		}
 		lists = append(lists, refs)
 	}
@@ -563,13 +595,15 @@ type resultSeries struct {
 }
 
 func (s *resultSeries) Labels() []labels.Label {
-	return s.labels
+	return append([]labels.Label(nil), s.labels...)
 }
 
 func (s *resultSeries) Iterator() SampleIterator {
 	var iters []chunkenc.ChunkIterator
 
-	// Blocks first (in minTime order) — block values win on duplicate timestamps.
+	// Blocks first in MinTime and ULID order, then head. Earlier sources win
+	// duplicates for the current block set; only block-over-head precedence is
+	// stable when compaction replaces blocks.
 	for _, b := range s.querier.blocks {
 		it, err := b.SeriesChunkIterator(s.ref, s.querier.mint, s.querier.maxt)
 		if err != nil {
@@ -588,55 +622,65 @@ func (s *resultSeries) Iterator() SampleIterator {
 	}
 }
 
-// mergedSampleIterator merges multiple ChunkIterators in order, deduplicating
-// timestamps. Earlier iterators (blocks) win over later ones (head).
+// mergedSampleIterator performs a timestamp merge across ChunkIterators and
+// deduplicates timestamps. Earlier iterators win over later ones.
 type mergedSampleIterator struct {
-	iters   []chunkenc.ChunkIterator
-	mint    int64
-	maxt    int64
-	cur     int
-	lastT   int64
-	curT    int64
-	curV    float64
-	started bool
-	err     error
+	iters       []chunkenc.ChunkIterator
+	mint        int64
+	maxt        int64
+	heap        sampleIteratorHeap
+	curT        int64
+	curV        float64
+	initialized bool
+	err         error
 }
 
 func (m *mergedSampleIterator) Next() bool {
-	for {
+	if m.err != nil {
+		return false
+	}
+	if !m.initialized {
+		m.initialized = true
+		heap.Init(&m.heap)
+		for source := range m.iters {
+			m.advance(source)
+		}
 		if m.err != nil {
 			return false
 		}
-		// Try to advance the current iterator.
-		for m.cur < len(m.iters) {
-			if m.iters[m.cur].Next() {
-				t, v := m.iters[m.cur].At()
-				// Filter to [mint, maxt].
-				if t < m.mint {
-					continue
-				}
-				if t > m.maxt {
-					// This iterator is past our range; move to next.
-					m.cur++
-					continue
-				}
-				// Dedup: skip if we've already emitted this timestamp.
-				if m.started && t <= m.lastT {
-					continue
-				}
-				m.curT = t
-				m.curV = v
-				m.lastT = t
-				m.started = true
-				return true
-			}
-			if err := m.iters[m.cur].Err(); err != nil {
-				m.err = err
-				return false
-			}
-			m.cur++
-		}
+	}
+	if len(m.heap) == 0 {
 		return false
+	}
+
+	next := heap.Pop(&m.heap).(sampleIteratorHead)
+	m.curT, m.curV = next.t, next.v
+	m.advance(next.source)
+
+	// Consume every lower-precedence copy of this timestamp. advance may push
+	// another copy from the same source, so inspect the heap after each push.
+	for len(m.heap) > 0 && m.heap[0].t == m.curT {
+		duplicate := heap.Pop(&m.heap).(sampleIteratorHead)
+		m.advance(duplicate.source)
+	}
+	return true
+}
+
+func (m *mergedSampleIterator) advance(source int) {
+	it := m.iters[source]
+	for it.Next() {
+		t, v := it.At()
+		if t < m.mint {
+			continue
+		}
+		if t > m.maxt {
+			return
+		}
+		heap.Push(&m.heap, sampleIteratorHead{source: source, t: t, v: v})
+		return
+	}
+	if err := it.Err(); err != nil {
+		m.err = err
 	}
 }
 
@@ -646,6 +690,37 @@ func (m *mergedSampleIterator) At() (int64, float64) {
 
 func (m *mergedSampleIterator) Err() error {
 	return m.err
+}
+
+type sampleIteratorHead struct {
+	source int
+	t      int64
+	v      float64
+}
+
+type sampleIteratorHeap []sampleIteratorHead
+
+func (h sampleIteratorHeap) Len() int { return len(h) }
+
+func (h sampleIteratorHeap) Less(i, j int) bool {
+	if h[i].t != h[j].t {
+		return h[i].t < h[j].t
+	}
+	return h[i].source < h[j].source
+}
+
+func (h sampleIteratorHeap) Swap(i, j int) { h[i], h[j] = h[j], h[i] }
+
+func (h *sampleIteratorHeap) Push(x any) {
+	*h = append(*h, x.(sampleIteratorHead))
+}
+
+func (h *sampleIteratorHeap) Pop() any {
+	old := *h
+	n := len(old)
+	x := old[n-1]
+	*h = old[:n-1]
+	return x
 }
 
 type errIterator struct {

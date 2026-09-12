@@ -1,9 +1,12 @@
 package labels
 
 import (
+	"errors"
 	"fmt"
 	"regexp"
 )
+
+var ErrInvalidMatchType = errors.New("labels: invalid matcher type")
 
 // MatchType identifies the type of a label matcher.
 type MatchType int
@@ -41,6 +44,11 @@ type Matcher struct {
 // NewMatcher creates a new Matcher. For regex types, the value is compiled
 // as a full-match regular expression (anchored with ^(?:...)$).
 func NewMatcher(typ MatchType, name, value string) (*Matcher, error) {
+	switch typ {
+	case MatchEqual, MatchNotEqual, MatchRegexp, MatchNotRegexp:
+	default:
+		return nil, fmt.Errorf("%w: %d", ErrInvalidMatchType, typ)
+	}
 	m := &Matcher{Type: typ, Name: name, Value: value}
 	if typ == MatchRegexp || typ == MatchNotRegexp {
 		re, err := regexp.Compile("^(?:" + value + ")$")
@@ -63,14 +71,23 @@ func MustNewMatcher(typ MatchType, name, value string) *Matcher {
 
 // Matches reports whether the given label value satisfies this matcher.
 func (m *Matcher) Matches(v string) bool {
+	if m == nil {
+		return false
+	}
 	switch m.Type {
 	case MatchEqual:
 		return v == m.Value
 	case MatchNotEqual:
 		return v != m.Value
 	case MatchRegexp:
+		if m.re == nil {
+			return false
+		}
 		return m.re.MatchString(v)
 	case MatchNotRegexp:
+		if m.re == nil {
+			return false
+		}
 		return !m.re.MatchString(v)
 	default:
 		return false

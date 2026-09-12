@@ -221,6 +221,110 @@ func TestBlockRoundTrip(t *testing.T) {
 	}
 }
 
+func TestBlockLabelLengthLimitAndOwnership(t *testing.T) {
+	tests := []struct {
+		name    string
+		labels  []labels.Label
+		wantErr error
+	}{
+		{name: "name_65535", labels: []labels.Label{{Name: strings.Repeat("n", 65535), Value: "v"}}},
+		{name: "name_65536", labels: []labels.Label{{Name: strings.Repeat("n", 65536), Value: "v"}}, wantErr: labels.ErrLabelTooLong},
+		{name: "value_65535", labels: []labels.Label{{Name: "name", Value: strings.Repeat("v", 65535)}}},
+		{name: "value_65536", labels: []labels.Label{{Name: "name", Value: strings.Repeat("v", 65536)}}, wantErr: labels.ErrLabelTooLong},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			dataDir := t.TempDir()
+			ulid, err := Flush(dataDir, []SeriesFlush{{
+				Ref:    1,
+				Labels: tc.labels,
+				Chunks: []ChunkData{{MinT: 1, MaxT: 1, Data: makeChunk(t, []sample{s(1, 1)})}},
+			}})
+			if err != tc.wantErr {
+				t.Fatalf("flush error: got %v, want %v", err, tc.wantErr)
+			}
+			if tc.wantErr != nil {
+				return
+			}
+
+			r, err := Open(filepath.Join(dataDir, ulid))
+			if err != nil {
+				t.Fatalf("open block: %v", err)
+			}
+			defer r.Close()
+			got, ok := r.Labels(1)
+			if !ok || !reflect.DeepEqual(got, tc.labels) {
+				t.Fatalf("block labels: got %v, ok=%v", got, ok)
+			}
+			got[0] = labels.Label{Name: "changed", Value: "changed"}
+			got, _ = r.Labels(1)
+			if !reflect.DeepEqual(got, tc.labels) {
+				t.Fatalf("stored labels changed through returned slice: %v", got)
+			}
+		})
+	}
+}
+
+func TestBlockSeriesResultsAreDefensive(t *testing.T) {
+	wantLabels := labels.FromStrings("__name__", "temp", "room", "office")
+	dataDir := t.TempDir()
+	ulid, err := Flush(dataDir, []SeriesFlush{{
+		Ref:    1,
+		Labels: wantLabels,
+		Chunks: []ChunkData{{MinT: 1, MaxT: 1, Data: makeChunk(t, []sample{s(1, 1)})}},
+	}})
+	if err != nil {
+		t.Fatalf("flush block: %v", err)
+	}
+	r, err := Open(filepath.Join(dataDir, ulid))
+	if err != nil {
+		t.Fatalf("open block: %v", err)
+	}
+	defer r.Close()
+
+	entries := r.Series()
+	if len(entries) != 1 || len(entries[0].Chunks) != 1 {
+		t.Fatalf("series: %v", entries)
+	}
+	wantChunk := entries[0].Chunks[0]
+	entries[0].Ref = 99
+	entries[0].Labels[0].Value = "changed"
+	entries[0].Chunks[0] = index.ChunkMeta{}
+
+	entry, ok := r.SeriesByRef(1)
+	if !ok {
+		t.Fatal("series by ref not found")
+	}
+	entry.Labels[0].Value = "changed-again"
+	entry.Chunks[0] = index.ChunkMeta{}
+
+	entries = r.Series()
+	if len(entries) != 1 || entries[0].Ref != 1 {
+		t.Fatalf("reader series identity changed: %v", entries)
+	}
+	if !reflect.DeepEqual(entries[0].Labels, wantLabels) {
+		t.Fatalf("reader labels changed: got %v, want %v", entries[0].Labels, wantLabels)
+	}
+	if !reflect.DeepEqual(entries[0].Chunks, []index.ChunkMeta{wantChunk}) {
+		t.Fatalf("reader chunks changed: got %v, want %v", entries[0].Chunks, wantChunk)
+	}
+	entry, ok = r.SeriesByRef(1)
+	if !ok || !reflect.DeepEqual(entry.Labels, wantLabels) || !reflect.DeepEqual(entry.Chunks, []index.ChunkMeta{wantChunk}) {
+		t.Fatalf("series by ref changed: got %v, ok=%v", entry, ok)
+	}
+	if got := r.Postings("__name__", "temp"); !reflect.DeepEqual(got, []uint64{1}) {
+		t.Fatalf("postings changed: %v", got)
+	}
+	it, err := r.SeriesChunkIterator(1, math.MinInt64, math.MaxInt64)
+	if err != nil {
+		t.Fatalf("series iterator: %v", err)
+	}
+	if got := collectIterator(t, it); !reflect.DeepEqual(got, []sample{s(1, 1)}) {
+		t.Fatalf("samples changed: %v", got)
+	}
+}
+
 func TestBlockSeriesChunkIterator(t *testing.T) {
 	chunk1Samples := []sample{s(1000, 1.0), s(1015, 2.0), s(1030, 3.0)}
 	chunk2Samples := []sample{s(2000, 4.0), s(2015, 5.0), s(2030, 6.0)}
@@ -301,6 +405,60 @@ func TestBlockSeriesChunkIterator(t *testing.T) {
 				if got[i].vBits != want.vBits {
 					t.Errorf("sample %d v: got %v, want %v", i, got[i].vBits, want.vBits)
 				}
+			}
+		})
+	}
+}
+
+func TestBlockSeriesChunkIteratorOverlappingChunks(t *testing.T) {
+	first := []sample{s(0, 0), s(50, 1), s(100, 2)}
+	second := []sample{s(50, 20), s(75, 3), s(100, 30), s(150, 4)}
+	dataDir := t.TempDir()
+	ulid, err := Flush(dataDir, []SeriesFlush{{
+		Ref:    1,
+		Labels: labels.FromStrings("__name__", "overlap"),
+		Chunks: []ChunkData{
+			{MinT: 0, MaxT: 100, Data: makeChunk(t, first)},
+			{MinT: 50, MaxT: 150, Data: makeChunk(t, second)},
+		},
+	}})
+	if err != nil {
+		t.Fatalf("flush block: %v", err)
+	}
+	r, err := Open(filepath.Join(dataDir, ulid))
+	if err != nil {
+		t.Fatalf("open block: %v", err)
+	}
+	defer r.Close()
+
+	tests := []struct {
+		name string
+		mint int64
+		maxt int64
+		want []sample
+	}{
+		{
+			name: "full_range_deduplicates_by_chunk_order",
+			mint: math.MinInt64,
+			maxt: math.MaxInt64,
+			want: []sample{s(0, 0), s(50, 1), s(75, 3), s(100, 2), s(150, 4)},
+		},
+		{
+			name: "maxt_inside_both_chunks",
+			mint: 0,
+			maxt: 75,
+			want: []sample{s(0, 0), s(50, 1), s(75, 3)},
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			it, err := r.SeriesChunkIterator(1, tc.mint, tc.maxt)
+			if err != nil {
+				t.Fatalf("create iterator: %v", err)
+			}
+			if got := collectIterator(t, it); !reflect.DeepEqual(got, tc.want) {
+				t.Fatalf("samples: got %v, want %v", got, tc.want)
 			}
 		})
 	}
