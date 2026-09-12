@@ -128,6 +128,76 @@ func openTestDB(t *testing.T) *DB {
 	return db
 }
 
+func TestAppenderRejectsStaleCommit(t *testing.T) {
+	db := openTestDB(t)
+	firstLabels := labels.FromStrings("__name__", "first")
+	secondLabels := labels.FromStrings("__name__", "second")
+
+	seed := db.Appender()
+	firstRef, err := seed.Append(0, firstLabels, 1, 1)
+	if err != nil {
+		t.Fatalf("append first seed sample: %v", err)
+	}
+	secondRef, err := seed.Append(0, secondLabels, 1, 1)
+	if err != nil {
+		t.Fatalf("append second seed sample: %v", err)
+	}
+	if err := seed.Commit(); err != nil {
+		t.Fatalf("commit seed samples: %v", err)
+	}
+
+	stale := db.Appender()
+	if _, err := stale.Append(firstRef, nil, 2, 2); err != nil {
+		t.Fatalf("append non-conflicting sample: %v", err)
+	}
+	if _, err := stale.Append(secondRef, nil, 2, 2); err != nil {
+		t.Fatalf("append stale sample: %v", err)
+	}
+	winner := db.Appender()
+	if _, err := winner.Append(secondRef, nil, 3, 3); err != nil {
+		t.Fatalf("append winning sample: %v", err)
+	}
+	if err := winner.Commit(); err != nil {
+		t.Fatalf("commit winning sample: %v", err)
+	}
+	if err := stale.Commit(); err == nil {
+		t.Fatal("stale commit succeeded")
+	}
+
+	q, err := db.Querier(math.MinInt64, math.MaxInt64)
+	if err != nil {
+		t.Fatalf("open querier: %v", err)
+	}
+	defer q.Close()
+	got := collectSeriesSet(t, q.Select())
+	want := map[uint64][]sample{
+		labels.Hash(firstLabels):  {{t: 1, v: 1}},
+		labels.Hash(secondLabels): {{t: 1, v: 1}, {t: 3, v: 3}},
+	}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("samples after rejected commit: got %v, want %v", got, want)
+	}
+}
+
+func TestAppenderRejectsAppendAfterClose(t *testing.T) {
+	for _, closeAppender := range []struct {
+		name string
+		fn   func(*Appender) error
+	}{
+		{name: "commit", fn: func(app *Appender) error { return app.Commit() }},
+		{name: "rollback", fn: func(app *Appender) error { return app.Rollback() }},
+	} {
+		t.Run(closeAppender.name, func(t *testing.T) {
+			db := openTestDB(t)
+			app := db.Appender()
+			if err := closeAppender.fn(app); err != nil {
+				t.Fatalf("close appender: %v", err)
+			}
+			if _, err := app.Append(0, labels.FromStrings("__name__", "closed"), 1, 1); err == nil {
+				t.Fatal("append after close succeeded")
+			}
+			if got := db.Stats().HeadSeries; got != 0 {
+				t.Fatalf("registered series after close: got %d, want 0", got)
 func TestSyncPolicyOptions(t *testing.T) {
 	tests := []struct {
 		name         string

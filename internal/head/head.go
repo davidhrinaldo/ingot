@@ -23,6 +23,7 @@ type Head struct {
 	wal      *wal.WAL
 	nextRef  atomic.Uint64
 	commitMu sync.Mutex
+	applyMu  sync.RWMutex // keeps iterator snapshots outside batch application
 
 	minTime atomic.Int64
 	maxTime atomic.Int64
@@ -307,6 +308,9 @@ func (h *Head) Appender() *Appender {
 // SeriesIterator returns an iterator over all samples in [mint, maxt]
 // for the given series ref.
 func (h *Head) SeriesIterator(ref uint64, mint, maxt int64) chunkenc.ChunkIterator {
+	h.applyMu.RLock()
+	defer h.applyMu.RUnlock()
+
 	s := h.series.getByRef(ref)
 	if s == nil {
 		return &emptyIterator{}
