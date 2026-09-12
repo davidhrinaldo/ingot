@@ -2,7 +2,9 @@ package index
 
 import (
 	"encoding/binary"
+	"fmt"
 	"hash/crc32"
+	"slices"
 	"sort"
 
 	"github.com/davidhrinaldo/ingot/labels"
@@ -14,8 +16,8 @@ type Reader struct {
 
 	symbols     []string
 	series      []SeriesEntry
-	seriesByRef map[uint64]int            // ref -> index into series
-	postings    map[labelPair][]uint64    // label pair -> sorted refs
+	seriesByRef map[uint64]int         // ref -> index into series
+	postings    map[labelPair][]uint64 // label pair -> sorted refs
 }
 
 // NewReader parses an index from data.
@@ -44,9 +46,17 @@ func NewReader(data []byte) (*Reader, error) {
 		return nil, ErrCorruptTOC
 	}
 
-	symbolsOff := int(binary.BigEndian.Uint64(toc[0:8]))
-	seriesOff := int(binary.BigEndian.Uint64(toc[8:16]))
-	postingsOff := int(binary.BigEndian.Uint64(toc[16:24]))
+	symbolsOffset := binary.BigEndian.Uint64(toc[0:8])
+	seriesOffset := binary.BigEndian.Uint64(toc[8:16])
+	postingsOffset := binary.BigEndian.Uint64(toc[16:24])
+	if symbolsOffset != headerLen ||
+		symbolsOffset > seriesOffset || seriesOffset > postingsOffset ||
+		postingsOffset > uint64(tocStart) {
+		return nil, fmt.Errorf("%w: invalid section offsets", ErrCorruptIndex)
+	}
+	symbolsOff := int(symbolsOffset)
+	seriesOff := int(seriesOffset)
+	postingsOff := int(postingsOffset)
 
 	r := &Reader{
 		data:        data,
@@ -54,66 +64,89 @@ func NewReader(data []byte) (*Reader, error) {
 		postings:    make(map[labelPair][]uint64),
 	}
 
-	if err := r.readSymbols(symbolsOff); err != nil {
+	if err := r.readSymbols(symbolsOff, seriesOff); err != nil {
 		return nil, err
 	}
-	if err := r.readSeries(seriesOff); err != nil {
+	if err := r.readSeries(seriesOff, postingsOff); err != nil {
 		return nil, err
 	}
 	if err := r.readPostings(postingsOff, tocStart); err != nil {
+		return nil, err
+	}
+	if err := r.validatePostings(); err != nil {
 		return nil, err
 	}
 
 	return r, nil
 }
 
-func (r *Reader) readSymbols(off int) error {
-	if off+4 > len(r.data) {
+func (r *Reader) readSymbols(off, limit int) error {
+	if off+4 > limit {
 		return ErrCorruptIndex
 	}
 	numSymbols := int(binary.BigEndian.Uint32(r.data[off : off+4]))
 	off += 4
+	if numSymbols > (limit-off)/2 {
+		return ErrCorruptIndex
+	}
 
-	r.symbols = make([]string, 0, numSymbols)
 	for i := 0; i < numSymbols; i++ {
-		if off+2 > len(r.data) {
+		if off+2 > limit {
 			return ErrCorruptIndex
 		}
 		slen := int(binary.BigEndian.Uint16(r.data[off : off+2]))
 		off += 2
-		if off+slen > len(r.data) {
+		if slen > limit-off {
 			return ErrCorruptIndex
 		}
-		r.symbols = append(r.symbols, string(r.data[off:off+slen]))
+		symbol := string(r.data[off : off+slen])
+		if i > 0 && r.symbols[i-1] >= symbol {
+			return fmt.Errorf("%w: symbols are not unique and sorted", ErrCorruptIndex)
+		}
+		r.symbols = append(r.symbols, symbol)
 		off += slen
+	}
+	if off != limit {
+		return fmt.Errorf("%w: symbol section length mismatch", ErrCorruptIndex)
 	}
 	return nil
 }
 
-func (r *Reader) readSeries(off int) error {
-	if off+4 > len(r.data) {
+func (r *Reader) readSeries(off, limit int) error {
+	if off+4 > limit {
 		return ErrCorruptIndex
 	}
 	numSeries := int(binary.BigEndian.Uint32(r.data[off : off+4]))
 	off += 4
+	if numSeries > (limit-off)/14 {
+		return ErrCorruptIndex
+	}
 
-	r.series = make([]SeriesEntry, 0, numSeries)
 	for i := 0; i < numSeries; i++ {
-		if off+8 > len(r.data) {
+		if off+8 > limit {
 			return ErrCorruptIndex
 		}
 		ref := binary.BigEndian.Uint64(r.data[off : off+8])
 		off += 8
+		if ref == 0 {
+			return fmt.Errorf("%w: invalid series ref 0", ErrCorruptIndex)
+		}
+		if _, exists := r.seriesByRef[ref]; exists {
+			return fmt.Errorf("%w: duplicate series ref %d", ErrCorruptIndex, ref)
+		}
 
-		if off+2 > len(r.data) {
+		if off+2 > limit {
 			return ErrCorruptIndex
 		}
 		numLabels := int(binary.BigEndian.Uint16(r.data[off : off+2]))
 		off += 2
+		if numLabels > (limit-off)/8 {
+			return ErrCorruptIndex
+		}
 
-		ls := make([]labels.Label, numLabels)
+		var ls []labels.Label
 		for j := 0; j < numLabels; j++ {
-			if off+8 > len(r.data) {
+			if off+8 > limit {
 				return ErrCorruptIndex
 			}
 			nameIdx := int(binary.BigEndian.Uint32(r.data[off : off+4]))
@@ -124,31 +157,42 @@ func (r *Reader) readSeries(off int) error {
 			if nameIdx >= len(r.symbols) || valueIdx >= len(r.symbols) {
 				return ErrCorruptIndex
 			}
-			ls[j] = labels.Label{Name: r.symbols[nameIdx], Value: r.symbols[valueIdx]}
+			ls = append(ls, labels.Label{Name: r.symbols[nameIdx], Value: r.symbols[valueIdx]})
+		}
+		if err := labels.Validate(ls); err != nil {
+			return fmt.Errorf("%w: series ref %d labels: %v", ErrCorruptIndex, ref, err)
 		}
 
-		if off+4 > len(r.data) {
+		if off+4 > limit {
 			return ErrCorruptIndex
 		}
 		numChunks := int(binary.BigEndian.Uint32(r.data[off : off+4]))
 		off += 4
+		if numChunks > (limit-off)/24 {
+			return ErrCorruptIndex
+		}
 
-		chunks := make([]ChunkMeta, numChunks)
+		var chunks []ChunkMeta
 		for j := 0; j < numChunks; j++ {
-			if off+24 > len(r.data) {
+			if off+24 > limit {
 				return ErrCorruptIndex
 			}
-			chunks[j].MinT = int64(binary.BigEndian.Uint64(r.data[off : off+8]))
+			chunk := ChunkMeta{}
+			chunk.MinT = int64(binary.BigEndian.Uint64(r.data[off : off+8]))
 			off += 8
-			chunks[j].MaxT = int64(binary.BigEndian.Uint64(r.data[off : off+8]))
+			chunk.MaxT = int64(binary.BigEndian.Uint64(r.data[off : off+8]))
 			off += 8
-			chunks[j].Ref = ChunkRef(binary.BigEndian.Uint64(r.data[off : off+8]))
+			chunk.Ref = ChunkRef(binary.BigEndian.Uint64(r.data[off : off+8]))
 			off += 8
+			chunks = append(chunks, chunk)
 		}
 
 		entry := SeriesEntry{Ref: ref, Labels: ls, Chunks: chunks}
 		r.seriesByRef[ref] = len(r.series)
 		r.series = append(r.series, entry)
+	}
+	if off != limit {
+		return fmt.Errorf("%w: series section length mismatch", ErrCorruptIndex)
 	}
 	return nil
 }
@@ -159,6 +203,9 @@ func (r *Reader) readPostings(off, limit int) error {
 	}
 	numEntries := int(binary.BigEndian.Uint32(r.data[off : off+4]))
 	off += 4
+	if numEntries > (limit-off)/12 {
+		return ErrCorruptIndex
+	}
 
 	for i := 0; i < numEntries; i++ {
 		if off+12 > limit {
@@ -175,18 +222,70 @@ func (r *Reader) readPostings(off, limit int) error {
 			return ErrCorruptIndex
 		}
 
-		if off+numRefs*8 > limit {
+		if numRefs > (limit-off)/8 {
 			return ErrCorruptIndex
 		}
 
-		refs := make([]uint64, numRefs)
+		var refs []uint64
 		for j := 0; j < numRefs; j++ {
-			refs[j] = binary.BigEndian.Uint64(r.data[off : off+8])
+			ref := binary.BigEndian.Uint64(r.data[off : off+8])
 			off += 8
+			if j > 0 && refs[j-1] >= ref {
+				return fmt.Errorf("%w: postings refs are not unique and sorted", ErrCorruptIndex)
+			}
+			refs = append(refs, ref)
 		}
 
 		key := labelPair{r.symbols[nameIdx], r.symbols[valueIdx]}
+		if _, exists := r.postings[key]; exists {
+			return fmt.Errorf("%w: duplicate postings for %s=%q", ErrCorruptIndex, key.name, key.value)
+		}
 		r.postings[key] = refs
+	}
+	if off != limit {
+		return fmt.Errorf("%w: postings section length mismatch", ErrCorruptIndex)
+	}
+	return nil
+}
+
+func (r *Reader) validatePostings() error {
+	expected := make(map[labelPair][]uint64)
+	for _, series := range r.series {
+		for _, label := range series.Labels {
+			key := labelPair{label.Name, label.Value}
+			expected[key] = append(expected[key], series.Ref)
+		}
+	}
+	for key := range expected {
+		sort.Slice(expected[key], func(i, j int) bool { return expected[key][i] < expected[key][j] })
+	}
+
+	for key, refs := range r.postings {
+		for _, ref := range refs {
+			seriesIdx, ok := r.seriesByRef[ref]
+			if !ok {
+				return fmt.Errorf("%w: postings for %s=%q reference missing series %d", ErrCorruptIndex, key.name, key.value, ref)
+			}
+			matched := false
+			for _, label := range r.series[seriesIdx].Labels {
+				if label.Name == key.name && label.Value == key.value {
+					matched = true
+					break
+				}
+			}
+			if !matched {
+				return fmt.Errorf("%w: postings for %s=%q reference wrong series %d", ErrCorruptIndex, key.name, key.value, ref)
+			}
+		}
+	}
+
+	if len(r.postings) != len(expected) {
+		return fmt.Errorf("%w: postings entries do not match series labels", ErrCorruptIndex)
+	}
+	for key, refs := range expected {
+		if !slices.Equal(r.postings[key], refs) {
+			return fmt.Errorf("%w: postings for %s=%q do not match series labels", ErrCorruptIndex, key.name, key.value)
+		}
 	}
 	return nil
 }

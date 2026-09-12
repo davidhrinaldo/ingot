@@ -2,6 +2,9 @@ package block
 
 import (
 	"encoding/binary"
+	"encoding/json"
+	"hash/crc32"
+	"math"
 	"os"
 	"path/filepath"
 	"strings"
@@ -26,7 +29,7 @@ func TestValidate(t *testing.T) {
 						Ref:    1,
 						Labels: labels.FromStrings("__name__", "temp"),
 						Chunks: []ChunkData{
-							{MinT: 0, MaxT: 1000, Data: makeTestChunk(t)},
+							{MinT: 0, MaxT: 30000, Data: makeTestChunk(t)},
 						},
 					},
 				}
@@ -48,7 +51,7 @@ func TestValidate(t *testing.T) {
 						Ref:    1,
 						Labels: labels.FromStrings("__name__", "temp"),
 						Chunks: []ChunkData{
-							{MinT: 0, MaxT: 1000, Data: makeTestChunk(t)},
+							{MinT: 0, MaxT: 30000, Data: makeTestChunk(t)},
 						},
 					},
 				}
@@ -72,7 +75,7 @@ func TestValidate(t *testing.T) {
 						Ref:    1,
 						Labels: labels.FromStrings("__name__", "temp"),
 						Chunks: []ChunkData{
-							{MinT: 0, MaxT: 1000, Data: makeTestChunk(t)},
+							{MinT: 0, MaxT: 30000, Data: makeTestChunk(t)},
 						},
 					},
 				}
@@ -106,7 +109,7 @@ func TestValidate(t *testing.T) {
 						Ref:    1,
 						Labels: labels.FromStrings("__name__", "temp"),
 						Chunks: []ChunkData{
-							{MinT: 0, MaxT: 1000, Data: makeTestChunk(t)},
+							{MinT: 0, MaxT: 30000, Data: makeTestChunk(t)},
 						},
 					},
 				}
@@ -155,14 +158,14 @@ func TestValidate(t *testing.T) {
 
 func TestReadMeta(t *testing.T) {
 	tests := []struct {
-		name      string
-		setup     func(t *testing.T) (string, string) // returns (dir, ulid)
-		wantULID  bool                                 // true = ULID should match
-		wantMinT  int64
-		wantMaxT  int64
-		wantNSer  int
-		wantNChk  int
-		wantErr   error
+		name     string
+		setup    func(t *testing.T) (string, string) // returns (dir, ulid)
+		wantULID bool                                // true = ULID should match
+		wantMinT int64
+		wantMaxT int64
+		wantNSer int
+		wantNChk int
+		wantErr  error
 	}{
 		{
 			name: "valid_block",
@@ -173,7 +176,7 @@ func TestReadMeta(t *testing.T) {
 						Ref:    1,
 						Labels: labels.FromStrings("__name__", "test"),
 						Chunks: []ChunkData{
-							{MinT: 100, MaxT: 200, Data: makeTestChunk(t)},
+							{MinT: 100, MaxT: 200, Data: makeChunk(t, []sample{s(100, 1), s(200, 2)})},
 						},
 					},
 				})
@@ -215,6 +218,402 @@ func TestReadMeta(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestValidateSemanticCorruption(t *testing.T) {
+	tests := []struct {
+		name      string
+		corrupt   func(t *testing.T, blockDir string)
+		wantMatch string
+	}{
+		{
+			name: "indexed_max_time",
+			corrupt: func(t *testing.T, blockDir string) {
+				mutateIndex(t, blockDir, func(data []byte, layout testIndexLayout) {
+					binary.BigEndian.PutUint64(data[layout.series[0].chunks[0].maxT:], uint64(201))
+				})
+			},
+			wantMatch: "do not match decoded samples",
+		},
+		{
+			name: "chunk_ref_not_at_entry_boundary",
+			corrupt: func(t *testing.T, blockDir string) {
+				mutateIndex(t, blockDir, func(data []byte, layout testIndexLayout) {
+					refOffset := layout.series[0].chunks[0].ref
+					ref := binary.BigEndian.Uint64(data[refOffset:])
+					binary.BigEndian.PutUint64(data[refOffset:], ref+1)
+				})
+			},
+			wantMatch: "not a chunk entry boundary",
+		},
+		{
+			name: "duplicate_chunk_ref",
+			corrupt: func(t *testing.T, blockDir string) {
+				mutateIndex(t, blockDir, func(data []byte, layout testIndexLayout) {
+					first := layout.series[0].chunks[0].ref
+					second := layout.series[0].chunks[1].ref
+					copy(data[second:second+8], data[first:first+8])
+				})
+			},
+			wantMatch: "duplicate chunk ref",
+		},
+		{
+			name: "duplicate_series_ref",
+			corrupt: func(t *testing.T, blockDir string) {
+				mutateIndex(t, blockDir, func(data []byte, layout testIndexLayout) {
+					copy(data[layout.series[1].ref:layout.series[1].ref+8], data[layout.series[0].ref:layout.series[0].ref+8])
+				})
+			},
+			wantMatch: "duplicate series ref",
+		},
+		{
+			name: "postings_missing_series",
+			corrupt: func(t *testing.T, blockDir string) {
+				mutateIndex(t, blockDir, func(data []byte, layout testIndexLayout) {
+					binary.BigEndian.PutUint64(data[layout.postingRefs[0]:], 999)
+				})
+			},
+			wantMatch: "reference missing series",
+		},
+		{
+			name: "postings_wrong_series",
+			corrupt: func(t *testing.T, blockDir string) {
+				mutateIndex(t, blockDir, func(data []byte, layout testIndexLayout) {
+					binary.BigEndian.PutUint64(data[layout.postingRefs[0]:], 2)
+				})
+			},
+			wantMatch: "reference wrong series",
+		},
+		{
+			name: "unsupported_chunk_encoding_with_valid_crc",
+			corrupt: func(t *testing.T, blockDir string) {
+				path := filepath.Join(blockDir, chunksDirName, "000001")
+				data, err := os.ReadFile(path)
+				if err != nil {
+					t.Fatal(err)
+				}
+				off := chunkHeaderLen
+				dataLen := int(binary.BigEndian.Uint32(data[off : off+4]))
+				data[off+4] = 99
+				checksum := crc32.New(castagnoliTable)
+				checksum.Write(data[off+4 : off+5])
+				checksum.Write(data[off+chunkEntryHeaderLen : off+chunkEntryHeaderLen+dataLen])
+				binary.BigEndian.PutUint32(data[off+chunkEntryHeaderLen+dataLen:], checksum.Sum32())
+				if err := os.WriteFile(path, data, 0644); err != nil {
+					t.Fatal(err)
+				}
+			},
+			wantMatch: "unsupported encoding 99",
+		},
+		{
+			name: "invalid_xor_window_with_valid_crc",
+			corrupt: func(t *testing.T, blockDir string) {
+				replaceLastChunk(t, blockDir, invalidXORWindowChunk())
+			},
+			wantMatch: "invalid XOR window",
+		},
+		{
+			name: "unsupported_meta_version",
+			corrupt: func(t *testing.T, blockDir string) {
+				mutateMeta(t, blockDir, func(meta *BlockMeta) { meta.Version++ })
+			},
+			wantMatch: "unsupported version 2",
+		},
+		{
+			name: "meta_max_time",
+			corrupt: func(t *testing.T, blockDir string) {
+				mutateMeta(t, blockDir, func(meta *BlockMeta) { meta.MaxTime++ })
+			},
+			wantMatch: "bounds [100,601] do not match",
+		},
+		{
+			name: "meta_stats",
+			corrupt: func(t *testing.T, blockDir string) {
+				mutateMeta(t, blockDir, func(meta *BlockMeta) { meta.Stats.NumSamples++ })
+			},
+			wantMatch: "numsamples 7 does not match decoded count 6",
+		},
+		{
+			name: "meta_ulid",
+			corrupt: func(t *testing.T, blockDir string) {
+				mutateMeta(t, blockDir, func(meta *BlockMeta) { meta.ULID = "00000000000000000000000000" })
+			},
+			wantMatch: "does not match directory",
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			blockDir := semanticTestBlock(t)
+			tc.corrupt(t, blockDir)
+
+			validationErrs := Validate(blockDir)
+			var combined strings.Builder
+			for _, err := range validationErrs {
+				combined.WriteString(err.Error())
+				combined.WriteByte('\n')
+			}
+			if !strings.Contains(strings.ToLower(combined.String()), strings.ToLower(tc.wantMatch)) {
+				t.Fatalf("Validate errors %q do not contain %q", combined.String(), tc.wantMatch)
+			}
+
+			reader, err := Open(blockDir)
+			if reader != nil {
+				reader.Close()
+			}
+			if err == nil || !strings.Contains(strings.ToLower(err.Error()), strings.ToLower(tc.wantMatch)) {
+				t.Fatalf("Open error %q does not contain %q", err, tc.wantMatch)
+			}
+		})
+	}
+}
+
+func TestLegacyNegativeTimeBounds(t *testing.T) {
+	newBlock := func(t *testing.T) string {
+		t.Helper()
+		dataDir := t.TempDir()
+		ulid, err := Flush(dataDir, []SeriesFlush{{
+			Ref:    1,
+			Labels: labels.FromStrings("__name__", "negative"),
+			Chunks: []ChunkData{{
+				MinT: -500,
+				MaxT: -100,
+				Data: makeChunk(t, []sample{s(-500, 1), s(-100, 2)}),
+			}},
+		}})
+		if err != nil {
+			t.Fatal(err)
+		}
+		return filepath.Join(dataDir, ulid)
+	}
+
+	t.Run("baseline_max_time_zero_is_normalized", func(t *testing.T) {
+		blockDir := newBlock(t)
+		mutateMeta(t, blockDir, func(meta *BlockMeta) { meta.MaxTime = 0 })
+		if errs := Validate(blockDir); len(errs) != 0 {
+			t.Fatalf("Validate rejected legacy block: %v", errs)
+		}
+		reader, err := Open(blockDir)
+		if err != nil {
+			t.Fatalf("Open rejected legacy block: %v", err)
+		}
+		defer reader.Close()
+		if got, want := reader.Meta.MaxTime, int64(-100); got != want {
+			t.Fatalf("normalized MaxTime: got %d, want %d", got, want)
+		}
+	})
+
+	t.Run("other_negative_bound_mismatch_is_rejected", func(t *testing.T) {
+		blockDir := newBlock(t)
+		mutateMeta(t, blockDir, func(meta *BlockMeta) {
+			meta.MinTime++
+			meta.MaxTime = 0
+		})
+		if errs := Validate(blockDir); len(errs) == 0 {
+			t.Fatal("Validate accepted arbitrary negative-time bounds")
+		}
+		if _, err := Open(blockDir); err == nil {
+			t.Fatal("Open accepted arbitrary negative-time bounds")
+		}
+	})
+}
+
+func TestValidateAcceptsOverlappingChunks(t *testing.T) {
+	dataDir := t.TempDir()
+	ulid, err := Flush(dataDir, []SeriesFlush{{
+		Ref:    1,
+		Labels: labels.FromStrings("__name__", "overlap"),
+		Chunks: []ChunkData{
+			{MinT: 100, MaxT: 300, Data: makeChunk(t, []sample{s(100, 1), s(300, 2)})},
+			{MinT: 200, MaxT: 400, Data: makeChunk(t, []sample{s(200, 3), s(400, 4)})},
+		},
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	blockDir := filepath.Join(dataDir, ulid)
+	if errs := Validate(blockDir); len(errs) != 0 {
+		t.Fatalf("Validate rejected overlapping chunks: %v", errs)
+	}
+	r, err := Open(blockDir)
+	if err != nil {
+		t.Fatalf("Open rejected overlapping chunks: %v", err)
+	}
+	r.Close()
+}
+
+func semanticTestBlock(t *testing.T) string {
+	t.Helper()
+	dataDir := t.TempDir()
+	ulid, err := Flush(dataDir, []SeriesFlush{
+		{
+			Ref:    1,
+			Labels: labels.FromStrings("__name__", "a"),
+			Chunks: []ChunkData{
+				{MinT: 100, MaxT: 200, Data: makeChunk(t, []sample{s(100, 1), s(200, 2)})},
+				{MinT: 300, MaxT: 400, Data: makeChunk(t, []sample{s(300, 3), s(400, 4)})},
+			},
+		},
+		{
+			Ref:    2,
+			Labels: labels.FromStrings("__name__", "b"),
+			Chunks: []ChunkData{
+				{MinT: 500, MaxT: 600, Data: makeChunk(t, []sample{s(500, 5), s(600, 6)})},
+			},
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return filepath.Join(dataDir, ulid)
+}
+
+type testChunkOffsets struct {
+	minT int
+	maxT int
+	ref  int
+}
+
+type testSeriesOffsets struct {
+	ref    int
+	chunks []testChunkOffsets
+}
+
+type testIndexLayout struct {
+	series      []testSeriesOffsets
+	postingRefs []int
+}
+
+func mutateIndex(t *testing.T, blockDir string, mutate func([]byte, testIndexLayout)) {
+	t.Helper()
+	path := filepath.Join(blockDir, "index")
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	layout := parseTestIndexLayout(t, data)
+	mutate(data, layout)
+	if err := os.WriteFile(path, data, 0644); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func parseTestIndexLayout(t *testing.T, data []byte) testIndexLayout {
+	t.Helper()
+	toc := data[len(data)-28:]
+	seriesOffset := int(binary.BigEndian.Uint64(toc[8:16]))
+	postingsOffset := int(binary.BigEndian.Uint64(toc[16:24]))
+
+	var layout testIndexLayout
+	off := seriesOffset
+	numSeries := int(binary.BigEndian.Uint32(data[off : off+4]))
+	off += 4
+	for i := 0; i < numSeries; i++ {
+		series := testSeriesOffsets{ref: off}
+		off += 8
+		numLabels := int(binary.BigEndian.Uint16(data[off : off+2]))
+		off += 2 + numLabels*8
+		numChunks := int(binary.BigEndian.Uint32(data[off : off+4]))
+		off += 4
+		for j := 0; j < numChunks; j++ {
+			series.chunks = append(series.chunks, testChunkOffsets{minT: off, maxT: off + 8, ref: off + 16})
+			off += 24
+		}
+		layout.series = append(layout.series, series)
+	}
+
+	off = postingsOffset
+	numPostings := int(binary.BigEndian.Uint32(data[off : off+4]))
+	off += 4
+	for i := 0; i < numPostings; i++ {
+		numRefs := int(binary.BigEndian.Uint32(data[off+8 : off+12]))
+		off += 12
+		for j := 0; j < numRefs; j++ {
+			layout.postingRefs = append(layout.postingRefs, off)
+			off += 8
+		}
+	}
+	return layout
+}
+
+func mutateMeta(t *testing.T, blockDir string, mutate func(*BlockMeta)) {
+	t.Helper()
+	meta, err := readMeta(blockDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	mutate(&meta)
+	data, err := json.MarshalIndent(meta, "", "  ")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(blockDir, metaFilename), data, 0644); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func replaceLastChunk(t *testing.T, blockDir string, chunk []byte) {
+	t.Helper()
+	path := filepath.Join(blockDir, chunksDirName, "000001")
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	off := chunkHeaderLen
+	for {
+		dataLen := int(binary.BigEndian.Uint32(data[off : off+4]))
+		next := off + chunkEntryHeaderLen + dataLen + chunkEntryCRCLen
+		if next == len(data) {
+			break
+		}
+		off = next
+	}
+
+	data = data[:off]
+	entry := make([]byte, chunkEntryHeaderLen+len(chunk)+chunkEntryCRCLen)
+	binary.BigEndian.PutUint32(entry[:4], uint32(len(chunk)))
+	entry[4] = encodingXOR
+	copy(entry[chunkEntryHeaderLen:], chunk)
+	checksum := crc32.New(castagnoliTable)
+	checksum.Write(entry[4:5])
+	checksum.Write(chunk)
+	binary.BigEndian.PutUint32(entry[chunkEntryHeaderLen+len(chunk):], checksum.Sum32())
+	data = append(data, entry...)
+	if err := os.WriteFile(path, data, 0644); err != nil {
+		t.Fatal(err)
+	}
+}
+
+type testBitWriter struct {
+	data []byte
+	bits int
+}
+
+func (w *testBitWriter) write(value uint64, count int) {
+	for bit := count - 1; bit >= 0; bit-- {
+		byteIndex := 2 + w.bits/8
+		if byteIndex == len(w.data) {
+			w.data = append(w.data, 0)
+		}
+		if value&(uint64(1)<<uint(bit)) != 0 {
+			w.data[byteIndex] |= 1 << uint(7-w.bits%8)
+		}
+		w.bits++
+	}
+}
+
+func invalidXORWindowChunk() []byte {
+	w := testBitWriter{data: make([]byte, 2)}
+	w.write(uint64(500), 64)
+	w.write(math.Float64bits(5), 64)
+	w.write(0, 1)
+	w.write(100, 14)
+	w.write(1, 1)
+	w.write(1, 1)
+	w.write(31, 5)
+	w.write(63, 6)
+	binary.BigEndian.PutUint16(w.data[:2], 2)
+	return w.data
 }
 
 func makeTestChunk(t *testing.T) []byte {

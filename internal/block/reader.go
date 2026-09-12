@@ -1,6 +1,7 @@
 package block
 
 import (
+	"fmt"
 	"container/heap"
 	"os"
 	"path/filepath"
@@ -27,6 +28,10 @@ func Open(dir string) (*Reader, error) {
 	if err != nil {
 		return nil, err
 	}
+	blockName := filepath.Base(filepath.Clean(dir))
+	if errs := validateMeta(blockName, meta); len(errs) > 0 {
+		return nil, fmt.Errorf("block: validation failed: %s", errs[0])
+	}
 
 	// Read the index file into memory.
 	indexData, err := os.ReadFile(filepath.Join(dir, "index"))
@@ -41,6 +46,10 @@ func Open(dir string) (*Reader, error) {
 	cr, err := newChunkReader(dir)
 	if err != nil {
 		return nil, err
+	}
+	if errs := validateRelationships(blockName, &meta, idx, cr.entries); len(errs) > 0 {
+		cr.close()
+		return nil, fmt.Errorf("block: validation failed: %s", errs[0])
 	}
 
 	r := &Reader{

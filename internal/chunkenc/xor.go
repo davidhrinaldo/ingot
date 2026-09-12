@@ -20,6 +20,8 @@ type ChunkIterator interface {
 	Err() error
 }
 
+var ErrInvalidXORWindow = errors.New("chunkenc: invalid XOR window")
+
 type XORChunk struct {
 	b bstream
 }
@@ -35,6 +37,15 @@ func XORChunkFromBytes(data []byte) *XORChunk {
 	cp := make([]byte, len(data))
 	copy(cp, data)
 	return &XORChunk{b: bstream{stream: cp}}
+}
+
+// XORIteratorFromBytes decodes data without copying it. The caller must keep
+// data unchanged for the lifetime of the iterator.
+func XORIteratorFromBytes(data []byte) ChunkIterator {
+	if len(data) < 2 {
+		return &xorIterator{err: ErrShortStream}
+	}
+	return (&XORChunk{b: bstream{stream: data}}).Iterator()
 }
 
 func (c *XORChunk) NumSamples() int {
@@ -194,8 +205,9 @@ type xorIterator struct {
 	v      float64
 	tDelta uint64
 
-	leading  uint8
-	trailing uint8
+	leading   uint8
+	trailing  uint8
+	hasWindow bool
 
 	err error
 }
@@ -379,8 +391,16 @@ func (it *xorIterator) readVDelta() bool {
 		if s == 0 {
 			s = 64
 		}
+		if l+s > 64 {
+			it.err = ErrInvalidXORWindow
+			return false
+		}
 		it.leading = uint8(l)
 		it.trailing = uint8(64 - l - s)
+		it.hasWindow = true
+	} else if !it.hasWindow {
+		it.err = ErrInvalidXORWindow
+		return false
 	}
 
 	sigbits := int(64 - it.leading - it.trailing)

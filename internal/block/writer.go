@@ -95,18 +95,16 @@ func prepareBlock(dataDir string, series []SeriesFlush, level int, sources []str
 	var (
 		indexEntries []index.SeriesEntry
 		meta         BlockMeta
+		haveChunks   bool
 	)
 	meta.ULID = ulid
-	meta.Version = 1
+	meta.Version = metaVersion
 	meta.Compaction = CompactionInfo{Level: level}
 	if sources != nil {
 		meta.Compaction.Sources = sources
 	} else {
 		meta.Compaction.Sources = []string{ulid}
 	}
-	meta.MinTime = int64(^uint64(0) >> 1) // max int64
-	meta.MaxTime = int64(0)
-
 	for _, sf := range series {
 		var chunks []index.ChunkMeta
 		for _, cd := range sf.Chunks {
@@ -120,12 +118,13 @@ func prepareBlock(dataDir string, series []SeriesFlush, level int, sources []str
 				MaxT: cd.MaxT,
 				Ref:  ref,
 			})
-			if cd.MinT < meta.MinTime {
+			if !haveChunks || cd.MinT < meta.MinTime {
 				meta.MinTime = cd.MinT
 			}
-			if cd.MaxT > meta.MaxTime {
+			if !haveChunks || cd.MaxT > meta.MaxTime {
 				meta.MaxTime = cd.MaxT
 			}
+			haveChunks = true
 			meta.Stats.NumChunks++
 			// Count samples from the chunk's 2-byte header.
 			if len(cd.Data) >= 2 {
@@ -138,6 +137,10 @@ func prepareBlock(dataDir string, series []SeriesFlush, level int, sources []str
 			Chunks: chunks,
 		})
 		meta.Stats.NumSeries++
+	}
+	if !haveChunks {
+		meta.MinTime = 0
+		meta.MaxTime = 0
 	}
 
 	if err := cw.close(); err != nil {

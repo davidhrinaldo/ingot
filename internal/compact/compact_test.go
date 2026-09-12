@@ -11,7 +11,8 @@ import (
 )
 
 const (
-	hour = 3600 * 1000 // 1 hour in ms
+	hour           = 3600 * 1000 // 1 hour in ms
+	testSourceULID = "00000000000000000000000000"
 )
 
 // makeChunk creates a chunk with the given samples and returns its raw bytes.
@@ -481,7 +482,7 @@ func createBlockWithMeta(t *testing.T, dataDir string, spec blockSpec) *block.Re
 	if level == 0 {
 		level = 1
 	}
-	return flushTestBlock(t, dataDir, series, level, []string{"src"})
+	return flushTestBlock(t, dataDir, series, level, []string{testSourceULID})
 }
 
 // createSourceBlock creates a block with the given series data.
@@ -508,5 +509,5 @@ func createSourceBlock(t *testing.T, dataDir string, sb sourceBlock) *block.Read
 	if level == 0 {
 		level = 1
 	}
-	return flushTestBlock(t, dataDir, flushData, level, []string{"src"})
+	return flushTestBlock(t, dataDir, flushData, level, []string{testSourceULID})
 }
