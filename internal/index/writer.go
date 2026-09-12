@@ -16,10 +16,10 @@ type Writer struct {
 	w   io.Writer
 	off int // bytes written so far
 
-	symbols    []string       // ordered symbol list
-	symbolIdx  map[string]int // string -> index in symbols
-	series     []SeriesEntry
-	postings   map[labelPair][]uint64 // label pair -> sorted series refs
+	symbols   []string       // ordered symbol list
+	symbolIdx map[string]int // string -> index in symbols
+	series    []SeriesEntry
+	postings  map[labelPair][]uint64 // label pair -> sorted series refs
 }
 
 type labelPair struct {
@@ -61,14 +61,19 @@ func (iw *Writer) addSymbol(s string) {
 
 // WriteTo writes the complete index file. Returns bytes written and any error.
 func (iw *Writer) WriteTo() (int, error) {
+	iw.off = 0
+	for _, entry := range iw.series {
+		if err := labels.Validate(entry.Labels); err != nil {
+			return iw.off, err
+		}
+	}
+
 	// Sort symbols for deterministic output.
 	sort.Strings(iw.symbols)
 	iw.symbolIdx = make(map[string]int, len(iw.symbols))
 	for i, s := range iw.symbols {
 		iw.symbolIdx[s] = i
 	}
-
-	iw.off = 0
 
 	// Header.
 	if err := iw.writeHeader(); err != nil {

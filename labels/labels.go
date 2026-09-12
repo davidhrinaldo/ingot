@@ -8,6 +8,11 @@ import (
 	"unicode/utf8"
 )
 
+const (
+	maxLabelLength = 1<<16 - 1
+	maxLabels      = 1<<16 - 1
+)
+
 // Label is a name/value pair identifying a time series.
 type Label struct {
 	Name  string
@@ -15,9 +20,11 @@ type Label struct {
 }
 
 var (
-	ErrEmptyName      = errors.New("labels: empty label name")
-	ErrInvalidUTF8    = errors.New("labels: label contains invalid UTF-8")
-	ErrDuplicateName  = errors.New("labels: duplicate label name")
+	ErrEmptyName     = errors.New("labels: empty label name")
+	ErrInvalidUTF8   = errors.New("labels: label contains invalid UTF-8")
+	ErrDuplicateName = errors.New("labels: duplicate label name")
+	ErrLabelTooLong  = errors.New("labels: label name or value exceeds 65535 bytes")
+	ErrTooManyLabels = errors.New("labels: label set exceeds 65535 labels")
 )
 
 // Sort sorts labels by name in place and returns them.
@@ -53,14 +60,20 @@ func Equal(a, b []Label) bool {
 }
 
 // Validate checks that labels are sorted, non-empty named, valid UTF-8,
-// and have no duplicate names.
+// encodable, and have no duplicate names.
 func Validate(ls []Label) error {
+	if len(ls) > maxLabels {
+		return ErrTooManyLabels
+	}
 	for i, l := range ls {
 		if l.Name == "" {
 			return ErrEmptyName
 		}
 		if !utf8.ValidString(l.Name) || !utf8.ValidString(l.Value) {
 			return ErrInvalidUTF8
+		}
+		if len(l.Name) > maxLabelLength || len(l.Value) > maxLabelLength {
+			return ErrLabelTooLong
 		}
 		if i > 0 && ls[i-1].Name >= l.Name {
 			if ls[i-1].Name == l.Name {

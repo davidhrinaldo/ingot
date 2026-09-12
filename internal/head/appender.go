@@ -18,9 +18,8 @@ var (
 type Appender struct {
 	head *Head
 
-	// New series created during this batch (not yet in WAL).
-	newSeries []wal.SeriesRecord
-	newHashes []uint64 // parallel to newSeries, for rollback
+	// Unlogged series used by this batch, with their label hashes for cleanup.
+	pendingSeries map[*memSeries]uint64
 
 	// Buffered samples.
 	samples []wal.RefSample
@@ -35,6 +34,9 @@ type Appender struct {
 // Append adds a sample to the batch. If ref is 0, the series is resolved
 // (or created) from ls. Returns the series ref for fast-path reuse.
 func (a *Appender) Append(ref uint64, ls []labels.Label, t int64, v float64) (uint64, error) {
+	if a.closed {
+		return 0, ErrAppenderClosed
+	}
 	if ref == 0 {
 		return a.appendByLabels(ls, t, v)
 	}
@@ -42,7 +44,7 @@ func (a *Appender) Append(ref uint64, ls []labels.Label, t int64, v float64) (ui
 }
 
 func (a *Appender) appendByLabels(ls []labels.Label, t int64, v float64) (uint64, error) {
-	ls = labels.Sort(ls)
+	ls = labels.Sort(copyLabels(ls))
 	if err := labels.Validate(ls); err != nil {
 		return 0, err
 	}
@@ -60,10 +62,6 @@ func (a *Appender) appendByLabels(ls []labels.Label, t int64, v float64) (uint64
 			labels: copyLabels(ls),
 		}
 		a.head.series.set(hash, s)
-		a.newSeries = append(a.newSeries, wal.SeriesRecord{Ref: ref, Labels: s.labels})
-		a.newHashes = append(a.newHashes, hash)
-	} else if !s.walLogged && !a.ownsSeries(s.ref) {
-		s.sharedPending = true
 	}
 
 	if err := a.checkTimestamp(s.ref, t); err != nil {
@@ -71,26 +69,25 @@ func (a *Appender) appendByLabels(ls []labels.Label, t int64, v float64) (uint64
 	}
 
 	a.samples = append(a.samples, wal.RefSample{Ref: s.ref, T: t, V: v})
+	a.trackPendingSeries(s, hash)
 	return s.ref, nil
 }
 
 func (a *Appender) appendByRef(ref uint64, t int64, v float64) (uint64, error) {
 	a.head.commitMu.Lock()
+	defer a.head.commitMu.Unlock()
+
 	s := a.head.series.getByRef(ref)
 	if s == nil {
-		a.head.commitMu.Unlock()
 		return 0, ErrSeriesNotFound
 	}
-	if !s.walLogged && !a.ownsSeries(ref) {
-		s.sharedPending = true
-	}
-	a.head.commitMu.Unlock()
 
 	if err := a.checkTimestamp(ref, t); err != nil {
 		return 0, err
 	}
 
 	a.samples = append(a.samples, wal.RefSample{Ref: ref, T: t, V: v})
+	a.trackPendingSeries(s, labels.Hash(s.labels))
 	return ref, nil
 }
 
@@ -126,6 +123,11 @@ func (a *Appender) Commit() error {
 	a.closed = true
 	a.head.commitMu.Lock()
 	defer a.head.commitMu.Unlock()
+	defer a.releasePendingSeries()
+
+	if err := a.validateBatch(); err != nil {
+		return err
+	}
 
 	// A series may have been created by another appender that has not committed.
 	// Log unresolved definitions here so samples never precede their series.
@@ -148,17 +150,49 @@ func (a *Appender) Commit() error {
 			return err
 		}
 	}
+	if err := a.head.wal.Commit(); err != nil {
+		return err
+	}
 
 	// Apply samples to head.
+	a.head.applyMu.Lock()
 	for _, s := range a.samples {
 		a.head.applySample(s.Ref, s.T, s.V)
 	}
+	a.head.applyMu.Unlock()
 
 	return nil
 }
 
-// Rollback discards the batch. Any new series created during this batch
-// that have no data are removed.
+// validateBatch checks committed timestamps again while commits are serialized.
+func (a *Appender) validateBatch() error {
+	lastT := make(map[uint64]int64)
+	for _, sample := range a.samples {
+		if prev, ok := lastT[sample.Ref]; ok {
+			if sample.T <= prev {
+				return ErrOutOfOrder
+			}
+			lastT[sample.Ref] = sample.T
+			continue
+		}
+
+		s := a.head.series.getByRef(sample.Ref)
+		if s == nil {
+			return ErrSeriesNotFound
+		}
+		s.mu.Lock()
+		committedT, hasData := s.lastT, s.hasData
+		s.mu.Unlock()
+		if hasData && sample.T <= committedT {
+			return ErrOutOfOrder
+		}
+		lastT[sample.Ref] = sample.T
+	}
+	return nil
+}
+
+// Rollback discards the batch. Unlogged series are removed when their last
+// participating appender closes.
 func (a *Appender) Rollback() error {
 	if a.closed {
 		return ErrAppenderClosed
@@ -167,33 +201,41 @@ func (a *Appender) Rollback() error {
 	a.head.commitMu.Lock()
 	defer a.head.commitMu.Unlock()
 
-	// Remove new series that were registered but never committed.
-	for i, rec := range a.newSeries {
-		s := a.head.series.getByRef(rec.Ref)
-		if s == nil {
+	a.releasePendingSeries()
+	a.samples = nil
+	return nil
+}
+
+func (a *Appender) trackPendingSeries(s *memSeries, hash uint64) {
+	if s.walLogged {
+		return
+	}
+	if a.pendingSeries == nil {
+		a.pendingSeries = make(map[*memSeries]uint64)
+	}
+	if _, ok := a.pendingSeries[s]; ok {
+		return
+	}
+	a.pendingSeries[s] = hash
+	s.pendingAppenders++
+}
+
+// releasePendingSeries drops this appender's claims and removes an unlogged
+// series after its last participating appender closes.
+func (a *Appender) releasePendingSeries() {
+	for s, hash := range a.pendingSeries {
+		s.pendingAppenders--
+		if s.pendingAppenders != 0 || s.walLogged {
 			continue
 		}
 		s.mu.Lock()
 		hasData := s.hasData
 		s.mu.Unlock()
-		if !hasData && !s.walLogged && !s.sharedPending {
-			a.head.series.remove(a.newHashes[i], s)
+		if !hasData {
+			a.head.series.remove(hash, s)
 		}
 	}
-
-	a.newSeries = nil
-	a.newHashes = nil
-	a.samples = nil
-	return nil
-}
-
-func (a *Appender) ownsSeries(ref uint64) bool {
-	for _, rec := range a.newSeries {
-		if rec.Ref == ref {
-			return true
-		}
-	}
-	return false
+	a.pendingSeries = nil
 }
 
 func copyLabels(ls []labels.Label) []labels.Label {
