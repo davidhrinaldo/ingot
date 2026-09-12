@@ -437,7 +437,7 @@ func (q *Querier) Select(matchers ...*labels.Matcher) SeriesSet {
 	return &sliceSeriesSet{series: entries}
 }
 
-// Close releases block references held by this querier.
+// Close releases snapshot references held by this querier.
 func (q *Querier) Close() error {
 	for _, b := range q.blocks {
 		dir := b.Dir()
@@ -446,6 +446,7 @@ func (q *Querier) Close() error {
 		}
 	}
 	q.blocks = nil
+	q.head = nil
 	return nil
 }
 

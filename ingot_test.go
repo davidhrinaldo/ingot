@@ -656,6 +656,34 @@ func TestQuerierExcludesCommitsAfterCreation(t *testing.T) {
 	}
 }
 
+func TestQuerierCloseReleasesHeadSnapshot(t *testing.T) {
+	db := openTestDB(t)
+	app := db.Appender()
+	if _, err := app.Append(0, labels.FromStrings("__name__", "temp"), 1, 1); err != nil {
+		t.Fatalf("append: %v", err)
+	}
+	if err := app.Commit(); err != nil {
+		t.Fatalf("commit: %v", err)
+	}
+
+	q, err := db.Querier(math.MinInt64, math.MaxInt64)
+	if err != nil {
+		t.Fatalf("create querier: %v", err)
+	}
+	if q.head == nil {
+		t.Fatal("querier has no head snapshot")
+	}
+	if err := q.Close(); err != nil {
+		t.Fatalf("close querier: %v", err)
+	}
+	if q.head != nil {
+		t.Fatal("closed querier retained its head snapshot")
+	}
+	if err := q.Close(); err != nil {
+		t.Fatalf("close querier again: %v", err)
+	}
+}
+
 type queryCase struct {
 	name     string
 	mint     int64
