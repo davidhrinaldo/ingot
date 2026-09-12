@@ -552,6 +552,173 @@ func TestCommitLogsSharedPendingSeries(t *testing.T) {
 	}
 }
 
+func TestCommitRevalidatesBatchBeforeWALWrite(t *testing.T) {
+	tests := []struct {
+		name       string
+		appendLose func(t *testing.T, app *Appender, refs []uint64)
+		appendWin  func(t *testing.T, app *Appender, refs []uint64)
+		want       map[uint64][]sample
+	}{
+		{
+			name: "reverse_commit_order_rejects_entire_batch",
+			appendLose: func(t *testing.T, app *Appender, refs []uint64) {
+				if _, err := app.Append(refs[0], nil, 2, 2); err != nil {
+					t.Fatalf("append non-conflicting sample: %v", err)
+				}
+				if _, err := app.Append(refs[1], nil, 2, 2); err != nil {
+					t.Fatalf("append stale sample: %v", err)
+				}
+			},
+			appendWin: func(t *testing.T, app *Appender, refs []uint64) {
+				if _, err := app.Append(refs[1], nil, 3, 3); err != nil {
+					t.Fatalf("append winning sample: %v", err)
+				}
+			},
+			want: map[uint64][]sample{
+				1: {s(1, 1)},
+				2: {s(1, 1), s(3, 3)},
+			},
+		},
+		{
+			name: "equal_timestamp_rejected",
+			appendLose: func(t *testing.T, app *Appender, refs []uint64) {
+				if _, err := app.Append(refs[0], nil, 2, 20); err != nil {
+					t.Fatalf("append duplicate timestamp: %v", err)
+				}
+			},
+			appendWin: func(t *testing.T, app *Appender, refs []uint64) {
+				if _, err := app.Append(refs[0], nil, 2, 2); err != nil {
+					t.Fatalf("append winning sample: %v", err)
+				}
+			},
+			want: map[uint64][]sample{
+				1: {s(1, 1), s(2, 2)},
+				2: {s(1, 1)},
+			},
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			dir := filepath.Join(t.TempDir(), "wal")
+			h, err := Open(dir, wal.Options{SyncInterval: -1})
+			if err != nil {
+				t.Fatalf("open head: %v", err)
+			}
+
+			seed := h.Appender()
+			refs := make([]uint64, 2)
+			for i, name := range []string{"first", "second"} {
+				refs[i], err = seed.Append(0, []labels.Label{{Name: "__name__", Value: name}}, 1, 1)
+				if err != nil {
+					t.Fatalf("append seed sample: %v", err)
+				}
+			}
+			if err := seed.Commit(); err != nil {
+				t.Fatalf("commit seed samples: %v", err)
+			}
+
+			loser := h.Appender()
+			tc.appendLose(t, loser, refs)
+			winner := h.Appender()
+			tc.appendWin(t, winner, refs)
+			if err := winner.Commit(); err != nil {
+				t.Fatalf("commit winning batch: %v", err)
+			}
+			if err := loser.Commit(); err != ErrOutOfOrder {
+				t.Fatalf("commit stale batch: got %v, want %v", err, ErrOutOfOrder)
+			}
+
+			for ref, want := range tc.want {
+				if got := collectSamples(t, h, ref, math.MinInt64, math.MaxInt64); !reflect.DeepEqual(got, want) {
+					t.Fatalf("head samples for ref %d: got %v, want %v", ref, got, want)
+				}
+			}
+			if err := h.Close(); err != nil {
+				t.Fatalf("close head: %v", err)
+			}
+
+			h, err = Open(dir, wal.Options{SyncInterval: -1})
+			if err != nil {
+				t.Fatalf("reopen head: %v", err)
+			}
+			defer h.Close()
+			for ref, want := range tc.want {
+				if got := collectSamples(t, h, ref, math.MinInt64, math.MaxInt64); !reflect.DeepEqual(got, want) {
+					t.Fatalf("replayed samples for ref %d: got %v, want %v", ref, got, want)
+				}
+			}
+		})
+	}
+}
+
+func TestAppendAfterAppenderClosedDoesNotRegisterSeries(t *testing.T) {
+	for _, closeAppender := range []struct {
+		name string
+		fn   func(*Appender) error
+	}{
+		{name: "commit", fn: func(app *Appender) error { return app.Commit() }},
+		{name: "rollback", fn: func(app *Appender) error { return app.Rollback() }},
+	} {
+		t.Run(closeAppender.name, func(t *testing.T) {
+			h := openHead(t)
+			app := h.Appender()
+			if err := closeAppender.fn(app); err != nil {
+				t.Fatalf("close appender: %v", err)
+			}
+			ref, err := app.Append(0, []labels.Label{{Name: "__name__", Value: "closed"}}, 1, 1)
+			if ref != 0 || err != ErrAppenderClosed {
+				t.Fatalf("append after close: got ref %d, error %v", ref, err)
+			}
+			if got := h.Stats().NumSeries; got != 0 {
+				t.Fatalf("registered series after close: got %d, want 0", got)
+			}
+		})
+	}
+}
+
+func TestSharedPendingSeriesRemovedAfterBothRollbacks(t *testing.T) {
+	for _, creatorFirst := range []bool{true, false} {
+		name := "shared_first"
+		if creatorFirst {
+			name = "creator_first"
+		}
+		t.Run(name, func(t *testing.T) {
+			h := openHead(t)
+			ls := []labels.Label{{Name: "__name__", Value: "pending"}}
+			creator := h.Appender()
+			ref, err := creator.Append(0, ls, 1, 1)
+			if err != nil {
+				t.Fatalf("append creator sample: %v", err)
+			}
+			shared := h.Appender()
+			if _, err := shared.Append(0, ls, 2, 2); err != nil {
+				t.Fatalf("append shared sample: %v", err)
+			}
+
+			first, second := shared, creator
+			if creatorFirst {
+				first, second = creator, shared
+			}
+			if err := first.Rollback(); err != nil {
+				t.Fatalf("first rollback: %v", err)
+			}
+			if h.series.getByRef(ref) == nil {
+				t.Fatal("series removed while another appender still uses it")
+			}
+			if err := second.Rollback(); err != nil {
+				t.Fatalf("second rollback: %v", err)
+			}
+			if h.series.getByRef(ref) != nil {
+				t.Fatal("series remains after all appenders rolled back")
+			}
+			if got := h.Stats().NumSeries; got != 0 {
+				t.Fatalf("series count: got %d, want 0", got)
+			}
+		})
+	}
+}
+
 func TestActivatedCheckpointRecoveryWithoutSourceBlock(t *testing.T) {
 	dir := filepath.Join(t.TempDir(), "wal")
 	opts := wal.Options{SegmentMaxSize: 128, SyncInterval: -1}

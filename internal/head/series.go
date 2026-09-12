@@ -29,10 +29,10 @@ type memSeries struct {
 	sealed []chunkMeta
 
 	// Timestamp of last appended sample (for OOO rejection).
-	lastT         int64
-	hasData       bool // false until the first sample is appended
-	walLogged     bool // protected by Head.commitMu
-	sharedPending bool // protected by Head.commitMu
+	lastT            int64
+	hasData          bool // false until the first sample is appended
+	walLogged        bool // protected by Head.commitMu
+	pendingAppenders int  // protected by Head.commitMu
 }
 
 // append adds a sample to the series. Caller must hold s.mu.
