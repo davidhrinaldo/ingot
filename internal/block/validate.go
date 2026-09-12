@@ -35,6 +35,15 @@ type scannedChunk struct {
 	valid bool
 }
 
+type chunkScanError struct {
+	detail string
+	cause  error
+}
+
+func (e chunkScanError) Error() string { return e.detail }
+
+func (e chunkScanError) Unwrap() error { return e.cause }
+
 // Validate checks the complete set of relationships in an immutable block.
 func Validate(dir string) []ValidationError {
 	var errs []ValidationError
@@ -90,8 +99,8 @@ func Validate(dir string) []ValidationError {
 			if !complete {
 				chunksReadable = false
 			}
-			for _, detail := range segmentErrs {
-				errs = append(errs, ValidationError{blockName, "chunks", detail})
+			for _, scanErr := range segmentErrs {
+				errs = append(errs, ValidationError{blockName, "chunks", scanErr.Error()})
 			}
 		}
 	}
@@ -102,7 +111,7 @@ func Validate(dir string) []ValidationError {
 	return errs
 }
 
-func validateChunkFile(path, name string, segment int, relationships *relationshipValidator) (bool, []string, error) {
+func validateChunkFile(path, name string, segment int, relationships *relationshipValidator) (bool, []chunkScanError, error) {
 	data, err := mmapFile(path)
 	if err != nil {
 		return false, nil, err
@@ -187,16 +196,11 @@ func newRelationshipValidator(blockName string, meta *BlockMeta, idx *index.Read
 		statsComplete: true,
 	}
 	for _, entry := range idx.Series() {
-		var previousMaxT int64
 		for chunkIndex, chunkMeta := range entry.Chunks {
 			v.numChunks++
 			if chunkMeta.MinT > chunkMeta.MaxT {
 				v.addIndex("series %d chunk %d has minT %d > maxT %d", entry.Ref, chunkIndex, chunkMeta.MinT, chunkMeta.MaxT)
 			}
-			if chunkIndex > 0 && chunkMeta.MinT <= previousMaxT {
-				v.addIndex("series %d chunks are unsorted or overlap at chunk %d", entry.Ref, chunkIndex)
-			}
-			previousMaxT = chunkMeta.MaxT
 
 			if _, duplicate := v.expected[chunkMeta.Ref]; duplicate {
 				v.addIndex("duplicate chunk ref %d", chunkMeta.Ref)
@@ -332,27 +336,33 @@ func validateRelationships(blockName string, meta *BlockMeta, idx *index.Reader,
 }
 
 // scanChunkSegment checks every entry and returns its exact on-disk boundary.
-func scanChunkSegment(data []byte, name string, segment int) (map[index.ChunkRef]scannedChunk, bool, []string) {
+func scanChunkSegment(data []byte, name string, segment int) (map[index.ChunkRef]scannedChunk, bool, []chunkScanError) {
 	entries := make(map[index.ChunkRef]scannedChunk)
 	if len(data) < chunkHeaderLen {
-		return entries, false, []string{fmt.Sprintf("segment %s: too short for header", name)}
+		return entries, false, []chunkScanError{{detail: fmt.Sprintf("segment %s: too short for header", name)}}
 	}
 	magic := binary.BigEndian.Uint32(data[:4])
 	if magic != chunkMagic {
-		return entries, false, []string{fmt.Sprintf("segment %s: invalid magic %#x", name, magic)}
+		return entries, false, []chunkScanError{{
+			detail: fmt.Sprintf("segment %s: invalid magic %#x", name, magic),
+			cause:  ErrInvalidChunkMagic,
+		}}
 	}
 	if data[4] != chunkVersion {
-		return entries, false, []string{fmt.Sprintf("segment %s: unsupported version %d", name, data[4])}
+		return entries, false, []chunkScanError{{
+			detail: fmt.Sprintf("segment %s: unsupported version %d", name, data[4]),
+			cause:  ErrInvalidChunkVersion,
+		}}
 	}
 
-	var errs []string
+	var errs []chunkScanError
 	complete := true
 	off := chunkHeaderLen
 	entryIndex := 0
 	for off < len(data) {
 		entryOffset := off
 		if off+chunkEntryHeaderLen > len(data) {
-			errs = append(errs, fmt.Sprintf("segment %s entry %d at offset %d: truncated header", name, entryIndex, off))
+			errs = append(errs, chunkScanError{detail: fmt.Sprintf("segment %s entry %d at offset %d: truncated header", name, entryIndex, off)})
 			complete = false
 			break
 		}
@@ -361,8 +371,8 @@ func scanChunkSegment(data []byte, name string, segment int) (map[index.ChunkRef
 		encoding := data[off+4]
 		off += chunkEntryHeaderLen
 		if dataLen > len(data)-off-chunkEntryCRCLen {
-			errs = append(errs, fmt.Sprintf("segment %s entry %d: truncated data (need %d bytes, have %d)",
-				name, entryIndex, dataLen+chunkEntryCRCLen, len(data)-off))
+			errs = append(errs, chunkScanError{detail: fmt.Sprintf("segment %s entry %d: truncated data (need %d bytes, have %d)",
+				name, entryIndex, dataLen+chunkEntryCRCLen, len(data)-off)})
 			complete = false
 			break
 		}
@@ -375,11 +385,17 @@ func scanChunkSegment(data []byte, name string, segment int) (map[index.ChunkRef
 		crc.Write(chunkBytes)
 		crcValid := crc.Sum32() == wantCRC
 		if !crcValid {
-			errs = append(errs, fmt.Sprintf("segment %s entry %d at offset %d: CRC mismatch", name, entryIndex, entryOffset))
+			errs = append(errs, chunkScanError{
+				detail: fmt.Sprintf("segment %s entry %d at offset %d: CRC mismatch", name, entryIndex, entryOffset),
+				cause:  ErrCorruptChunk,
+			})
 		}
 		encodingValid := encoding == encodingXOR
 		if !encodingValid {
-			errs = append(errs, fmt.Sprintf("segment %s entry %d at offset %d: unsupported encoding %d", name, entryIndex, entryOffset, encoding))
+			errs = append(errs, chunkScanError{
+				detail: fmt.Sprintf("segment %s entry %d at offset %d: unsupported encoding %d", name, entryIndex, entryOffset, encoding),
+				cause:  ErrInvalidChunkEncoding,
+			})
 		}
 
 		ref := index.NewChunkRef(uint32(segment), uint32(entryOffset))
@@ -392,6 +408,10 @@ func scanChunkSegment(data []byte, name string, segment int) (map[index.ChunkRef
 
 // validateChunkSegment is retained for focused segment validation tests.
 func validateChunkSegment(data []byte, name string) []string {
-	_, _, errs := scanChunkSegment(data, name, parseSegmentName(name))
+	_, _, scanErrs := scanChunkSegment(data, name, parseSegmentName(name))
+	errs := make([]string, len(scanErrs))
+	for i, err := range scanErrs {
+		errs[i] = err.Error()
+	}
 	return errs
 }

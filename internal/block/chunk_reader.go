@@ -73,7 +73,7 @@ func newChunkReader(blockDir string) (*chunkReader, error) {
 		parsed, _, errs := scanChunkSegment(data, e.Name(), idx)
 		if len(errs) > 0 {
 			cr.close()
-			return nil, fmt.Errorf("block: %s", errs[0])
+			return nil, fmt.Errorf("block: %w", errs[0])
 		}
 
 		for ref, chunk := range parsed {

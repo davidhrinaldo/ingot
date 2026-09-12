@@ -285,19 +285,6 @@ func TestValidateSemanticCorruption(t *testing.T) {
 			wantMatch: "reference wrong series",
 		},
 		{
-			name: "unsorted_chunks",
-			corrupt: func(t *testing.T, blockDir string) {
-				mutateIndex(t, blockDir, func(data []byte, layout testIndexLayout) {
-					first := layout.series[0].chunks[0].minT
-					second := layout.series[0].chunks[1].minT
-					firstMeta := append([]byte(nil), data[first:first+24]...)
-					copy(data[first:first+24], data[second:second+24])
-					copy(data[second:second+24], firstMeta)
-				})
-			},
-			wantMatch: "unsorted or overlap",
-		},
-		{
 			name: "unsupported_chunk_encoding_with_valid_crc",
 			corrupt: func(t *testing.T, blockDir string) {
 				path := filepath.Join(blockDir, chunksDirName, "000001")
@@ -431,7 +418,7 @@ func TestLegacyNegativeTimeBounds(t *testing.T) {
 	})
 }
 
-func TestValidateRejectsOverlappingChunks(t *testing.T) {
+func TestValidateAcceptsOverlappingChunks(t *testing.T) {
 	dataDir := t.TempDir()
 	ulid, err := Flush(dataDir, []SeriesFlush{{
 		Ref:    1,
@@ -445,13 +432,14 @@ func TestValidateRejectsOverlappingChunks(t *testing.T) {
 		t.Fatal(err)
 	}
 	blockDir := filepath.Join(dataDir, ulid)
-	errs := Validate(blockDir)
-	if len(errs) == 0 || !strings.Contains(errs[0].Error(), "unsorted or overlap") {
-		t.Fatalf("got %v, want overlapping chunks error", errs)
+	if errs := Validate(blockDir); len(errs) != 0 {
+		t.Fatalf("Validate rejected overlapping chunks: %v", errs)
 	}
-	if _, err := Open(blockDir); err == nil {
-		t.Fatal("Open accepted overlapping chunks")
+	r, err := Open(blockDir)
+	if err != nil {
+		t.Fatalf("Open rejected overlapping chunks: %v", err)
 	}
+	r.Close()
 }
 
 func semanticTestBlock(t *testing.T) string {

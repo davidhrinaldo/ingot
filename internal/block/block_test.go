@@ -1,6 +1,7 @@
 package block
 
 import (
+	"errors"
 	"math"
 	"math/rand"
 	"os"
@@ -557,6 +558,7 @@ func TestBlockCorruption(t *testing.T) {
 		name        string
 		corruptFunc func(t *testing.T, blockDir string, chunkRef index.ChunkRef)
 		wantErr     string
+		wantCause   error
 	}{
 		{
 			name: "corrupt_chunk_data_byte",
@@ -572,7 +574,8 @@ func TestBlockCorruption(t *testing.T) {
 					t.Fatalf("unexpected error: %v", err)
 				}
 			},
-			wantErr: "CRC mismatch",
+			wantErr:   "CRC mismatch",
+			wantCause: ErrCorruptChunk,
 		},
 		{
 			name: "corrupt_chunk_crc",
@@ -593,7 +596,8 @@ func TestBlockCorruption(t *testing.T) {
 					t.Fatalf("unexpected error: %v", err)
 				}
 			},
-			wantErr: "CRC mismatch",
+			wantErr:   "CRC mismatch",
+			wantCause: ErrCorruptChunk,
 		},
 	}
 
@@ -630,6 +634,9 @@ func TestBlockCorruption(t *testing.T) {
 			_, err = Open(blockDir)
 			if err == nil || !strings.Contains(err.Error(), tc.wantErr) {
 				t.Errorf("got %v, want error containing %q", err, tc.wantErr)
+			}
+			if !errors.Is(err, tc.wantCause) {
+				t.Errorf("got error %v, want cause %v", err, tc.wantCause)
 			}
 		})
 	}
