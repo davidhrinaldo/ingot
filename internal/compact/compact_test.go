@@ -264,7 +264,7 @@ func TestCompact(t *testing.T) {
 			wantLevel: 3,
 		},
 		{
-			name: "sort_series_chunks_independently_of_source_blocks",
+			name: "merge_series_independently_of_source_blocks",
 			sourceBlocks: []sourceBlock{
 				{
 					level: 1,
@@ -284,6 +284,28 @@ func TestCompact(t *testing.T) {
 			wantSamples: map[uint64][]sample{
 				1: {{1000, 1.0}, {2000, 2.0}, {3000, 3.0}, {4000, 4.0}},
 				2: {{0, 0.0}},
+			},
+			wantLevel: 2,
+		},
+		{
+			name: "merge_overlapping_chunks_with_source_precedence",
+			sourceBlocks: []sourceBlock{
+				{
+					level: 1,
+					series: []seriesData{
+						{ref: 1, labels: labels.FromStrings("__name__", "shared"), samples: []sample{{50, 20.0}, {75, 3.0}, {100, 30.0}, {150, 4.0}}},
+					},
+				},
+				{
+					level: 1,
+					series: []seriesData{
+						{ref: 1, labels: labels.FromStrings("__name__", "shared"), samples: []sample{{0, 0.0}, {50, 1.0}, {100, 2.0}}},
+					},
+				},
+			},
+			wantSeriesRefs: []uint64{1},
+			wantSamples: map[uint64][]sample{
+				1: {{0, 0.0}, {50, 1.0}, {75, 3.0}, {100, 2.0}, {150, 4.0}},
 			},
 			wantLevel: 2,
 		},

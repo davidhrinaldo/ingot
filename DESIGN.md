@@ -150,7 +150,7 @@ Simplifications defended: no postings offset table sparse index (blocks are smal
 ## 9. Read Path
 1. `Querier(mint, maxt)` snapshots the set of overlapping blocks plus the head.
 2. `Select(matchers...)` resolves each matcher to a postings list (equality = direct lookup; regex = scan matching values), intersects/unions them.
-3. Per-series iterator merges chunks across head and blocks in time order; exact-duplicate timestamps dedupe to the block value (blocks are the durable record).
+3. Per-series iterators merge chunks, blocks, and head data in time order. At an exact-duplicate timestamp, a block value wins over the head because blocks are the durable record. Conflicting values in separate blocks have a deterministic winner for the current block set (`MinTime`, then ULID), but that winner is not stable across compaction: replacing several blocks changes both the replacement's global time range and its identity. Applications must not rely on precedence between conflicting blocks.
 4. Correctness oracle: tests compare every query result against a naive `[]sample` in-memory reference implementation fed the same appends. The merge across the head/block boundary is where the bugs live.
 
 Block reaping while a Querier holds references is handled by refcounting block readers; the compactor deletes directories only at refcount zero.

@@ -574,7 +574,8 @@ func (s *resultSeries) Iterator() SampleIterator {
 	var iters []chunkenc.ChunkIterator
 
 	// Blocks first in MinTime and ULID order, then head. Earlier sources win
-	// when several sources contain the same timestamp.
+	// duplicates for the current block set; only block-over-head precedence is
+	// stable when compaction replaces blocks.
 	for _, b := range s.querier.blocks {
 		it, err := b.SeriesChunkIterator(s.ref, s.querier.mint, s.querier.maxt)
 		if err != nil {
