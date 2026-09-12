@@ -1,11 +1,23 @@
 package wal
 
 import (
+	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"sync"
 	"sync/atomic"
 	"time"
+)
+
+// SyncPolicy controls when WAL writes are made durable.
+type SyncPolicy uint8
+
+const (
+	// SyncOnCommit fsyncs the WAL when a commit completes.
+	SyncOnCommit SyncPolicy = iota
+	// SyncPeriodic fsyncs the WAL in a background goroutine.
+	SyncPeriodic
 )
 
 // Options configures WAL behavior.
@@ -15,9 +27,16 @@ type Options struct {
 	// Default: 128 MiB.
 	SegmentMaxSize int
 
-	// SyncInterval controls background fsync frequency.
-	// Default (zero): 1s. Negative: sync on every Log call.
+	// SyncPolicy controls whether commits or a background goroutine fsync.
+	// The default is SyncOnCommit.
+	SyncPolicy SyncPolicy
+
+	// SyncInterval controls background fsync frequency when SyncPolicy is
+	// SyncPeriodic. The default is 1s.
 	SyncInterval time.Duration
+
+	// sync is overridden by tests that exercise fsync failures.
+	sync func(*os.File) error
 }
 
 func (o *Options) segmentMaxSize() int {
@@ -28,13 +47,33 @@ func (o *Options) segmentMaxSize() int {
 }
 
 func (o *Options) syncInterval() time.Duration {
-	if o.SyncInterval < 0 {
-		return -1 // sync-per-write sentinel
+	if o.SyncPolicy != SyncPeriodic {
+		return 0
 	}
-	if o.SyncInterval == 0 {
+	if o.SyncInterval <= 0 {
 		return time.Second
 	}
 	return o.SyncInterval
+}
+
+func (o *Options) validate() error {
+	if o.SyncPolicy != SyncOnCommit && o.SyncPolicy != SyncPeriodic {
+		return fmt.Errorf("wal: invalid sync policy %d", o.SyncPolicy)
+	}
+	if o.SyncInterval < 0 {
+		return fmt.Errorf("wal: sync interval must not be negative")
+	}
+	if o.SyncPolicy == SyncOnCommit && o.SyncInterval != 0 {
+		return fmt.Errorf("wal: sync interval requires periodic sync policy")
+	}
+	return nil
+}
+
+func (o *Options) fsync(f *os.File) error {
+	if o.sync != nil {
+		return o.sync(f)
+	}
+	return f.Sync()
 }
 
 // WAL is a segmented write-ahead log.
@@ -47,6 +86,7 @@ type WAL struct {
 	segmentIdx int
 	segmentOff int64
 	buf        []byte
+	syncErr    error
 
 	lastSyncDur atomic.Int64 // nanoseconds of last fsync
 
@@ -54,9 +94,12 @@ type WAL struct {
 	wg   sync.WaitGroup
 }
 
-// Open opens or creates a WAL in dir. If segments already exist, it runs
-// recovery (truncating at the first corrupt record) before returning.
+// Open opens or creates a WAL in dir. Recovery repairs an incomplete final
+// segment and rejects corruption in any closed segment.
 func Open(dir string, opts Options) (*WAL, error) {
+	if err := opts.validate(); err != nil {
+		return nil, err
+	}
 	if err := os.MkdirAll(dir, 0755); err != nil {
 		return nil, err
 	}
@@ -124,6 +167,9 @@ func Open(dir string, opts Options) (*WAL, error) {
 func (w *WAL) Log(typ RecordType, payload []byte) error {
 	w.mu.Lock()
 	defer w.mu.Unlock()
+	if w.syncErr != nil {
+		return fmt.Errorf("wal: previous fsync failed: %w", w.syncErr)
+	}
 
 	w.buf = EncodeRecord(w.buf[:0], typ, payload)
 
@@ -138,11 +184,6 @@ func (w *WAL) Log(typ RecordType, payload []byte) error {
 	w.segmentOff += int64(n)
 	if err != nil {
 		return err
-	}
-
-	// Sync-per-write mode.
-	if w.opts.syncInterval() < 0 {
-		return w.segment.Sync()
 	}
 
 	return nil
@@ -171,6 +212,9 @@ func (w *WAL) LogSamples(samples []RefSample) error {
 func (w *WAL) Checkpoint(blockULID string, series []SeriesRecord, samples [][]RefSample) (Checkpoint, error) {
 	w.mu.Lock()
 	defer w.mu.Unlock()
+	if w.syncErr != nil {
+		return Checkpoint{}, fmt.Errorf("wal: previous fsync failed: %w", w.syncErr)
+	}
 
 	if err := w.rotate(); err != nil {
 		return Checkpoint{}, err
@@ -211,11 +255,27 @@ func (w *WAL) Checkpoint(blockULID string, series []SeriesRecord, samples [][]Re
 func (w *WAL) ActivateCheckpoint(cp Checkpoint) error {
 	w.mu.Lock()
 	defer w.mu.Unlock()
+	if w.syncErr != nil {
+		return fmt.Errorf("wal: previous fsync failed: %w", w.syncErr)
+	}
 
 	if err := w.logLocked(RecordCheckpointActivate, EncodeCheckpoint(nil, cp)); err != nil {
 		return err
 	}
 	return w.timedSync()
+}
+
+// Commit completes the current WAL commit according to the sync policy.
+func (w *WAL) Commit() error {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	if w.syncErr != nil {
+		return fmt.Errorf("wal: previous fsync failed: %w", w.syncErr)
+	}
+	if w.opts.SyncPolicy == SyncOnCommit {
+		return w.timedSync()
+	}
+	return nil
 }
 
 // Replay returns a Reader over all WAL segments. The caller must Close
@@ -228,6 +288,9 @@ func (w *WAL) Replay() (*Reader, error) {
 func (w *WAL) Sync() error {
 	w.mu.Lock()
 	defer w.mu.Unlock()
+	if w.syncErr != nil {
+		return fmt.Errorf("wal: previous fsync failed: %w", w.syncErr)
+	}
 	return w.timedSync()
 }
 
@@ -237,20 +300,14 @@ func (w *WAL) LastSyncDuration() float64 {
 	return float64(ns) / 1e9
 }
 
-// HasSegmentBefore reports whether a WAL segment predating index still exists.
-func (w *WAL) HasSegmentBefore(index int) (bool, error) {
-	segs, err := listSegments(w.dir)
-	if err != nil {
-		return false, err
-	}
-	return len(segs) > 0 && segs[0] < index, nil
-}
-
 // timedSync fsyncs the segment and records the duration. Caller must hold w.mu.
 func (w *WAL) timedSync() error {
 	start := time.Now()
-	err := w.segment.Sync()
+	err := w.opts.fsync(w.segment)
 	w.lastSyncDur.Store(int64(time.Since(start)))
+	if err != nil && w.syncErr == nil {
+		w.syncErr = err
+	}
 	return err
 }
 
@@ -291,19 +348,19 @@ func (w *WAL) Close() error {
 	defer w.mu.Unlock()
 
 	if w.segment == nil {
-		return nil
+		return w.syncErr
 	}
-	if err := w.segment.Sync(); err != nil {
-		w.segment.Close()
-		return err
-	}
-	return w.segment.Close()
+	previousSyncErr := w.syncErr
+	syncErr := w.timedSync()
+	closeErr := w.segment.Close()
+	w.segment = nil
+	return errors.Join(previousSyncErr, syncErr, closeErr)
 }
 
 // rotate fsyncs the current segment, closes it, and creates a new one.
 // Caller must hold w.mu.
 func (w *WAL) rotate() error {
-	if err := w.segment.Sync(); err != nil {
+	if err := w.timedSync(); err != nil {
 		return err
 	}
 	if err := w.segment.Close(); err != nil {
@@ -344,7 +401,9 @@ func (w *WAL) syncLoop(interval time.Duration) {
 			return
 		case <-ticker.C:
 			w.mu.Lock()
-			w.timedSync()
+			if w.syncErr == nil {
+				w.timedSync()
+			}
 			w.mu.Unlock()
 		}
 	}

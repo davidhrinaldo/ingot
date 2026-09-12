@@ -1,10 +1,13 @@
 package wal
 
 import (
+	"errors"
 	"os"
 	"path/filepath"
 	"reflect"
+	"sync"
 	"testing"
+	"time"
 
 	"github.com/davidhrinaldo/ingot/labels"
 )
@@ -141,7 +144,7 @@ func TestWAL(t *testing.T) {
 					t.Fatalf("unexpected error: %v", err)
 				}
 			},
-			wantRecords: 1,  // only the last segment's record(s) survive
+			wantRecords: 1, // only the last segment's record(s) survive
 			wantMinSegs: 1,
 		},
 		{
@@ -377,6 +380,206 @@ func TestTornWriteRecovery(t *testing.T) {
 						t.Errorf("cutoff=%d rec=%d data: got %v, want %v", cutoff, i, rec.Data, origRecs[i].Data)
 					}
 				}
+			}
+		})
+	}
+}
+
+func TestClosedSegmentCorruptionLeavesWALIntact(t *testing.T) {
+	tests := []struct {
+		name    string
+		corrupt func([]byte) []byte
+		wantErr error
+	}{
+		{
+			name: "checksum",
+			corrupt: func(data []byte) []byte {
+				data[len(data)-1] ^= 0xff
+				return data
+			},
+			wantErr: ErrCorruptRecord,
+		},
+		{
+			name: "truncated",
+			corrupt: func(data []byte) []byte {
+				return data[:len(data)-1]
+			},
+			wantErr: ErrInvalidRecord,
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			dir := filepath.Join(t.TempDir(), "wal")
+			opts := Options{SegmentMaxSize: 50}
+			w, err := Open(dir, opts)
+			if err != nil {
+				t.Fatalf("open WAL: %v", err)
+			}
+			for i := 0; i < 4; i++ {
+				if err := w.LogSamples([]RefSample{{Ref: 1, T: int64(i), V: float64(i)}}); err != nil {
+					t.Fatalf("log sample %d: %v", i, err)
+				}
+			}
+			if err := w.Close(); err != nil {
+				t.Fatalf("close WAL: %v", err)
+			}
+
+			segs, err := listSegments(dir)
+			if err != nil {
+				t.Fatalf("list segments: %v", err)
+			}
+			if len(segs) < 3 {
+				t.Fatalf("segment count: got %d, want at least 3", len(segs))
+			}
+			closed := segs[0]
+			path := segmentPath(dir, closed)
+			data, err := os.ReadFile(path)
+			if err != nil {
+				t.Fatalf("read closed segment: %v", err)
+			}
+			if err := os.WriteFile(path, tc.corrupt(data), 0644); err != nil {
+				t.Fatalf("corrupt closed segment: %v", err)
+			}
+
+			before := make(map[int][]byte, len(segs))
+			for _, idx := range segs {
+				before[idx], err = os.ReadFile(segmentPath(dir, idx))
+				if err != nil {
+					t.Fatalf("snapshot segment %d: %v", idx, err)
+				}
+			}
+
+			if _, err := Open(dir, opts); !errors.Is(err, tc.wantErr) {
+				t.Fatalf("reopen error: got %v, want %v", err, tc.wantErr)
+			}
+			afterSegs, err := listSegments(dir)
+			if err != nil {
+				t.Fatalf("list segments after failed recovery: %v", err)
+			}
+			if !reflect.DeepEqual(afterSegs, segs) {
+				t.Fatalf("segments changed: got %v, want %v", afterSegs, segs)
+			}
+			for _, idx := range segs {
+				after, err := os.ReadFile(segmentPath(dir, idx))
+				if err != nil {
+					t.Fatalf("read segment %d after failed recovery: %v", idx, err)
+				}
+				if !reflect.DeepEqual(after, before[idx]) {
+					t.Fatalf("segment %d changed during failed recovery", idx)
+				}
+			}
+		})
+	}
+}
+
+func TestCommitSyncPolicy(t *testing.T) {
+	tests := []struct {
+		name            string
+		opts            Options
+		wantCommitSyncs int
+	}{
+		{name: "default_syncs_on_commit", opts: Options{}, wantCommitSyncs: 1},
+		{
+			name:            "periodic_commit_does_not_sync",
+			opts:            Options{SyncPolicy: SyncPeriodic, SyncInterval: time.Hour},
+			wantCommitSyncs: 0,
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			var syncs int
+			tc.opts.sync = func(*os.File) error {
+				syncs++
+				return nil
+			}
+			w, err := Open(filepath.Join(t.TempDir(), "wal"), tc.opts)
+			if err != nil {
+				t.Fatalf("open WAL: %v", err)
+			}
+			if err := w.LogSamples([]RefSample{{Ref: 1, T: 1, V: 1}}); err != nil {
+				t.Fatalf("log sample: %v", err)
+			}
+			if err := w.Commit(); err != nil {
+				t.Fatalf("commit WAL: %v", err)
+			}
+			if syncs != tc.wantCommitSyncs {
+				t.Fatalf("sync count after commit: got %d, want %d", syncs, tc.wantCommitSyncs)
+			}
+			if err := w.Close(); err != nil {
+				t.Fatalf("close WAL: %v", err)
+			}
+		})
+	}
+}
+
+func TestCommitSyncFailureIsSticky(t *testing.T) {
+	syncFailure := errors.New("injected fsync failure")
+	var syncs int
+	opts := Options{sync: func(*os.File) error {
+		syncs++
+		if syncs == 1 {
+			return syncFailure
+		}
+		return nil
+	}}
+	w, err := Open(filepath.Join(t.TempDir(), "wal"), opts)
+	if err != nil {
+		t.Fatalf("open WAL: %v", err)
+	}
+	if err := w.LogSamples([]RefSample{{Ref: 1, T: 1, V: 1}}); err != nil {
+		t.Fatalf("log sample: %v", err)
+	}
+	if err := w.Commit(); !errors.Is(err, syncFailure) {
+		t.Fatalf("commit error: got %v, want %v", err, syncFailure)
+	}
+	if err := w.Commit(); !errors.Is(err, syncFailure) {
+		t.Fatalf("second commit error: got %v, want %v", err, syncFailure)
+	}
+	if err := w.Close(); !errors.Is(err, syncFailure) {
+		t.Fatalf("close error: got %v, want %v", err, syncFailure)
+	}
+	if syncs != 2 {
+		t.Fatalf("sync count: got %d, want 2", syncs)
+	}
+}
+
+func TestBackgroundSyncErrorIsReported(t *testing.T) {
+	syncFailure := errors.New("injected fsync failure")
+
+	for _, operation := range []string{"commit", "close"} {
+		t.Run(operation, func(t *testing.T) {
+			called := make(chan struct{})
+			var once sync.Once
+			opts := Options{
+				SyncPolicy:   SyncPeriodic,
+				SyncInterval: time.Millisecond,
+				sync: func(*os.File) error {
+					once.Do(func() { close(called) })
+					return syncFailure
+				},
+			}
+			w, err := Open(filepath.Join(t.TempDir(), "wal"), opts)
+			if err != nil {
+				t.Fatalf("open WAL: %v", err)
+			}
+			if err := w.LogSamples([]RefSample{{Ref: 1, T: 1, V: 1}}); err != nil {
+				t.Fatalf("log sample: %v", err)
+			}
+			select {
+			case <-called:
+			case <-time.After(time.Second):
+				t.Fatal("background sync did not run")
+			}
+
+			if operation == "commit" {
+				if err := w.Commit(); !errors.Is(err, syncFailure) {
+					t.Fatalf("commit error: got %v, want %v", err, syncFailure)
+				}
+			}
+			if err := w.Close(); !errors.Is(err, syncFailure) {
+				t.Fatalf("close error: got %v, want %v", err, syncFailure)
 			}
 		})
 	}

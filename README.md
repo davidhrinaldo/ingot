@@ -57,11 +57,26 @@ go get github.com/davidhrinaldo/ingot
 ## Features
 
 - **Gorilla XOR compression** — ~1 byte/sample on regular metric data (see benchmarks below)
-- **Crash-safe** — WAL with CRC32C records. Committed data is persisted
+- **Crash-safe** — WAL with CRC32C records. By default, a successful commit is durable on disk
 - **Query by label matchers** — equality, negation, regex, negative regex; merged across head and blocks
 - **Levelled compaction** — 2h → 8h → 32h blocks, background merging, retention-based expiry
 - **Self-instrumentation** — the DB records its own metrics (series/chunk counts, compactions, WAL fsync duration) through the normal write path, queryable like any other series
 - **Zero external dependencies**
+
+## Commit durability
+
+The zero-value `Options{}` uses `SyncOnCommit`. `Appender.Commit` writes the batch to the WAL, calls `fsync`, and applies it to the in-memory head only after the sync succeeds. A successful commit therefore survives a process or machine crash, subject to the storage device honoring `fsync`.
+
+Applications that accept a bounded loss window can opt into background sync:
+
+```go
+db, err := ingot.Open("./data", ingot.Options{
+    SyncPolicy:   ingot.SyncPeriodic,
+    SyncInterval: time.Second,
+})
+```
+
+With `SyncPeriodic`, `Commit` does not wait for `fsync`; a crash can lose commits since the last successful background sync. A background sync error becomes sticky and is returned by the next `Commit` and by `Close`.
 
 ## Tools
 

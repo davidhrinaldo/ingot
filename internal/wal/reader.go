@@ -1,6 +1,7 @@
 package wal
 
 import (
+	"fmt"
 	"io"
 	"os"
 )
@@ -171,9 +172,9 @@ func cloneBytes(b []byte) []byte {
 	return c
 }
 
-// recover scans all segments, validating records. On the first corrupt or
-// truncated record, it truncates the segment file at the start of that record
-// and deletes all subsequent segments. Returns the records that survived.
+// recover validates closed segments without modifying them. A corrupt or
+// truncated final segment is repaired because it may be an interrupted write
+// to the active tail.
 func recover(dir string) error {
 	segs, err := listSegments(dir)
 	if err != nil {
@@ -184,27 +185,20 @@ func recover(dir string) error {
 	}
 
 	for i, idx := range segs {
-		truncated, err := recoverSegment(dir, idx)
+		truncated, err := recoverSegment(dir, idx, i == len(segs)-1)
 		if err != nil {
 			return err
 		}
 		if truncated {
-			// Delete all segments after this one.
-			for _, laterIdx := range segs[i+1:] {
-				if err := os.Remove(segmentPath(dir, laterIdx)); err != nil {
-					return err
-				}
-			}
 			return syncDir(dir)
 		}
 	}
 	return nil
 }
 
-// recoverSegment validates all records in a single segment. If it encounters
-// corruption, it truncates the file at the last valid record boundary.
-// Returns true if truncation occurred.
-func recoverSegment(dir string, index int) (bool, error) {
+// recoverSegment validates all records in a segment. It repairs corruption at
+// the last valid record boundary only when repairTail is true.
+func recoverSegment(dir string, index int, repairTail bool) (bool, error) {
 	path := segmentPath(dir, index)
 	data, err := os.ReadFile(path)
 	if err != nil {
@@ -214,10 +208,12 @@ func recoverSegment(dir string, index int) (bool, error) {
 	// Walk records, tracking the offset of the last valid boundary.
 	validEnd := 0
 	off := 0
+	var recordErr error
 	for off < len(data) {
 		_, _, consumed, err := DecodeRecord(data[off:])
 		if err != nil {
 			// Corruption or truncation at this offset.
+			recordErr = err
 			break
 		}
 		off += consumed
@@ -227,6 +223,9 @@ func recoverSegment(dir string, index int) (bool, error) {
 	if validEnd == len(data) {
 		// Entire segment is valid.
 		return false, nil
+	}
+	if !repairTail {
+		return false, fmt.Errorf("wal: corrupt closed segment %08d at offset %d: %w", index, validEnd, recordErr)
 	}
 
 	// Truncate the file at the last valid boundary.
