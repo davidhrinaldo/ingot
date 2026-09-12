@@ -451,7 +451,7 @@ func (h *Head) Labels(ref uint64) ([]labels.Label, bool) {
 	if s == nil {
 		return nil, false
 	}
-	return s.labels, true
+	return copyLabels(s.labels), true
 }
 
 // AllPostings returns sorted refs for all series in the head.

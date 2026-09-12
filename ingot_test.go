@@ -3,7 +3,9 @@ package ingot
 import (
 	"math"
 	"os"
+	"path/filepath"
 	"reflect"
+	"sort"
 	"testing"
 	"time"
 
@@ -18,7 +20,7 @@ type sample struct {
 
 // oracle is a naive reference implementation for query comparison.
 type oracle struct {
-	series map[uint64][]sample      // ref -> samples in order
+	series map[uint64][]sample       // ref -> samples in order
 	labels map[uint64][]labels.Label // ref -> labels
 }
 
@@ -129,9 +131,9 @@ func openTestDB(t *testing.T) *DB {
 
 func TestQueryOracle(t *testing.T) {
 	tests := []struct {
-		name     string
-		setup    func(t *testing.T, db *DB, o *oracle)
-		queries  []queryCase
+		name    string
+		setup   func(t *testing.T, db *DB, o *oracle)
+		queries []queryCase
 	}{
 		{
 			name: "head_only",
@@ -363,9 +365,9 @@ func TestQueryOracle(t *testing.T) {
 					matchers: []*labels.Matcher{labels.MustNewMatcher(labels.MatchEqual, "room", "office")},
 				},
 				{
-					name:     "combined_matchers",
-					mint:     math.MinInt64,
-					maxt:     math.MaxInt64,
+					name: "combined_matchers",
+					mint: math.MinInt64,
+					maxt: math.MaxInt64,
 					matchers: []*labels.Matcher{
 						labels.MustNewMatcher(labels.MatchEqual, "__name__", "temp"),
 						labels.MustNewMatcher(labels.MatchEqual, "room", "office"),
@@ -526,6 +528,133 @@ func TestQueryOracle(t *testing.T) {
 						}
 					}
 				})
+			}
+		})
+	}
+}
+
+func TestMatcherAbsentLabelSemantics(t *testing.T) {
+	tests := []struct {
+		name    string
+		matcher *labels.Matcher
+		want    []string
+	}{
+		{name: "equal_empty", matcher: labels.MustNewMatcher(labels.MatchEqual, "state", ""), want: []string{"explicit-empty", "missing"}},
+		{name: "equal_nonempty", matcher: labels.MustNewMatcher(labels.MatchEqual, "state", "up"), want: []string{"nonempty"}},
+		{name: "not_equal_empty", matcher: labels.MustNewMatcher(labels.MatchNotEqual, "state", ""), want: []string{"nonempty"}},
+		{name: "not_equal_nonempty", matcher: labels.MustNewMatcher(labels.MatchNotEqual, "state", "up"), want: []string{"explicit-empty", "missing"}},
+		{name: "regexp_matches_empty", matcher: labels.MustNewMatcher(labels.MatchRegexp, "state", ".*"), want: []string{"explicit-empty", "missing", "nonempty"}},
+		{name: "regexp_rejects_empty", matcher: labels.MustNewMatcher(labels.MatchRegexp, "state", ".+"), want: []string{"nonempty"}},
+		{name: "not_regexp_rejects_empty", matcher: labels.MustNewMatcher(labels.MatchNotRegexp, "state", ".*"), want: nil},
+		{name: "not_regexp_matches_empty", matcher: labels.MustNewMatcher(labels.MatchNotRegexp, "state", ".+"), want: []string{"explicit-empty", "missing"}},
+		{name: "nil", matcher: nil, want: nil},
+		{name: "unsupported", matcher: &labels.Matcher{Type: labels.MatchType(99), Name: "state"}, want: nil},
+		{name: "uncompiled_regexp", matcher: &labels.Matcher{Type: labels.MatchRegexp, Name: "state", Value: ".*"}, want: nil},
+	}
+
+	for _, blockOnly := range []bool{false, true} {
+		source := "head"
+		if blockOnly {
+			source = "block_reopen"
+		}
+		t.Run(source, func(t *testing.T) {
+			dataDir := t.TempDir()
+			db, err := Open(dataDir, Options{})
+			if err != nil {
+				t.Fatalf("open DB: %v", err)
+			}
+
+			series := [][]labels.Label{
+				labels.FromStrings("__name__", "missing"),
+				labels.FromStrings("__name__", "explicit-empty", "state", ""),
+				labels.FromStrings("__name__", "nonempty", "state", "up"),
+			}
+			app := db.Appender()
+			for _, ls := range series {
+				ref, err := app.Append(0, ls, 0, 0)
+				if err != nil {
+					db.Close()
+					t.Fatalf("append series: %v", err)
+				}
+				if blockOnly {
+					for i := 1; i <= 120; i++ {
+						if _, err := app.Append(ref, nil, int64(i), float64(i)); err != nil {
+							db.Close()
+							t.Fatalf("append sample: %v", err)
+						}
+					}
+				}
+			}
+			if err := app.Commit(); err != nil {
+				db.Close()
+				t.Fatalf("commit: %v", err)
+			}
+
+			if blockOnly {
+				if _, err := db.FlushOlderThan(math.MaxInt64); err != nil {
+					db.Close()
+					t.Fatalf("flush: %v", err)
+				}
+				if err := db.Close(); err != nil {
+					t.Fatalf("close before reopen: %v", err)
+				}
+				if err := os.RemoveAll(filepath.Join(dataDir, "wal")); err != nil {
+					t.Fatalf("remove WAL: %v", err)
+				}
+				db, err = Open(dataDir, Options{})
+				if err != nil {
+					t.Fatalf("reopen DB: %v", err)
+				}
+			}
+			defer db.Close()
+
+			for _, tc := range tests {
+				t.Run(tc.name, func(t *testing.T) {
+					q, err := db.Querier(math.MinInt64, math.MaxInt64)
+					if err != nil {
+						t.Fatalf("querier: %v", err)
+					}
+					ss := q.Select(tc.matcher)
+					var got []string
+					for ss.Next() {
+						for _, l := range ss.At().Labels() {
+							if l.Name == "__name__" {
+								got = append(got, l.Value)
+							}
+						}
+					}
+					if err := ss.Err(); err != nil {
+						q.Close()
+						t.Fatalf("select: %v", err)
+					}
+					if err := q.Close(); err != nil {
+						t.Fatalf("close querier: %v", err)
+					}
+					sort.Strings(got)
+					if !reflect.DeepEqual(got, tc.want) {
+						t.Fatalf("series: got %v, want %v", got, tc.want)
+					}
+				})
+			}
+
+			q, err := db.Querier(math.MinInt64, math.MaxInt64)
+			if err != nil {
+				t.Fatalf("querier for mutation test: %v", err)
+			}
+			ss := q.Select(labels.MustNewMatcher(labels.MatchEqual, "__name__", "missing"))
+			if !ss.Next() {
+				q.Close()
+				t.Fatal("series for mutation test not found")
+			}
+			result := ss.At()
+			got := result.Labels()
+			got[0].Value = "changed"
+			if got = result.Labels(); got[0].Value != "missing" {
+				q.Close()
+				t.Fatalf("result labels changed through returned slice: %v", got)
+			}
+			if err := q.Close(); err != nil {
+				t.Fatalf("close mutation querier: %v", err)
 			}
 		})
 	}

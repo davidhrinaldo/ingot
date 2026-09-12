@@ -1,9 +1,11 @@
 package wal
 
 import (
+	"errors"
 	"os"
 	"path/filepath"
 	"reflect"
+	"strings"
 	"testing"
 
 	"github.com/davidhrinaldo/ingot/labels"
@@ -26,6 +28,27 @@ func collectRecords(t *testing.T, dir string) []Record {
 		t.Fatalf("unexpected error: %v", r.Err())
 	}
 	return recs
+}
+
+func TestLogSeriesRejectsOversizedBatchBeforeWriting(t *testing.T) {
+	dir := filepath.Join(t.TempDir(), "wal")
+	w, err := Open(dir, Options{SyncInterval: -1})
+	if err != nil {
+		t.Fatalf("open WAL: %v", err)
+	}
+	recs := []SeriesRecord{
+		{Ref: 1, Labels: labels.FromStrings("__name__", "valid")},
+		{Ref: 2, Labels: labels.FromStrings("__name__", strings.Repeat("v", 1<<16))},
+	}
+	if err := w.LogSeries(recs); !errors.Is(err, labels.ErrLabelTooLong) {
+		t.Fatalf("log series error: got %v, want %v", err, labels.ErrLabelTooLong)
+	}
+	if err := w.Close(); err != nil {
+		t.Fatalf("close WAL: %v", err)
+	}
+	if got := collectRecords(t, dir); len(got) != 0 {
+		t.Fatalf("wrote %d records before rejecting oversized label", len(got))
+	}
 }
 
 func TestWAL(t *testing.T) {
@@ -141,7 +164,7 @@ func TestWAL(t *testing.T) {
 					t.Fatalf("unexpected error: %v", err)
 				}
 			},
-			wantRecords: 1,  // only the last segment's record(s) survive
+			wantRecords: 1, // only the last segment's record(s) survive
 			wantMinSegs: 1,
 		},
 		{

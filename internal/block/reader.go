@@ -107,7 +107,7 @@ func (r *Reader) Labels(ref uint64) ([]labels.Label, bool) {
 	if !ok {
 		return nil, false
 	}
-	return entry.Labels, true
+	return append([]labels.Label(nil), entry.Labels...), true
 }
 
 // LabelValues returns sorted unique values for the given label name.
@@ -181,6 +181,6 @@ func (m *multiIterator) Err() error {
 
 type emptyIterator struct{}
 
-func (e *emptyIterator) Next() bool        { return false }
+func (e *emptyIterator) Next() bool           { return false }
 func (e *emptyIterator) At() (int64, float64) { return 0, 0 }
-func (e *emptyIterator) Err() error        { return nil }
+func (e *emptyIterator) Err() error           { return nil }

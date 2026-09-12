@@ -6,6 +6,7 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"strings"
 	"sync"
 	"testing"
 
@@ -318,6 +319,110 @@ func TestHead(t *testing.T) {
 						t.Errorf("ref %d sample %d: got %v, want %v", ref, i, got[i], want)
 					}
 				}
+			}
+		})
+	}
+}
+
+func TestAppenderLabelOwnership(t *testing.T) {
+	dir := filepath.Join(t.TempDir(), "wal")
+	h, err := Open(dir, wal.Options{SyncInterval: -1})
+	if err != nil {
+		t.Fatalf("open head: %v", err)
+	}
+	input := []labels.Label{
+		{Name: "room", Value: "office"},
+		{Name: "__name__", Value: "temp"},
+	}
+	wantInput := append([]labels.Label(nil), input...)
+	wantStored := []labels.Label{
+		{Name: "__name__", Value: "temp"},
+		{Name: "room", Value: "office"},
+	}
+
+	app := h.Appender()
+	ref, err := app.Append(0, input, 1, 1)
+	if err != nil {
+		t.Fatalf("append: %v", err)
+	}
+	if !reflect.DeepEqual(input, wantInput) {
+		t.Fatalf("caller labels changed: got %v, want %v", input, wantInput)
+	}
+	input[0].Value = "kitchen"
+	input[1].Value = "humidity"
+	if err := app.Commit(); err != nil {
+		t.Fatalf("commit: %v", err)
+	}
+
+	got, ok := h.Labels(ref)
+	if !ok || !reflect.DeepEqual(got, wantStored) {
+		t.Fatalf("stored labels: got %v, ok=%v, want %v", got, ok, wantStored)
+	}
+	got[0].Value = "changed"
+	got, _ = h.Labels(ref)
+	if !reflect.DeepEqual(got, wantStored) {
+		t.Fatalf("stored labels changed through returned slice: %v", got)
+	}
+
+	if err := h.Close(); err != nil {
+		t.Fatalf("close head: %v", err)
+	}
+	h, err = Open(dir, wal.Options{SyncInterval: -1})
+	if err != nil {
+		t.Fatalf("reopen head: %v", err)
+	}
+	defer h.Close()
+	got, ok = h.Labels(ref)
+	if !ok || !reflect.DeepEqual(got, wantStored) {
+		t.Fatalf("replayed labels: got %v, ok=%v, want %v", got, ok, wantStored)
+	}
+}
+
+func TestHeadLabelLengthLimit(t *testing.T) {
+	tests := []struct {
+		name    string
+		labels  []labels.Label
+		wantErr error
+	}{
+		{name: "name_65535", labels: []labels.Label{{Name: strings.Repeat("n", 65535), Value: "v"}}},
+		{name: "name_65536", labels: []labels.Label{{Name: strings.Repeat("n", 65536), Value: "v"}}, wantErr: labels.ErrLabelTooLong},
+		{name: "value_65535", labels: []labels.Label{{Name: "name", Value: strings.Repeat("v", 65535)}}},
+		{name: "value_65536", labels: []labels.Label{{Name: "name", Value: strings.Repeat("v", 65536)}}, wantErr: labels.ErrLabelTooLong},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			dir := filepath.Join(t.TempDir(), "wal")
+			h, err := Open(dir, wal.Options{SyncInterval: -1})
+			if err != nil {
+				t.Fatalf("open head: %v", err)
+			}
+			app := h.Appender()
+			ref, err := app.Append(0, tc.labels, 1, 1)
+			if err != tc.wantErr {
+				h.Close()
+				t.Fatalf("append error: got %v, want %v", err, tc.wantErr)
+			}
+			if tc.wantErr != nil {
+				h.Close()
+				return
+			}
+			if err := app.Commit(); err != nil {
+				h.Close()
+				t.Fatalf("commit: %v", err)
+			}
+			if err := h.Close(); err != nil {
+				t.Fatalf("close head: %v", err)
+			}
+
+			h, err = Open(dir, wal.Options{SyncInterval: -1})
+			if err != nil {
+				t.Fatalf("reopen head: %v", err)
+			}
+			defer h.Close()
+			got, ok := h.Labels(ref)
+			if !ok || !reflect.DeepEqual(got, tc.labels) {
+				t.Fatalf("replayed labels: got %v, ok=%v", got, ok)
 			}
 		})
 	}

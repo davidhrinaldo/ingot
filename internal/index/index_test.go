@@ -2,7 +2,9 @@ package index
 
 import (
 	"bytes"
+	"errors"
 	"reflect"
+	"strings"
 	"testing"
 
 	"github.com/davidhrinaldo/ingot/labels"
@@ -20,6 +22,22 @@ func writeIndex(t *testing.T, entries []SeriesEntry) []byte {
 		t.Fatalf("unexpected error: %v", err)
 	}
 	return buf.Bytes()
+}
+
+func TestWriterRejectsOversizedLabelBeforeWriting(t *testing.T) {
+	var buf bytes.Buffer
+	w := NewWriter(&buf)
+	w.AddSeries(SeriesEntry{
+		Ref:    1,
+		Labels: []labels.Label{{Name: "name", Value: strings.Repeat("v", 1<<16)}},
+	})
+
+	if _, err := w.WriteTo(); !errors.Is(err, labels.ErrLabelTooLong) {
+		t.Fatalf("write error: got %v, want %v", err, labels.ErrLabelTooLong)
+	}
+	if buf.Len() != 0 {
+		t.Fatalf("wrote %d bytes before rejecting oversized label", buf.Len())
+	}
 }
 
 func TestIndexRoundTrip(t *testing.T) {

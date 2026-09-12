@@ -6,6 +6,7 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"strings"
 	"testing"
 
 	"github.com/davidhrinaldo/ingot/internal/chunkenc"
@@ -215,6 +216,51 @@ func TestBlockRoundTrip(t *testing.T) {
 				if !reflect.DeepEqual(ls, s.labels) {
 					t.Errorf("got %v, want %v", ls, s.labels)
 				}
+			}
+		})
+	}
+}
+
+func TestBlockLabelLengthLimitAndOwnership(t *testing.T) {
+	tests := []struct {
+		name    string
+		labels  []labels.Label
+		wantErr error
+	}{
+		{name: "name_65535", labels: []labels.Label{{Name: strings.Repeat("n", 65535), Value: "v"}}},
+		{name: "name_65536", labels: []labels.Label{{Name: strings.Repeat("n", 65536), Value: "v"}}, wantErr: labels.ErrLabelTooLong},
+		{name: "value_65535", labels: []labels.Label{{Name: "name", Value: strings.Repeat("v", 65535)}}},
+		{name: "value_65536", labels: []labels.Label{{Name: "name", Value: strings.Repeat("v", 65536)}}, wantErr: labels.ErrLabelTooLong},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			dataDir := t.TempDir()
+			ulid, err := Flush(dataDir, []SeriesFlush{{
+				Ref:    1,
+				Labels: tc.labels,
+				Chunks: []ChunkData{{MinT: 1, MaxT: 1, Data: makeChunk(t, []sample{s(1, 1)})}},
+			}})
+			if err != tc.wantErr {
+				t.Fatalf("flush error: got %v, want %v", err, tc.wantErr)
+			}
+			if tc.wantErr != nil {
+				return
+			}
+
+			r, err := Open(filepath.Join(dataDir, ulid))
+			if err != nil {
+				t.Fatalf("open block: %v", err)
+			}
+			defer r.Close()
+			got, ok := r.Labels(1)
+			if !ok || !reflect.DeepEqual(got, tc.labels) {
+				t.Fatalf("block labels: got %v, ok=%v", got, ok)
+			}
+			got[0] = labels.Label{Name: "changed", Value: "changed"}
+			got, _ = r.Labels(1)
+			if !reflect.DeepEqual(got, tc.labels) {
+				t.Fatalf("stored labels changed through returned slice: %v", got)
 			}
 		})
 	}
