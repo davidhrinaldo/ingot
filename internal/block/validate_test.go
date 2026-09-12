@@ -4,6 +4,7 @@ import (
 	"encoding/binary"
 	"encoding/json"
 	"hash/crc32"
+	"math"
 	"os"
 	"path/filepath"
 	"strings"
@@ -318,6 +319,13 @@ func TestValidateSemanticCorruption(t *testing.T) {
 			wantMatch: "unsupported encoding 99",
 		},
 		{
+			name: "invalid_xor_window_with_valid_crc",
+			corrupt: func(t *testing.T, blockDir string) {
+				replaceLastChunk(t, blockDir, invalidXORWindowChunk())
+			},
+			wantMatch: "invalid XOR window",
+		},
+		{
 			name: "unsupported_meta_version",
 			corrupt: func(t *testing.T, blockDir string) {
 				mutateMeta(t, blockDir, func(meta *BlockMeta) { meta.Version++ })
@@ -371,6 +379,56 @@ func TestValidateSemanticCorruption(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestLegacyNegativeTimeBounds(t *testing.T) {
+	newBlock := func(t *testing.T) string {
+		t.Helper()
+		dataDir := t.TempDir()
+		ulid, err := Flush(dataDir, []SeriesFlush{{
+			Ref:    1,
+			Labels: labels.FromStrings("__name__", "negative"),
+			Chunks: []ChunkData{{
+				MinT: -500,
+				MaxT: -100,
+				Data: makeChunk(t, []sample{s(-500, 1), s(-100, 2)}),
+			}},
+		}})
+		if err != nil {
+			t.Fatal(err)
+		}
+		return filepath.Join(dataDir, ulid)
+	}
+
+	t.Run("baseline_max_time_zero_is_normalized", func(t *testing.T) {
+		blockDir := newBlock(t)
+		mutateMeta(t, blockDir, func(meta *BlockMeta) { meta.MaxTime = 0 })
+		if errs := Validate(blockDir); len(errs) != 0 {
+			t.Fatalf("Validate rejected legacy block: %v", errs)
+		}
+		reader, err := Open(blockDir)
+		if err != nil {
+			t.Fatalf("Open rejected legacy block: %v", err)
+		}
+		defer reader.Close()
+		if got, want := reader.Meta.MaxTime, int64(-100); got != want {
+			t.Fatalf("normalized MaxTime: got %d, want %d", got, want)
+		}
+	})
+
+	t.Run("other_negative_bound_mismatch_is_rejected", func(t *testing.T) {
+		blockDir := newBlock(t)
+		mutateMeta(t, blockDir, func(meta *BlockMeta) {
+			meta.MinTime++
+			meta.MaxTime = 0
+		})
+		if errs := Validate(blockDir); len(errs) == 0 {
+			t.Fatal("Validate accepted arbitrary negative-time bounds")
+		}
+		if _, err := Open(blockDir); err == nil {
+			t.Fatal("Open accepted arbitrary negative-time bounds")
+		}
+	})
 }
 
 func TestValidateRejectsOverlappingChunks(t *testing.T) {
@@ -504,6 +562,70 @@ func mutateMeta(t *testing.T, blockDir string, mutate func(*BlockMeta)) {
 	if err := os.WriteFile(filepath.Join(blockDir, metaFilename), data, 0644); err != nil {
 		t.Fatal(err)
 	}
+}
+
+func replaceLastChunk(t *testing.T, blockDir string, chunk []byte) {
+	t.Helper()
+	path := filepath.Join(blockDir, chunksDirName, "000001")
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	off := chunkHeaderLen
+	for {
+		dataLen := int(binary.BigEndian.Uint32(data[off : off+4]))
+		next := off + chunkEntryHeaderLen + dataLen + chunkEntryCRCLen
+		if next == len(data) {
+			break
+		}
+		off = next
+	}
+
+	data = data[:off]
+	entry := make([]byte, chunkEntryHeaderLen+len(chunk)+chunkEntryCRCLen)
+	binary.BigEndian.PutUint32(entry[:4], uint32(len(chunk)))
+	entry[4] = encodingXOR
+	copy(entry[chunkEntryHeaderLen:], chunk)
+	checksum := crc32.New(castagnoliTable)
+	checksum.Write(entry[4:5])
+	checksum.Write(chunk)
+	binary.BigEndian.PutUint32(entry[chunkEntryHeaderLen+len(chunk):], checksum.Sum32())
+	data = append(data, entry...)
+	if err := os.WriteFile(path, data, 0644); err != nil {
+		t.Fatal(err)
+	}
+}
+
+type testBitWriter struct {
+	data []byte
+	bits int
+}
+
+func (w *testBitWriter) write(value uint64, count int) {
+	for bit := count - 1; bit >= 0; bit-- {
+		byteIndex := 2 + w.bits/8
+		if byteIndex == len(w.data) {
+			w.data = append(w.data, 0)
+		}
+		if value&(uint64(1)<<uint(bit)) != 0 {
+			w.data[byteIndex] |= 1 << uint(7-w.bits%8)
+		}
+		w.bits++
+	}
+}
+
+func invalidXORWindowChunk() []byte {
+	w := testBitWriter{data: make([]byte, 2)}
+	w.write(uint64(500), 64)
+	w.write(math.Float64bits(5), 64)
+	w.write(0, 1)
+	w.write(100, 14)
+	w.write(1, 1)
+	w.write(1, 1)
+	w.write(31, 5)
+	w.write(63, 6)
+	binary.BigEndian.PutUint16(w.data[:2], 2)
+	return w.data
 }
 
 func makeTestChunk(t *testing.T) []byte {

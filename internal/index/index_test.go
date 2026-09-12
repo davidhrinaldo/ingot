@@ -374,3 +374,74 @@ func firstPostingRefOffset(data []byte) int {
 	postingsOffset := int(binary.BigEndian.Uint64(toc[16:24]))
 	return postingsOffset + 4 + 12
 }
+
+func TestIndexRejectsStructurallyImpossibleCounts(t *testing.T) {
+	newData := func() []byte {
+		return writeIndex(t, []SeriesEntry{{
+			Ref:    1,
+			Labels: labels.FromStrings("__name__", "a"),
+			Chunks: []ChunkMeta{{MinT: 1, MaxT: 2, Ref: NewChunkRef(1, 5)}},
+		}})
+	}
+	tests := []struct {
+		name   string
+		mutate func([]byte)
+	}{
+		{
+			name: "symbols",
+			mutate: func(data []byte) {
+				binary.BigEndian.PutUint32(data[headerLen:], ^uint32(0))
+			},
+		},
+		{
+			name: "series",
+			mutate: func(data []byte) {
+				toc := data[len(data)-tocLen:]
+				off := int(binary.BigEndian.Uint64(toc[8:16]))
+				binary.BigEndian.PutUint32(data[off:], ^uint32(0))
+			},
+		},
+		{
+			name: "labels",
+			mutate: func(data []byte) {
+				toc := data[len(data)-tocLen:]
+				off := int(binary.BigEndian.Uint64(toc[8:16])) + 4 + 8
+				binary.BigEndian.PutUint16(data[off:], ^uint16(0))
+			},
+		},
+		{
+			name: "chunks",
+			mutate: func(data []byte) {
+				toc := data[len(data)-tocLen:]
+				off := int(binary.BigEndian.Uint64(toc[8:16])) + 4 + 8 + 2 + 8
+				binary.BigEndian.PutUint32(data[off:], ^uint32(0))
+			},
+		},
+		{
+			name: "postings",
+			mutate: func(data []byte) {
+				toc := data[len(data)-tocLen:]
+				off := int(binary.BigEndian.Uint64(toc[16:24]))
+				binary.BigEndian.PutUint32(data[off:], ^uint32(0))
+			},
+		},
+		{
+			name: "posting_refs",
+			mutate: func(data []byte) {
+				toc := data[len(data)-tocLen:]
+				off := int(binary.BigEndian.Uint64(toc[16:24])) + 4 + 8
+				binary.BigEndian.PutUint32(data[off:], ^uint32(0))
+			},
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			data := newData()
+			tc.mutate(data)
+			if _, err := NewReader(data); !errors.Is(err, ErrCorruptIndex) {
+				t.Fatalf("got %v, want ErrCorruptIndex", err)
+			}
+		})
+	}
+}

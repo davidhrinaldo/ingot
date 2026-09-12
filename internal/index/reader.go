@@ -90,7 +90,6 @@ func (r *Reader) readSymbols(off, limit int) error {
 		return ErrCorruptIndex
 	}
 
-	r.symbols = make([]string, 0, numSymbols)
 	for i := 0; i < numSymbols; i++ {
 		if off+2 > limit {
 			return ErrCorruptIndex
@@ -123,7 +122,6 @@ func (r *Reader) readSeries(off, limit int) error {
 		return ErrCorruptIndex
 	}
 
-	r.series = make([]SeriesEntry, 0, numSeries)
 	for i := 0; i < numSeries; i++ {
 		if off+8 > limit {
 			return ErrCorruptIndex
@@ -146,7 +144,7 @@ func (r *Reader) readSeries(off, limit int) error {
 			return ErrCorruptIndex
 		}
 
-		ls := make([]labels.Label, numLabels)
+		var ls []labels.Label
 		for j := 0; j < numLabels; j++ {
 			if off+8 > limit {
 				return ErrCorruptIndex
@@ -159,7 +157,7 @@ func (r *Reader) readSeries(off, limit int) error {
 			if nameIdx >= len(r.symbols) || valueIdx >= len(r.symbols) {
 				return ErrCorruptIndex
 			}
-			ls[j] = labels.Label{Name: r.symbols[nameIdx], Value: r.symbols[valueIdx]}
+			ls = append(ls, labels.Label{Name: r.symbols[nameIdx], Value: r.symbols[valueIdx]})
 		}
 		if err := labels.Validate(ls); err != nil {
 			return fmt.Errorf("%w: series ref %d labels: %v", ErrCorruptIndex, ref, err)
@@ -174,17 +172,19 @@ func (r *Reader) readSeries(off, limit int) error {
 			return ErrCorruptIndex
 		}
 
-		chunks := make([]ChunkMeta, numChunks)
+		var chunks []ChunkMeta
 		for j := 0; j < numChunks; j++ {
 			if off+24 > limit {
 				return ErrCorruptIndex
 			}
-			chunks[j].MinT = int64(binary.BigEndian.Uint64(r.data[off : off+8]))
+			chunk := ChunkMeta{}
+			chunk.MinT = int64(binary.BigEndian.Uint64(r.data[off : off+8]))
 			off += 8
-			chunks[j].MaxT = int64(binary.BigEndian.Uint64(r.data[off : off+8]))
+			chunk.MaxT = int64(binary.BigEndian.Uint64(r.data[off : off+8]))
 			off += 8
-			chunks[j].Ref = ChunkRef(binary.BigEndian.Uint64(r.data[off : off+8]))
+			chunk.Ref = ChunkRef(binary.BigEndian.Uint64(r.data[off : off+8]))
 			off += 8
+			chunks = append(chunks, chunk)
 		}
 
 		entry := SeriesEntry{Ref: ref, Labels: ls, Chunks: chunks}
@@ -226,13 +226,14 @@ func (r *Reader) readPostings(off, limit int) error {
 			return ErrCorruptIndex
 		}
 
-		refs := make([]uint64, numRefs)
+		var refs []uint64
 		for j := 0; j < numRefs; j++ {
-			refs[j] = binary.BigEndian.Uint64(r.data[off : off+8])
+			ref := binary.BigEndian.Uint64(r.data[off : off+8])
 			off += 8
-			if j > 0 && refs[j-1] >= refs[j] {
+			if j > 0 && refs[j-1] >= ref {
 				return fmt.Errorf("%w: postings refs are not unique and sorted", ErrCorruptIndex)
 			}
+			refs = append(refs, ref)
 		}
 
 		key := labelPair{r.symbols[nameIdx], r.symbols[valueIdx]}

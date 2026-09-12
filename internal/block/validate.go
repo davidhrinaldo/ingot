@@ -6,6 +6,8 @@ import (
 	"hash/crc32"
 	"os"
 	"path/filepath"
+	"sort"
+	"syscall"
 
 	"github.com/davidhrinaldo/ingot/internal/chunkenc"
 	"github.com/davidhrinaldo/ingot/internal/index"
@@ -56,7 +58,10 @@ func Validate(dir string) []ValidationError {
 		}
 	}
 
-	chunkEntries := make(map[index.ChunkRef]scannedChunk)
+	var relationships *relationshipValidator
+	if metaErr == nil && idx != nil {
+		relationships = newRelationshipValidator(blockName, &meta, idx)
+	}
 	chunksReadable := true
 	chunksDir := filepath.Join(dir, chunksDirName)
 	dirEntries, err := os.ReadDir(chunksDir)
@@ -73,30 +78,42 @@ func Validate(dir string) []ValidationError {
 				continue
 			}
 
-			data, readErr := os.ReadFile(filepath.Join(chunksDir, entry.Name()))
+			complete, segmentErrs, readErr := validateChunkFile(
+				filepath.Join(chunksDir, entry.Name()), entry.Name(), segment, relationships,
+			)
 			if readErr != nil {
 				errs = append(errs, ValidationError{blockName, "chunks",
 					fmt.Sprintf("segment %s: %s", entry.Name(), readErr)})
 				chunksReadable = false
 				continue
 			}
-			parsed, complete, segmentErrs := scanChunkSegment(data, entry.Name(), segment)
 			if !complete {
 				chunksReadable = false
 			}
 			for _, detail := range segmentErrs {
 				errs = append(errs, ValidationError{blockName, "chunks", detail})
 			}
-			for ref, chunk := range parsed {
-				chunkEntries[ref] = chunk
-			}
 		}
 	}
 
 	if metaErr == nil && idx != nil && chunksReadable {
-		errs = append(errs, validateRelationships(blockName, meta, idx, chunkEntries)...)
+		errs = append(errs, relationships.finish()...)
 	}
 	return errs
+}
+
+func validateChunkFile(path, name string, segment int, relationships *relationshipValidator) (bool, []string, error) {
+	data, err := mmapFile(path)
+	if err != nil {
+		return false, nil, err
+	}
+	defer syscall.Munmap(data)
+
+	parsed, complete, errs := scanChunkSegment(data, name, segment)
+	if relationships != nil {
+		relationships.observe(parsed)
+	}
+	return complete, errs, nil
 }
 
 func validateMeta(blockName string, meta BlockMeta) []ValidationError {
@@ -134,128 +151,184 @@ func canonicalULID(value string) bool {
 	return err == nil && encodeULID(parsed) == value
 }
 
-func validateRelationships(blockName string, meta BlockMeta, idx *index.Reader, chunks map[index.ChunkRef]scannedChunk) []ValidationError {
-	var errs []ValidationError
-	addIndex := func(format string, args ...any) {
-		errs = append(errs, ValidationError{blockName, "index", fmt.Sprintf(format, args...)})
-	}
-	addChunk := func(format string, args ...any) {
-		errs = append(errs, ValidationError{blockName, "chunks", fmt.Sprintf(format, args...)})
-	}
-	addMeta := func(format string, args ...any) {
-		errs = append(errs, ValidationError{blockName, "meta", fmt.Sprintf(format, args...)})
-	}
+type chunkExpectation struct {
+	seriesRef  uint64
+	chunkIndex int
+	meta       index.ChunkMeta
+}
 
-	series := idx.Series()
-	referenced := make(map[index.ChunkRef]struct{})
-	numChunks := 0
-	numSamples := 0
-	statsComplete := true
-	haveSamples := false
-	var blockMinT, blockMaxT int64
+type relationshipValidator struct {
+	blockName string
+	meta      *BlockMeta
+	errs      []ValidationError
 
-	for _, entry := range series {
+	expected      map[index.ChunkRef]chunkExpectation
+	expectedOrder []index.ChunkRef
+	observed      map[index.ChunkRef]struct{}
+	unexpected    []index.ChunkRef
+
+	numSeries     int
+	numChunks     int
+	numEntries    int
+	numSamples    int
+	statsComplete bool
+	haveSamples   bool
+	blockMinT     int64
+	blockMaxT     int64
+}
+
+func newRelationshipValidator(blockName string, meta *BlockMeta, idx *index.Reader) *relationshipValidator {
+	v := &relationshipValidator{
+		blockName:     blockName,
+		meta:          meta,
+		expected:      make(map[index.ChunkRef]chunkExpectation),
+		observed:      make(map[index.ChunkRef]struct{}),
+		numSeries:     len(idx.Series()),
+		statsComplete: true,
+	}
+	for _, entry := range idx.Series() {
 		var previousMaxT int64
 		for chunkIndex, chunkMeta := range entry.Chunks {
-			numChunks++
+			v.numChunks++
 			if chunkMeta.MinT > chunkMeta.MaxT {
-				addIndex("series %d chunk %d has minT %d > maxT %d", entry.Ref, chunkIndex, chunkMeta.MinT, chunkMeta.MaxT)
+				v.addIndex("series %d chunk %d has minT %d > maxT %d", entry.Ref, chunkIndex, chunkMeta.MinT, chunkMeta.MaxT)
 			}
 			if chunkIndex > 0 && chunkMeta.MinT <= previousMaxT {
-				addIndex("series %d chunks are unsorted or overlap at chunk %d", entry.Ref, chunkIndex)
+				v.addIndex("series %d chunks are unsorted or overlap at chunk %d", entry.Ref, chunkIndex)
 			}
 			previousMaxT = chunkMeta.MaxT
 
-			if _, duplicate := referenced[chunkMeta.Ref]; duplicate {
-				addIndex("duplicate chunk ref %d", chunkMeta.Ref)
-				statsComplete = false
+			if _, duplicate := v.expected[chunkMeta.Ref]; duplicate {
+				v.addIndex("duplicate chunk ref %d", chunkMeta.Ref)
+				v.statsComplete = false
 				continue
 			}
-			referenced[chunkMeta.Ref] = struct{}{}
-
-			chunk, ok := chunks[chunkMeta.Ref]
-			if !ok {
-				addIndex("series %d chunk %d ref %d is not a chunk entry boundary", entry.Ref, chunkIndex, chunkMeta.Ref)
-				statsComplete = false
-				continue
-			}
-			if !chunk.valid {
-				statsComplete = false
-				continue
-			}
-			if len(chunk.data) < 2 {
-				addChunk("chunk ref %d is too short for an XOR sample count", chunkMeta.Ref)
-				statsComplete = false
-				continue
-			}
-
-			iterator := chunkenc.XORChunkFromBytes(chunk.data).Iterator()
-			count := 0
-			var firstT, lastT int64
-			sorted := true
-			for iterator.Next() {
-				timestamp, _ := iterator.At()
-				if count == 0 {
-					firstT = timestamp
-				} else if timestamp <= lastT {
-					sorted = false
-				}
-				lastT = timestamp
-				count++
-			}
-			if err := iterator.Err(); err != nil {
-				addChunk("chunk ref %d cannot be decoded: %s", chunkMeta.Ref, err)
-				statsComplete = false
-				continue
-			}
-			if count == 0 {
-				addChunk("chunk ref %d contains no samples", chunkMeta.Ref)
-				statsComplete = false
-				continue
-			}
-			if !sorted {
-				addChunk("chunk ref %d samples are not strictly increasing", chunkMeta.Ref)
-			}
-			if chunkMeta.MinT != firstT || chunkMeta.MaxT != lastT {
-				addIndex("series %d chunk %d bounds [%d,%d] do not match decoded samples [%d,%d]",
-					entry.Ref, chunkIndex, chunkMeta.MinT, chunkMeta.MaxT, firstT, lastT)
-			}
-
-			numSamples += count
-			if !haveSamples || firstT < blockMinT {
-				blockMinT = firstT
-			}
-			if !haveSamples || lastT > blockMaxT {
-				blockMaxT = lastT
-			}
-			haveSamples = true
+			v.expected[chunkMeta.Ref] = chunkExpectation{entry.Ref, chunkIndex, chunkMeta}
+			v.expectedOrder = append(v.expectedOrder, chunkMeta.Ref)
 		}
 	}
+	return v
+}
 
-	for ref := range chunks {
-		if _, ok := referenced[ref]; !ok {
-			addChunk("chunk entry ref %d is not referenced by the index", ref)
+func (v *relationshipValidator) addIndex(format string, args ...any) {
+	v.errs = append(v.errs, ValidationError{v.blockName, "index", fmt.Sprintf(format, args...)})
+}
+
+func (v *relationshipValidator) addChunk(format string, args ...any) {
+	v.errs = append(v.errs, ValidationError{v.blockName, "chunks", fmt.Sprintf(format, args...)})
+}
+
+func (v *relationshipValidator) addMeta(format string, args ...any) {
+	v.errs = append(v.errs, ValidationError{v.blockName, "meta", fmt.Sprintf(format, args...)})
+}
+
+func (v *relationshipValidator) observe(chunks map[index.ChunkRef]scannedChunk) {
+	for ref, chunk := range chunks {
+		v.numEntries++
+		v.observed[ref] = struct{}{}
+		expected, ok := v.expected[ref]
+		if !ok {
+			v.unexpected = append(v.unexpected, ref)
+			continue
+		}
+		if !chunk.valid {
+			v.statsComplete = false
+			continue
+		}
+		v.decode(expected, chunk.data)
+	}
+}
+
+func (v *relationshipValidator) decode(expected chunkExpectation, data []byte) {
+	if len(data) < 2 {
+		v.addChunk("chunk ref %d is too short for an XOR sample count", expected.meta.Ref)
+		v.statsComplete = false
+		return
+	}
+
+	iterator := chunkenc.XORIteratorFromBytes(data)
+	count := 0
+	var firstT, lastT int64
+	sorted := true
+	for iterator.Next() {
+		timestamp, _ := iterator.At()
+		if count == 0 {
+			firstT = timestamp
+		} else if timestamp <= lastT {
+			sorted = false
+		}
+		lastT = timestamp
+		count++
+	}
+	if err := iterator.Err(); err != nil {
+		v.addChunk("chunk ref %d cannot be decoded: %s", expected.meta.Ref, err)
+		v.statsComplete = false
+		return
+	}
+	if count == 0 {
+		v.addChunk("chunk ref %d contains no samples", expected.meta.Ref)
+		v.statsComplete = false
+		return
+	}
+	if !sorted {
+		v.addChunk("chunk ref %d samples are not strictly increasing", expected.meta.Ref)
+	}
+	if expected.meta.MinT != firstT || expected.meta.MaxT != lastT {
+		v.addIndex("series %d chunk %d bounds [%d,%d] do not match decoded samples [%d,%d]",
+			expected.seriesRef, expected.chunkIndex, expected.meta.MinT, expected.meta.MaxT, firstT, lastT)
+	}
+
+	v.numSamples += count
+	if !v.haveSamples || firstT < v.blockMinT {
+		v.blockMinT = firstT
+	}
+	if !v.haveSamples || lastT > v.blockMaxT {
+		v.blockMaxT = lastT
+	}
+	v.haveSamples = true
+}
+
+func (v *relationshipValidator) finish() []ValidationError {
+	for _, ref := range v.expectedOrder {
+		if _, ok := v.observed[ref]; !ok {
+			expected := v.expected[ref]
+			v.addIndex("series %d chunk %d ref %d is not a chunk entry boundary", expected.seriesRef, expected.chunkIndex, ref)
+			v.statsComplete = false
 		}
 	}
-	if len(series) != meta.Stats.NumSeries {
-		addMeta("numSeries %d does not match index count %d", meta.Stats.NumSeries, len(series))
+	sort.Slice(v.unexpected, func(i, j int) bool { return v.unexpected[i] < v.unexpected[j] })
+	for _, ref := range v.unexpected {
+		v.addChunk("chunk entry ref %d is not referenced by the index", ref)
 	}
-	if numChunks != meta.Stats.NumChunks {
-		addMeta("numChunks %d does not match index count %d", meta.Stats.NumChunks, numChunks)
+	if v.numSeries != v.meta.Stats.NumSeries {
+		v.addMeta("numSeries %d does not match index count %d", v.meta.Stats.NumSeries, v.numSeries)
 	}
-	if numChunks != len(chunks) {
-		addIndex("indexed chunk count %d does not match chunk entry count %d", numChunks, len(chunks))
+	if v.numChunks != v.meta.Stats.NumChunks {
+		v.addMeta("numChunks %d does not match index count %d", v.meta.Stats.NumChunks, v.numChunks)
 	}
-	if statsComplete && numSamples != meta.Stats.NumSamples {
-		addMeta("numSamples %d does not match decoded count %d", meta.Stats.NumSamples, numSamples)
+	if v.numChunks != v.numEntries {
+		v.addIndex("indexed chunk count %d does not match chunk entry count %d", v.numChunks, v.numEntries)
 	}
-	if statsComplete && haveSamples && (meta.MinTime != blockMinT || meta.MaxTime != blockMaxT) {
-		addMeta("bounds [%d,%d] do not match decoded samples [%d,%d]", meta.MinTime, meta.MaxTime, blockMinT, blockMaxT)
+	if v.statsComplete && v.numSamples != v.meta.Stats.NumSamples {
+		v.addMeta("numSamples %d does not match decoded count %d", v.meta.Stats.NumSamples, v.numSamples)
 	}
-	if statsComplete && !haveSamples && (meta.MinTime != 0 || meta.MaxTime != 0) {
-		addMeta("empty block bounds [%d,%d] must be [0,0]", meta.MinTime, meta.MaxTime)
+	if v.statsComplete && v.haveSamples && (v.meta.MinTime != v.blockMinT || v.meta.MaxTime != v.blockMaxT) {
+		if v.meta.Version == 1 && v.meta.MinTime == v.blockMinT && v.meta.MaxTime == 0 && v.blockMaxT < 0 {
+			v.meta.MaxTime = v.blockMaxT
+		} else {
+			v.addMeta("bounds [%d,%d] do not match decoded samples [%d,%d]", v.meta.MinTime, v.meta.MaxTime, v.blockMinT, v.blockMaxT)
+		}
 	}
-	return errs
+	if v.statsComplete && !v.haveSamples && (v.meta.MinTime != 0 || v.meta.MaxTime != 0) {
+		v.addMeta("empty block bounds [%d,%d] must be [0,0]", v.meta.MinTime, v.meta.MaxTime)
+	}
+	return v.errs
+}
+
+func validateRelationships(blockName string, meta *BlockMeta, idx *index.Reader, chunks map[index.ChunkRef]scannedChunk) []ValidationError {
+	v := newRelationshipValidator(blockName, meta, idx)
+	v.observe(chunks)
+	return v.finish()
 }
 
 // scanChunkSegment checks every entry and returns its exact on-disk boundary.

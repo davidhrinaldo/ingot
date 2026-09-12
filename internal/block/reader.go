@@ -46,7 +46,7 @@ func Open(dir string) (*Reader, error) {
 	if err != nil {
 		return nil, err
 	}
-	if errs := validateRelationships(blockName, meta, idx, cr.entries); len(errs) > 0 {
+	if errs := validateRelationships(blockName, &meta, idx, cr.entries); len(errs) > 0 {
 		cr.close()
 		return nil, fmt.Errorf("block: validation failed: %s", errs[0])
 	}
