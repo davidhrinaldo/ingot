@@ -3,7 +3,9 @@ package ingot
 import (
 	"math"
 	"os"
+	"path/filepath"
 	"reflect"
+	"strconv"
 	"testing"
 	"time"
 
@@ -703,7 +705,9 @@ func TestDBLifecycle(t *testing.T) {
 				if err != nil {
 					t.Fatalf("unexpected error: %v", err)
 				}
-				db.ApplyRetention()
+				if err := db.ApplyRetention(); err != nil {
+					t.Fatalf("unexpected error: %v", err)
+				}
 				return db
 			},
 			wantSampleCount: 250,
@@ -884,4 +888,251 @@ func TestQueryDuringCompaction(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestRestartReconcilesCompactionLineage(t *testing.T) {
+	dir := t.TempDir()
+	db, err := Open(dir, Options{})
+	if err != nil {
+		t.Fatalf("open DB: %v", err)
+	}
+	writeTestBlocks(t, db, []int64{0, 4 * 3600 * 1000})
+
+	q, err := db.Querier(math.MinInt64, math.MaxInt64)
+	if err != nil {
+		t.Fatalf("open querier: %v", err)
+	}
+	if err := db.RunCompaction(); err != nil {
+		t.Fatalf("compact: %v", err)
+	}
+	if got := db.Stats().Blocks; got != 1 {
+		t.Fatalf("blocks after compaction: got %d, want 1", got)
+	}
+	if got := blockDirectoryCount(t, dir); got != 3 {
+		t.Fatalf("block directories while sources are pinned: got %d, want 3", got)
+	}
+
+	if err := db.Close(); err != nil {
+		t.Fatalf("close DB: %v", err)
+	}
+	db, err = Open(dir, Options{})
+	if err != nil {
+		t.Fatalf("reopen DB: %v", err)
+	}
+	defer db.Close()
+	if got := db.Stats().Blocks; got != 1 {
+		t.Fatalf("blocks after restart: got %d, want 1", got)
+	}
+	if got := blockDirectoryCount(t, dir); got != 1 {
+		t.Fatalf("block directories after restart: got %d, want 1", got)
+	}
+	if err := q.Close(); err != nil {
+		t.Fatalf("close lingering querier: %v", err)
+	}
+}
+
+func TestRestartReconcilesFlattenedCompactionLineage(t *testing.T) {
+	const hour = int64(3600 * 1000)
+	dir := t.TempDir()
+	db, err := Open(dir, Options{})
+	if err != nil {
+		t.Fatalf("open DB: %v", err)
+	}
+	writeTestBlocks(t, db, []int64{0, 4 * hour, 12 * hour, 16 * hour})
+
+	q, err := db.Querier(math.MinInt64, math.MaxInt64)
+	if err != nil {
+		t.Fatalf("open querier: %v", err)
+	}
+	for i := 0; i < 3; i++ {
+		if err := db.RunCompaction(); err != nil {
+			t.Fatalf("compaction %d: %v", i+1, err)
+		}
+	}
+	if got := db.Stats().Blocks; got != 1 {
+		t.Fatalf("blocks after cascading compaction: got %d, want 1", got)
+	}
+	db.mu.RLock()
+	sourceCount := len(db.blocks[0].Meta.Compaction.Sources)
+	db.mu.RUnlock()
+	if sourceCount != 4 {
+		t.Fatalf("persisted original sources: got %d, want 4", sourceCount)
+	}
+
+	if err := db.Close(); err != nil {
+		t.Fatalf("close DB: %v", err)
+	}
+	db, err = Open(dir, Options{})
+	if err != nil {
+		t.Fatalf("reopen DB: %v", err)
+	}
+	defer db.Close()
+	if got := db.Stats().Blocks; got != 1 {
+		t.Fatalf("blocks after restart: got %d, want 1", got)
+	}
+	if got := blockDirectoryCount(t, dir); got != 1 {
+		t.Fatalf("block directories after restart: got %d, want 1", got)
+	}
+	if err := q.Close(); err != nil {
+		t.Fatalf("close lingering querier: %v", err)
+	}
+}
+
+func TestConcurrentCompactionsAndRestart(t *testing.T) {
+	dir := t.TempDir()
+	db, err := Open(dir, Options{})
+	if err != nil {
+		t.Fatalf("open DB: %v", err)
+	}
+	writeTestBlocks(t, db, []int64{0, 4 * 3600 * 1000})
+
+	db.lifecycleMu.Lock()
+	started := make(chan struct{}, 2)
+	errs := make(chan error, 2)
+	for range 2 {
+		go func() {
+			started <- struct{}{}
+			errs <- db.RunCompaction()
+		}()
+	}
+	<-started
+	<-started
+	db.lifecycleMu.Unlock()
+
+	for range 2 {
+		if err := <-errs; err != nil {
+			t.Fatalf("concurrent compaction: %v", err)
+		}
+	}
+	if got := db.Stats(); got.Blocks != 1 || got.Compactions != 1 {
+		t.Fatalf("stats after concurrent compactions: got %+v, want 1 block and 1 compaction", got)
+	}
+	if got := blockDirectoryCount(t, dir); got != 1 {
+		t.Fatalf("block directories after concurrent compactions: got %d, want 1", got)
+	}
+
+	if err := db.Close(); err != nil {
+		t.Fatalf("close DB: %v", err)
+	}
+	db, err = Open(dir, Options{})
+	if err != nil {
+		t.Fatalf("reopen DB: %v", err)
+	}
+	defer db.Close()
+	if got := db.Stats().Blocks; got != 1 {
+		t.Fatalf("blocks after restart: got %d, want 1", got)
+	}
+	if got := blockDirectoryCount(t, dir); got != 1 {
+		t.Fatalf("block directories after restart: got %d, want 1", got)
+	}
+}
+
+func TestConcurrentCompactionAndRetention(t *testing.T) {
+	const hour = int64(3600 * 1000)
+	db, err := Open(t.TempDir(), Options{
+		Retention: time.Hour,
+		Clock:     func() int64 { return 100 * hour },
+	})
+	if err != nil {
+		t.Fatalf("open DB: %v", err)
+	}
+	defer db.Close()
+	writeTestBlocks(t, db, []int64{0, 4 * hour})
+
+	db.lifecycleMu.Lock()
+	started := make(chan struct{}, 2)
+	errs := make(chan error, 2)
+	go func() {
+		started <- struct{}{}
+		errs <- db.RunCompaction()
+	}()
+	go func() {
+		started <- struct{}{}
+		errs <- db.ApplyRetention()
+	}()
+	<-started
+	<-started
+	db.lifecycleMu.Unlock()
+
+	for range 2 {
+		if err := <-errs; err != nil {
+			t.Fatalf("maintenance operation: %v", err)
+		}
+	}
+	if got := db.Stats().Blocks; got != 0 {
+		t.Fatalf("blocks after retention: got %d, want 0", got)
+	}
+}
+
+func TestApplyRetentionReportsDeletionFailure(t *testing.T) {
+	dir := t.TempDir()
+	db, err := Open(dir, Options{
+		Retention: time.Hour,
+		Clock:     func() int64 { return 100 * 3600 * 1000 },
+	})
+	if err != nil {
+		t.Fatalf("open DB: %v", err)
+	}
+	writeTestBlocks(t, db, []int64{0})
+
+	if err := os.Chmod(dir, 0555); err != nil {
+		t.Fatalf("make data directory read-only: %v", err)
+	}
+	t.Cleanup(func() {
+		if err := os.Chmod(dir, 0755); err != nil && !os.IsNotExist(err) {
+			t.Errorf("restore data directory permissions: %v", err)
+		}
+	})
+	if err := db.ApplyRetention(); err == nil {
+		t.Fatal("retention did not report the block deletion failure")
+	}
+	if err := os.Chmod(dir, 0755); err != nil {
+		t.Fatalf("restore data directory permissions: %v", err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatalf("close DB: %v", err)
+	}
+}
+
+func writeTestBlocks(t *testing.T, db *DB, starts []int64) {
+	t.Helper()
+	for _, start := range starts {
+		var ref uint64
+		app := db.Appender()
+		for i := 0; i < 130; i++ {
+			ls := []labels.Label(nil)
+			if ref == 0 {
+				ls = labels.FromStrings("__name__", "lifecycle_test", "block", strconv.FormatInt(start, 10))
+			}
+			var err error
+			ref, err = app.Append(ref, ls, start+int64(i)*15000, float64(i))
+			if err != nil {
+				t.Fatalf("append sample: %v", err)
+			}
+		}
+		if err := app.Commit(); err != nil {
+			t.Fatalf("commit samples: %v", err)
+		}
+		if _, err := db.FlushOlderThan(math.MaxInt64); err != nil {
+			t.Fatalf("flush block: %v", err)
+		}
+	}
+}
+
+func blockDirectoryCount(t *testing.T, dir string) int {
+	t.Helper()
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		t.Fatalf("read data directory: %v", err)
+	}
+	count := 0
+	for _, entry := range entries {
+		if !entry.IsDir() || entry.Name() == "wal" {
+			continue
+		}
+		if _, err := os.Stat(filepath.Join(dir, entry.Name(), "meta.json")); err == nil {
+			count++
+		}
+	}
+	return count
 }

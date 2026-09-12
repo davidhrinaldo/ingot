@@ -3,6 +3,7 @@ package ingot
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -29,15 +30,18 @@ var defaultLevels = []int64{
 
 // DB is an embedded time-series database.
 type DB struct {
-	dataDir       string
-	opts          Options
-	head          *head.Head
-	blocks        []*block.Reader // sorted by MinTime
-	mu            sync.RWMutex    // protects blocks slice
-	compactor     *compact.Compactor
-	compactCtx    context.Context
-	compactCancel context.CancelFunc
-	compactWg     sync.WaitGroup
+	dataDir        string
+	opts           Options
+	head           *head.Head
+	blocks         []*block.Reader // sorted by MinTime
+	mu             sync.RWMutex    // protects blocks slice
+	compactor      *compact.Compactor
+	compactCtx     context.Context
+	compactCancel  context.CancelFunc
+	compactWg      sync.WaitGroup
+	lifecycleMu    sync.Mutex // serializes flush, compaction, retention, and close
+	maintenanceMu  sync.Mutex
+	maintenanceErr error
 
 	compactionCount atomic.Int64 // incremented on each successful compaction
 	metricsR        metricsRefs  // cached series refs for self-instrumentation
@@ -117,6 +121,7 @@ func (db *DB) loadBlocks() error {
 		return err
 	}
 
+	var opened []*block.Reader
 	for _, e := range entries {
 		if !e.IsDir() || e.Name() == "wal" {
 			continue
@@ -128,16 +133,109 @@ func (db *DB) loadBlocks() error {
 		}
 		br, err := block.Open(dir)
 		if err != nil {
-			return fmt.Errorf("open block %s: %w", e.Name(), err)
+			return errors.Join(fmt.Errorf("open block %s: %w", e.Name(), err), closeBlockReaders(opened))
 		}
-		db.blocks = append(db.blocks, br)
+		opened = append(opened, br)
 	}
 
-	sort.Slice(db.blocks, func(i, j int) bool {
-		return db.blocks[i].Meta.MinTime < db.blocks[j].Meta.MinTime
+	active, replaced := reconcileBlockLineage(opened)
+	var cleanupErr error
+	for _, b := range replaced {
+		dir := b.Dir()
+		b.Condemn()
+		if b.Release() {
+			cleanupErr = errors.Join(cleanupErr, removeBlockDirectory(dir))
+		}
+	}
+	if cleanupErr != nil {
+		return errors.Join(fmt.Errorf("remove replaced blocks: %w", cleanupErr), closeBlockReaders(active))
+	}
+
+	sort.Slice(active, func(i, j int) bool {
+		return active[i].Meta.MinTime < active[j].Meta.MinTime
 	})
+	db.blocks = active
 
 	return nil
+}
+
+// reconcileBlockLineage keeps one maximal block for each source lineage.
+// A compacted block replaces every block whose transitive sources are a subset
+// of its sources.
+func reconcileBlockLineage(blocks []*block.Reader) (active, replaced []*block.Reader) {
+	byULID := make(map[string]*block.Reader, len(blocks))
+	for _, b := range blocks {
+		byULID[b.Meta.ULID] = b
+	}
+
+	lineages := make(map[string]map[string]struct{}, len(blocks))
+	var lineage func(*block.Reader, map[string]bool) map[string]struct{}
+	lineage = func(b *block.Reader, visiting map[string]bool) map[string]struct{} {
+		if cached := lineages[b.Meta.ULID]; cached != nil {
+			return cached
+		}
+		if visiting[b.Meta.ULID] {
+			return map[string]struct{}{b.Meta.ULID: {}}
+		}
+		visiting[b.Meta.ULID] = true
+		sources := b.Meta.Compaction.Sources
+		if len(sources) == 0 {
+			sources = []string{b.Meta.ULID}
+		}
+		result := make(map[string]struct{})
+		for _, source := range sources {
+			if source == b.Meta.ULID {
+				result[source] = struct{}{}
+				continue
+			}
+			if parent := byULID[source]; parent != nil {
+				for original := range lineage(parent, visiting) {
+					result[original] = struct{}{}
+				}
+				continue
+			}
+			result[source] = struct{}{}
+		}
+		delete(visiting, b.Meta.ULID)
+		lineages[b.Meta.ULID] = result
+		return result
+	}
+
+	for _, candidate := range blocks {
+		candidateSources := lineage(candidate, make(map[string]bool))
+		obsolete := false
+		for _, replacement := range blocks {
+			if candidate == replacement {
+				continue
+			}
+			replacementSources := lineage(replacement, make(map[string]bool))
+			if !sourceSubset(candidateSources, replacementSources) {
+				continue
+			}
+			if len(candidateSources) < len(replacementSources) || candidate.Meta.ULID < replacement.Meta.ULID {
+				obsolete = true
+				break
+			}
+		}
+		if obsolete {
+			replaced = append(replaced, candidate)
+		} else {
+			active = append(active, candidate)
+		}
+	}
+	return active, replaced
+}
+
+func sourceSubset(a, b map[string]struct{}) bool {
+	if len(a) > len(b) {
+		return false
+	}
+	for source := range a {
+		if _, ok := b[source]; !ok {
+			return false
+		}
+	}
+	return true
 }
 
 // Appender returns a new Appender for batching writes.
@@ -167,6 +265,9 @@ func (db *DB) Querier(mint, maxt int64) (*Querier, error) {
 
 // FlushOlderThan flushes sealed head chunks to an immutable block.
 func (db *DB) FlushOlderThan(maxT int64) (string, error) {
+	db.lifecycleMu.Lock()
+	defer db.lifecycleMu.Unlock()
+
 	return db.head.FlushOlderThanAndInstall(maxT, func(ulid string) error {
 		br, err := block.Open(filepath.Join(db.dataDir, ulid))
 		if err != nil {
@@ -184,6 +285,9 @@ func (db *DB) FlushOlderThan(maxT int64) (string, error) {
 
 // RunCompaction performs a single compaction cycle. Exported for testing.
 func (db *DB) RunCompaction() error {
+	db.lifecycleMu.Lock()
+	defer db.lifecycleMu.Unlock()
+
 	db.mu.RLock()
 	snapshot := make([]*block.Reader, len(db.blocks))
 	copy(snapshot, db.blocks)
@@ -196,12 +300,17 @@ func (db *DB) RunCompaction() error {
 
 	newULID, err := db.compactor.Compact(group.Sources)
 	if err != nil {
-		return fmt.Errorf("ingot: compact: %w", err)
+		var cleanupErr error
+		if newULID != "" {
+			cleanupErr = removeBlockDirectory(filepath.Join(db.dataDir, newULID))
+		}
+		return errors.Join(fmt.Errorf("ingot: compact: %w", err), cleanupErr)
 	}
 
 	newBlock, err := block.Open(filepath.Join(db.dataDir, newULID))
 	if err != nil {
-		return fmt.Errorf("ingot: open compacted block: %w", err)
+		cleanupErr := removeBlockDirectory(filepath.Join(db.dataDir, newULID))
+		return errors.Join(fmt.Errorf("ingot: open compacted block: %w", err), cleanupErr)
 	}
 
 	// Build a set of source ULIDs for fast lookup.
@@ -226,23 +335,30 @@ func (db *DB) RunCompaction() error {
 	db.mu.Unlock()
 
 	// Condemn and release source blocks.
+	var cleanupErr error
 	for _, src := range group.Sources {
 		dir := src.Dir()
 		src.Condemn()
 		if src.Release() {
-			os.RemoveAll(dir)
+			cleanupErr = errors.Join(cleanupErr, removeBlockDirectory(dir))
 		}
 	}
 
 	db.compactionCount.Add(1)
+	if cleanupErr != nil {
+		return fmt.Errorf("ingot: remove compacted source blocks: %w", cleanupErr)
+	}
 	return nil
 }
 
 // ApplyRetention drops blocks whose data is older than the retention window.
 // Exported for testing.
-func (db *DB) ApplyRetention() {
+func (db *DB) ApplyRetention() error {
+	db.lifecycleMu.Lock()
+	defer db.lifecycleMu.Unlock()
+
 	if db.opts.Retention == 0 {
-		return
+		return nil
 	}
 
 	db.mu.RLock()
@@ -252,7 +368,7 @@ func (db *DB) ApplyRetention() {
 
 	expired := db.compactor.Expired(snapshot)
 	if len(expired) == 0 {
-		return
+		return nil
 	}
 
 	expiredSet := make(map[string]struct{}, len(expired))
@@ -270,13 +386,18 @@ func (db *DB) ApplyRetention() {
 	db.blocks = remaining
 	db.mu.Unlock()
 
+	var cleanupErr error
 	for _, b := range expired {
 		dir := b.Dir()
 		b.Condemn()
 		if b.Release() {
-			os.RemoveAll(dir)
+			cleanupErr = errors.Join(cleanupErr, removeBlockDirectory(dir))
 		}
 	}
+	if cleanupErr != nil {
+		return fmt.Errorf("ingot: remove expired blocks: %w", cleanupErr)
+	}
+	return nil
 }
 
 // compactLoop runs in a background goroutine, periodically flushing the
@@ -291,18 +412,33 @@ func (db *DB) compactLoop() {
 			return
 		case <-ticker.C:
 			db.collectMetrics()
-			db.autoFlush()
-			db.RunCompaction()
-			db.ApplyRetention()
+			if err := db.autoFlush(); err != nil {
+				db.recordMaintenanceError(err)
+			}
+			if err := db.RunCompaction(); err != nil {
+				db.recordMaintenanceError(err)
+			}
+			if err := db.ApplyRetention(); err != nil {
+				db.recordMaintenanceError(err)
+			}
 		}
 	}
 }
 
 // autoFlush flushes sealed head chunks older than BlockDuration.
-func (db *DB) autoFlush() {
+func (db *DB) autoFlush() error {
 	now := db.opts.clock()()
 	cutoff := now - db.opts.blockDurationMs()
-	db.FlushOlderThan(cutoff)
+	_, err := db.FlushOlderThan(cutoff)
+	return err
+}
+
+func (db *DB) recordMaintenanceError(err error) {
+	db.maintenanceMu.Lock()
+	if db.maintenanceErr == nil {
+		db.maintenanceErr = err
+	}
+	db.maintenanceMu.Unlock()
 }
 
 // DBStats holds summary statistics for the database.
@@ -331,6 +467,8 @@ func (db *DB) Stats() DBStats {
 func (db *DB) Close() error {
 	db.compactCancel()
 	db.compactWg.Wait()
+	db.lifecycleMu.Lock()
+	defer db.lifecycleMu.Unlock()
 
 	var firstErr error
 	if err := db.head.Close(); err != nil {
@@ -341,7 +479,10 @@ func (db *DB) Close() error {
 			firstErr = err
 		}
 	}
-	return firstErr
+	db.maintenanceMu.Lock()
+	maintenanceErr := db.maintenanceErr
+	db.maintenanceMu.Unlock()
+	return errors.Join(firstErr, maintenanceErr)
 }
 
 func syncDirectory(dir string) error {
@@ -351,6 +492,26 @@ func syncDirectory(dir string) error {
 	}
 	defer d.Close()
 	return d.Sync()
+}
+
+func removeBlockDirectory(dir string) error {
+	removeErr := os.RemoveAll(dir)
+	syncErr := syncDirectory(filepath.Dir(dir))
+	if removeErr != nil {
+		removeErr = fmt.Errorf("remove block directory %s: %w", dir, removeErr)
+	}
+	if syncErr != nil {
+		syncErr = fmt.Errorf("sync block directory parent %s: %w", filepath.Dir(dir), syncErr)
+	}
+	return errors.Join(removeErr, syncErr)
+}
+
+func closeBlockReaders(blocks []*block.Reader) error {
+	var err error
+	for _, b := range blocks {
+		err = errors.Join(err, b.Close())
+	}
+	return err
 }
 
 // Appender buffers samples and new series for atomic commit.
@@ -437,14 +598,15 @@ func (q *Querier) Select(matchers ...*labels.Matcher) SeriesSet {
 
 // Close releases block references held by this querier.
 func (q *Querier) Close() error {
+	var err error
 	for _, b := range q.blocks {
 		dir := b.Dir()
 		if b.Release() {
-			os.RemoveAll(dir)
+			err = errors.Join(err, removeBlockDirectory(dir))
 		}
 	}
 	q.blocks = nil
-	return nil
+	return err
 }
 
 func resolveBlockPostings(b *block.Reader, matchers []*labels.Matcher) []uint64 {

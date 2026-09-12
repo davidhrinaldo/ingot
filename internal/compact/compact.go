@@ -172,13 +172,24 @@ func (c *Compactor) Compact(sources []*block.Reader) (string, error) {
 
 	// Determine new compaction level and collect source ULIDs.
 	maxLevel := 0
-	sourceULIDs := make([]string, 0, len(sources))
+	sourceSet := make(map[string]struct{})
 	for _, src := range sources {
 		if src.Meta.Compaction.Level > maxLevel {
 			maxLevel = src.Meta.Compaction.Level
 		}
-		sourceULIDs = append(sourceULIDs, src.Meta.ULID)
+		lineage := src.Meta.Compaction.Sources
+		if len(lineage) == 0 {
+			lineage = []string{src.Meta.ULID}
+		}
+		for _, source := range lineage {
+			sourceSet[source] = struct{}{}
+		}
 	}
+	sourceULIDs := make([]string, 0, len(sourceSet))
+	for source := range sourceSet {
+		sourceULIDs = append(sourceULIDs, source)
+	}
+	sort.Strings(sourceULIDs)
 
 	return block.FlushCompacted(c.dataDir, flushData, maxLevel+1, sourceULIDs)
 }

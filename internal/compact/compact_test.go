@@ -1,6 +1,7 @@
 package compact
 
 import (
+	"fmt"
 	"math"
 	"path/filepath"
 	"testing"
@@ -462,5 +463,9 @@ func createSourceBlock(t *testing.T, dataDir string, sb sourceBlock) *block.Read
 	if level == 0 {
 		level = 1
 	}
-	return flushTestBlock(t, dataDir, flushData, level, []string{"src"})
+	if level == 1 {
+		return flushTestBlock(t, dataDir, flushData, level, nil)
+	}
+	source := fmt.Sprintf("source-%d", sb.series[0].samples[0].t)
+	return flushTestBlock(t, dataDir, flushData, level, []string{source})
 }
