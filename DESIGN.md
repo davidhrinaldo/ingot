@@ -105,13 +105,14 @@ ingot/              public API: Open, Options, Appender, Querier
 4. When a series' active chunk hits ~120 samples (Gorilla's sweet spot) it's sealed and a new one starts.
 
 ### Durability policy
-The zero-value `Options{}` uses `SyncOnCommit`: each successful `Appender.Commit` has fsynced its WAL records before changing the in-memory head or returning. `SyncPeriodic` is an explicit throughput-oriented alternative controlled by `Options.SyncInterval`, which defaults to one second. It can lose successful commits made after the last fsync if the process or machine crashes. Background fsync errors are sticky and the next `Commit` and `Close` return them.
+The zero-value `Options{}` uses `SyncOnCommit`: each successful `Appender.Commit` has fsynced its WAL records before changing the in-memory head or returning. `SyncPeriodic` is an explicit throughput-oriented alternative controlled by `Options.SyncInterval`, which defaults to one second. It can lose successful commits made after the last fsync if the process or machine crashes. A write, short write, rotation, fsync, or directory-sync failure poisons the WAL. No later commit can succeed, and `Close` returns the original failure. This rule also applies to background fsync errors.
 
 ### WAL format
 - Segments of fixed max size (default 128 MiB), numbered files.
 - Records: `type(1) | len(4) | payload | crc32(4)`. Types include normal `series` and `samples` records plus checkpoint begin, series, samples, commit, and activation records.
-- Replay on `Open`: scan segments in order. A corrupt or truncated final segment is treated as an interrupted active-tail write and truncated to its last valid record. Corruption in any earlier closed segment fails startup without modifying or deleting WAL files.
-- Truncation: a head cutoff prepares and fsyncs block data, writes and fsyncs a checkpoint containing the remaining live head, atomically publishes `meta.json`, records checkpoint activation, then deletes pre-checkpoint WAL segments. Recovery ignores an unactivated checkpoint whose block was not published, so a crash on either side of publication retains a complete copy. An activated checkpoint remains valid if compaction or retention removed its whole source block. If the source directory still exists, recovery validates the block before accepting the checkpoint and deleting the old WAL. Ordering is invariant: block data fsync -> checkpoint fsync -> meta.json publication -> activation fsync -> WAL truncate. Never reordered.
+- Replay on `Open`: scan segments in order. A CRC mismatch in any segment fails startup without modifying WAL files. An incomplete record in a non-final segment also fails. Only an incomplete record at the physical end of the final segment is treated as an interrupted append and truncated to its last valid boundary.
+- Final-tail limit: the WAL has no persisted durable-offset watermark. An external truncation through a previously durable final record is indistinguishable from an interrupted append and may lose that record during recovery. External WAL mutation is unsupported. CRC corruption, including corruption before later valid records, remains distinguishable and always fails without mutation.
+- Truncation: a head cutoff prepares and fsyncs block data, writes and fsyncs a checkpoint containing the remaining live head, atomically publishes `meta.json`, validates the published source block, records checkpoint activation, then deletes pre-checkpoint WAL segments. Recovery ignores an unactivated checkpoint whose block was not published, so a crash on either side of publication retains a complete copy. An activated checkpoint remains valid if compaction or retention removed its whole source block. If the source directory still exists, recovery validates the block before accepting the checkpoint and deleting the old WAL. Ordering is invariant: block data fsync -> checkpoint fsync -> meta.json publication -> source validation -> activation fsync -> WAL truncate. Never reordered.
 
 ## 7. Chunk Encoding
 Gorilla (Facebook, VLDB 2015), same scheme Prometheus uses:
@@ -169,7 +170,7 @@ Block reaping while a Querier holds references is handled by refcounting block r
 ## 12. Testing Strategy
 
 - chunkenc: Property round-trips (rapid), fuzzing the decoder, adversarial cases: NaN, +- Inf, single sample, counter resets, max deltas
-- wal: Torn-write harness for the final segment; corruption tests assert that a damaged closed segment and all later segments remain untouched
+- wal: Torn-write harness appends every incomplete prefix after acknowledged records; corruption tests assert that CRC damage never mutates the WAL and damaged closed segments retain all later segments
 - head: Race detector on concurrent append/query; checkpoint crash-boundary tests cover publication, activation, missing source blocks, and corrupt source blocks
 - query: Oracle comparison against naive reference implementation, boundary emphasis on head/block seam
 - system: Soak: 10k series @15s interval, 48h via fake clock - assert flat RSS, bounded disk, zero errors

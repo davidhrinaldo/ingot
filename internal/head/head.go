@@ -201,6 +201,19 @@ func (h *Head) activatedCheckpointValid(cp wal.Checkpoint) (bool, error) {
 	return state != checkpointBlockInvalid, nil
 }
 
+func (h *Head) activateCheckpoint(cp wal.Checkpoint) error {
+	return h.wal.ActivateCheckpoint(cp, func() error {
+		state, err := h.checkpointBlockState(cp)
+		if err != nil {
+			return err
+		}
+		if state != checkpointBlockValid {
+			return fmt.Errorf("source block %q is not valid", cp.BlockULID)
+		}
+		return nil
+	})
+}
+
 func (h *Head) checkpointBlockState(cp wal.Checkpoint) (checkpointBlockState, error) {
 	blockDir := filepath.Join(h.dataDir, cp.BlockULID)
 	if _, err := os.Stat(blockDir); err != nil {
@@ -402,7 +415,7 @@ func (h *Head) flushOlderThan(maxT int64, install func(string) error) (string, e
 	if err := prepared.Publish(); err != nil {
 		return "", fmt.Errorf("head: publish block: %w", err)
 	}
-	if err := h.wal.ActivateCheckpoint(checkpoint); err != nil {
+	if err := h.activateCheckpoint(checkpoint); err != nil {
 		return prepared.ULID, fmt.Errorf("head: activate WAL checkpoint: %w", err)
 	}
 	if install != nil {

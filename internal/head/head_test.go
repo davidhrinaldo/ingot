@@ -578,61 +578,64 @@ func TestCommitLogsSharedPendingSeries(t *testing.T) {
 }
 
 func TestActivatedCheckpointRecoveryWithoutSourceBlock(t *testing.T) {
-	dir := filepath.Join(t.TempDir(), "wal")
+	dataDir := t.TempDir()
+	walDir := filepath.Join(dataDir, "wal")
 	opts := wal.Options{SegmentMaxSize: 128}
-	h, err := Open(dir, opts)
+	h, err := Open(walDir, opts)
 	if err != nil {
 		t.Fatalf("open head: %v", err)
 	}
 	app := h.Appender()
-	ref, err := app.Append(0, []labels.Label{{Name: "__name__", Value: "temp"}}, 1, 1)
+	ref, err := app.Append(0, []labels.Label{{Name: "__name__", Value: "temp"}}, 0, 0)
 	if err != nil {
 		t.Fatalf("append first sample: %v", err)
 	}
-	if _, err := app.Append(ref, nil, 2, 2); err != nil {
-		t.Fatalf("append second sample: %v", err)
+	for i := 1; i < 250; i++ {
+		if _, err := app.Append(ref, nil, int64(i), float64(i)); err != nil {
+			t.Fatalf("append sample %d: %v", i, err)
+		}
 	}
 	if err := app.Commit(); err != nil {
 		t.Fatalf("commit: %v", err)
 	}
 
-	cp, err := h.wal.Checkpoint(
-		"removed-block",
-		[]wal.SeriesRecord{{Ref: ref, Labels: []labels.Label{{Name: "__name__", Value: "temp"}}}},
-		[][]wal.RefSample{{{Ref: ref, T: 2, V: 2}}},
-	)
+	ulid, err := h.FlushOlderThan(math.MaxInt64)
 	if err != nil {
-		t.Fatalf("checkpoint: %v", err)
+		t.Fatalf("flush: %v", err)
 	}
-	if err := h.wal.ActivateCheckpoint(cp); err != nil {
-		t.Fatalf("activate checkpoint: %v", err)
+	if ulid == "" {
+		t.Fatal("flush did not publish a source block")
 	}
 	if err := h.Close(); err != nil {
 		t.Fatalf("close head: %v", err)
 	}
 
-	h, err = Open(dir, opts)
+	// Compaction and retention may remove a source after its checkpoint has
+	// been validated and activated.
+	if err := os.RemoveAll(filepath.Join(dataDir, ulid)); err != nil {
+		t.Fatalf("remove activated checkpoint source: %v", err)
+	}
+
+	h, err = Open(walDir, opts)
 	if err != nil {
 		t.Fatalf("reopen head: %v", err)
 	}
 	got := collectSamples(t, h, ref, math.MinInt64, math.MaxInt64)
-	if len(got) != 1 || got[0] != s(2, 2) {
-		t.Fatalf("replayed samples: got %v, want %v", got, []sample{s(2, 2)})
+	if len(got) != 10 || got[0] != s(240, 240) || got[9] != s(249, 249) {
+		t.Fatalf("replayed samples: got %v, want timestamps 240..249", got)
 	}
 	if err := h.Close(); err != nil {
 		t.Fatalf("close recovered head: %v", err)
 	}
 
-	// Recovery has now deleted the old WAL. The durable activation marker must
-	// continue to authorize the checkpoint without its source block.
-	h, err = Open(dir, opts)
+	h, err = Open(walDir, opts)
 	if err != nil {
-		t.Fatalf("reopen after WAL truncation: %v", err)
+		t.Fatalf("reopen without source block again: %v", err)
 	}
 	defer h.Close()
 	got = collectSamples(t, h, ref, math.MinInt64, math.MaxInt64)
-	if len(got) != 1 || got[0] != s(2, 2) {
-		t.Fatalf("replayed samples after WAL truncation: got %v, want %v", got, []sample{s(2, 2)})
+	if len(got) != 10 || got[0] != s(240, 240) || got[9] != s(249, 249) {
+		t.Fatalf("replayed samples without source block again: got %v, want timestamps 240..249", got)
 	}
 }
 
@@ -690,7 +693,7 @@ func TestActivatedCheckpointRejectsCorruptExistingSourceBlock(t *testing.T) {
 	if err := prepared.Publish(); err != nil {
 		t.Fatalf("publish block: %v", err)
 	}
-	if err := h.wal.ActivateCheckpoint(checkpoint); err != nil {
+	if err := h.activateCheckpoint(checkpoint); err != nil {
 		t.Fatalf("activate checkpoint: %v", err)
 	}
 	if err := h.Close(); err != nil {

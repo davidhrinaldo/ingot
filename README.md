@@ -76,7 +76,9 @@ db, err := ingot.Open("./data", ingot.Options{
 })
 ```
 
-With `SyncPeriodic`, `Commit` does not wait for `fsync`; a crash can lose commits since the last successful background sync. A background sync error becomes sticky and is returned by the next `Commit` and by `Close`.
+With `SyncPeriodic`, `Commit` does not wait for `fsync`; a crash can lose commits since the last successful background sync. Any WAL write, rotation, `fsync`, or directory-sync failure poisons the open database. Later commits fail, and `Close` returns the original error. This also prevents a background sync error from being ignored.
+
+Recovery removes an incomplete record only from the physical end of the final WAL segment. A CRC mismatch in any segment fails startup without changing the WAL. Ingot does not persist a durable-offset watermark, so it cannot distinguish a crash-torn final append from external truncation in the middle of a previously durable final record. External changes to WAL files are unsupported and can cause that final record to be discarded as an incomplete tail.
 
 ## Tools
 

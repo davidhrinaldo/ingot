@@ -47,14 +47,14 @@ type DB struct {
 type Options struct {
 	Retention     time.Duration
 	BlockDuration time.Duration
+	// Clock returns the current time in milliseconds. Defaults to
+	// time.Now().UnixMilli(). Injected for testing with simulated time.
+	Clock func() int64
 	// SyncPolicy controls WAL fsync behavior. The zero value, SyncOnCommit,
 	// makes a successful Commit durable before it returns.
 	SyncPolicy SyncPolicy
 	// SyncInterval controls fsync frequency for SyncPeriodic. Zero uses 1s.
 	SyncInterval time.Duration
-	// Clock returns the current time in milliseconds. Defaults to
-	// time.Now().UnixMilli(). Injected for testing with simulated time.
-	Clock func() int64
 }
 
 // SyncPolicy controls when committed WAL records are fsynced.

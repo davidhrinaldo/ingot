@@ -1,6 +1,7 @@
 package wal
 
 import (
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -172,9 +173,9 @@ func cloneBytes(b []byte) []byte {
 	return c
 }
 
-// recover validates closed segments without modifying them. A corrupt or
-// truncated final segment is repaired because it may be an interrupted write
-// to the active tail.
+// recover validates closed segments without modifying them. It repairs only an
+// incomplete record at the end of the final segment. CRC failures are never
+// repaired.
 func recover(dir string) error {
 	segs, err := listSegments(dir)
 	if err != nil {
@@ -224,6 +225,12 @@ func recoverSegment(dir string, index int, repairTail bool) (bool, error) {
 		// Entire segment is valid.
 		return false, nil
 	}
+	if errors.Is(recordErr, ErrCorruptRecord) {
+		return false, fmt.Errorf("wal: corrupt segment %08d at offset %d: %w", index, validEnd, recordErr)
+	}
+	if hasValidRecordAfter(data, validEnd) {
+		return false, fmt.Errorf("wal: invalid segment %08d at offset %d before a later valid record: %w", index, validEnd, recordErr)
+	}
 	if !repairTail {
 		return false, fmt.Errorf("wal: corrupt closed segment %08d at offset %d: %w", index, validEnd, recordErr)
 	}
@@ -245,4 +252,17 @@ func recoverSegment(dir string, index int, repairTail bool) (bool, error) {
 		return false, err
 	}
 	return true, nil
+}
+
+func hasValidRecordAfter(data []byte, off int) bool {
+	for start := off + 1; start+recordHeaderSize+recordTrailerSize <= len(data); start++ {
+		typ := RecordType(data[start])
+		if typ < RecordSeries || typ > RecordCheckpointActivate {
+			continue
+		}
+		if _, _, _, err := DecodeRecord(data[start:]); err == nil {
+			return true
+		}
+	}
+	return false
 }
