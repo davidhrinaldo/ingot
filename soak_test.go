@@ -112,9 +112,7 @@ func TestSoak(t *testing.T) {
 			if err != nil {
 				t.Fatalf("unexpected error: %v", err)
 			}
-			if err := db.ApplyRetention(); err != nil {
-				t.Fatalf("unexpected error: %v", err)
-			}
+			db.ApplyRetention()
 		}
 
 		// Periodic query validation.

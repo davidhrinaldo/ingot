@@ -8,6 +8,7 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -28,6 +29,12 @@ var defaultLevels = []int64{
 	32 * 3600 * 1000, // 32h
 }
 
+// ErrClosed indicates that a lifecycle operation was rejected because Close
+// has started.
+var ErrClosed = errors.New("ingot: database is closing or closed")
+
+const retentionTombstoneDir = ".retention"
+
 // DB is an embedded time-series database.
 type DB struct {
 	dataDir        string
@@ -40,6 +47,12 @@ type DB struct {
 	compactCancel  context.CancelFunc
 	compactWg      sync.WaitGroup
 	lifecycleMu    sync.Mutex // serializes flush, compaction, retention, and close
+	closing        bool
+	closed         bool
+	closeDone      chan struct{}
+	closeErr       error
+	retentionRetry map[string][]string
+	removeBlockDir func(string) error
 	maintenanceMu  sync.Mutex
 	maintenanceErr error
 
@@ -92,11 +105,14 @@ func Open(dataDir string, opts Options) (*DB, error) {
 	ctx, cancel := context.WithCancel(context.Background())
 
 	db := &DB{
-		dataDir:       dataDir,
-		opts:          opts,
-		head:          h,
-		compactCtx:    ctx,
-		compactCancel: cancel,
+		dataDir:        dataDir,
+		opts:           opts,
+		head:           h,
+		compactCtx:     ctx,
+		compactCancel:  cancel,
+		closeDone:      make(chan struct{}),
+		retentionRetry: make(map[string][]string),
+		removeBlockDir: removeBlockDirectory,
 	}
 
 	db.compactor = compact.New(dataDir, defaultLevels, opts.retentionMs(), opts.clock())
@@ -116,6 +132,25 @@ func Open(dataDir string, opts Options) (*DB, error) {
 
 // loadBlocks scans dataDir for block directories and opens them.
 func (db *DB) loadBlocks() error {
+	tombstones, err := db.loadRetentionTombstones()
+	if err != nil {
+		return fmt.Errorf("load retention tombstones: %w", err)
+	}
+	var retryErr error
+	blocked := make(map[string]struct{})
+	for marker, names := range tombstones {
+		if err := db.finishRetentionDelete(marker, names); err != nil {
+			db.retentionRetry[marker] = names
+			for _, name := range names {
+				blocked[name] = struct{}{}
+			}
+			retryErr = errors.Join(retryErr, err)
+		}
+	}
+	if retryErr != nil {
+		db.recordMaintenanceError(fmt.Errorf("retry retained block deletion: %w", retryErr))
+	}
+
 	entries, err := os.ReadDir(db.dataDir)
 	if err != nil {
 		return err
@@ -124,6 +159,9 @@ func (db *DB) loadBlocks() error {
 	var opened []*block.Reader
 	for _, e := range entries {
 		if !e.IsDir() || e.Name() == "wal" {
+			continue
+		}
+		if _, tombstoned := blocked[e.Name()]; tombstoned {
 			continue
 		}
 		// Try to open as a block — skip if meta.json is missing.
@@ -139,6 +177,13 @@ func (db *DB) loadBlocks() error {
 	}
 
 	active, replaced := reconcileBlockLineage(opened)
+	if len(replaced) > 0 {
+		for _, replacement := range active {
+			if err := validateReferencedChunks(replacement); err != nil {
+				return errors.Join(fmt.Errorf("validate replacement block %s: %w", replacement.Meta.ULID, err), closeBlockReaders(opened))
+			}
+		}
+	}
 	var cleanupErr error
 	for _, b := range replaced {
 		dir := b.Dir()
@@ -161,7 +206,8 @@ func (db *DB) loadBlocks() error {
 
 // reconcileBlockLineage keeps one maximal block for each source lineage.
 // A compacted block replaces every block whose transitive sources are a subset
-// of its sources.
+// of its sources. Legacy blocks with immediate-only lineage cannot be traced
+// through an intermediate block that was already deleted.
 func reconcileBlockLineage(blocks []*block.Reader) (active, replaced []*block.Reader) {
 	byULID := make(map[string]*block.Reader, len(blocks))
 	for _, b := range blocks {
@@ -238,6 +284,17 @@ func sourceSubset(a, b map[string]struct{}) bool {
 	return true
 }
 
+func validateReferencedChunks(b *block.Reader) error {
+	for _, series := range b.Series() {
+		for _, chunk := range series.Chunks {
+			if _, err := b.RawChunkData(chunk.Ref); err != nil {
+				return fmt.Errorf("read chunk ref %v: %w", chunk.Ref, err)
+			}
+		}
+	}
+	return nil
+}
+
 // Appender returns a new Appender for batching writes.
 func (db *DB) Appender() *Appender {
 	return &Appender{inner: db.head.Appender()}
@@ -267,6 +324,9 @@ func (db *DB) Querier(mint, maxt int64) (*Querier, error) {
 func (db *DB) FlushOlderThan(maxT int64) (string, error) {
 	db.lifecycleMu.Lock()
 	defer db.lifecycleMu.Unlock()
+	if db.closing || db.closed {
+		return "", ErrClosed
+	}
 
 	return db.head.FlushOlderThanAndInstall(maxT, func(ulid string) error {
 		br, err := block.Open(filepath.Join(db.dataDir, ulid))
@@ -287,6 +347,9 @@ func (db *DB) FlushOlderThan(maxT int64) (string, error) {
 func (db *DB) RunCompaction() error {
 	db.lifecycleMu.Lock()
 	defer db.lifecycleMu.Unlock()
+	if db.closing || db.closed {
+		return ErrClosed
+	}
 
 	db.mu.RLock()
 	snapshot := make([]*block.Reader, len(db.blocks))
@@ -352,13 +415,41 @@ func (db *DB) RunCompaction() error {
 }
 
 // ApplyRetention drops blocks whose data is older than the retention window.
-// Exported for testing.
-func (db *DB) ApplyRetention() error {
+// Errors are retained and returned by Close. Use RunRetention to receive an
+// immediate error.
+func (db *DB) ApplyRetention() {
 	db.lifecycleMu.Lock()
 	defer db.lifecycleMu.Unlock()
+	if db.closing || db.closed {
+		return
+	}
+	if err := db.runRetentionLocked(); err != nil {
+		db.recordMaintenanceError(err)
+	}
+}
+
+// RunRetention applies retention and returns any persistence or deletion error.
+func (db *DB) RunRetention() error {
+	db.lifecycleMu.Lock()
+	defer db.lifecycleMu.Unlock()
+	if db.closing || db.closed {
+		return ErrClosed
+	}
+	return db.runRetentionLocked()
+}
+
+func (db *DB) runRetentionLocked() error {
+	var retryErr error
+	for marker, names := range db.retentionRetry {
+		if err := db.finishRetentionDelete(marker, names); err != nil {
+			retryErr = errors.Join(retryErr, err)
+			continue
+		}
+		delete(db.retentionRetry, marker)
+	}
 
 	if db.opts.Retention == 0 {
-		return nil
+		return retryErr
 	}
 
 	db.mu.RLock()
@@ -368,12 +459,30 @@ func (db *DB) ApplyRetention() error {
 
 	expired := db.compactor.Expired(snapshot)
 	if len(expired) == 0 {
-		return nil
+		return retryErr
 	}
 
 	expiredSet := make(map[string]struct{}, len(expired))
+	tombstones := make(map[string][]string, len(expired))
 	for _, b := range expired {
 		expiredSet[b.Meta.ULID] = struct{}{}
+		names := map[string]struct{}{filepath.Base(b.Dir()): {}}
+		for _, source := range b.Meta.Compaction.Sources {
+			if source == "" || source == "." || source == ".." || filepath.IsAbs(source) || filepath.Base(source) != source {
+				return errors.Join(retryErr, fmt.Errorf("ingot: invalid retention source %q", source))
+			}
+			names[source] = struct{}{}
+		}
+		blockNames := make([]string, 0, len(names))
+		for name := range names {
+			blockNames = append(blockNames, name)
+		}
+		sort.Strings(blockNames)
+		marker := filepath.Base(b.Dir())
+		if err := db.writeRetentionTombstone(marker, blockNames); err != nil {
+			return errors.Join(retryErr, fmt.Errorf("ingot: persist retention tombstone for %s: %w", b.Meta.ULID, err))
+		}
+		tombstones[marker] = blockNames
 	}
 
 	db.mu.Lock()
@@ -386,18 +495,23 @@ func (db *DB) ApplyRetention() error {
 	db.blocks = remaining
 	db.mu.Unlock()
 
-	var cleanupErr error
 	for _, b := range expired {
-		dir := b.Dir()
 		b.Condemn()
-		if b.Release() {
-			cleanupErr = errors.Join(cleanupErr, removeBlockDirectory(dir))
+		b.Release()
+	}
+	// Querier references keep mapped readers alive after POSIX unlink. The
+	// manifest must cover source directories even when those readers are pinned.
+	var cleanupErr error
+	for marker, names := range tombstones {
+		if err := db.finishRetentionDelete(marker, names); err != nil {
+			db.retentionRetry[marker] = names
+			cleanupErr = errors.Join(cleanupErr, err)
 		}
 	}
 	if cleanupErr != nil {
-		return fmt.Errorf("ingot: remove expired blocks: %w", cleanupErr)
+		cleanupErr = fmt.Errorf("ingot: remove expired blocks: %w", cleanupErr)
 	}
-	return nil
+	return errors.Join(retryErr, cleanupErr)
 }
 
 // compactLoop runs in a background goroutine, periodically flushing the
@@ -413,12 +527,21 @@ func (db *DB) compactLoop() {
 		case <-ticker.C:
 			db.collectMetrics()
 			if err := db.autoFlush(); err != nil {
+				if errors.Is(err, ErrClosed) {
+					return
+				}
 				db.recordMaintenanceError(err)
 			}
 			if err := db.RunCompaction(); err != nil {
+				if errors.Is(err, ErrClosed) {
+					return
+				}
 				db.recordMaintenanceError(err)
 			}
-			if err := db.ApplyRetention(); err != nil {
+			if err := db.RunRetention(); err != nil {
+				if errors.Is(err, ErrClosed) {
+					return
+				}
 				db.recordMaintenanceError(err)
 			}
 		}
@@ -465,6 +588,19 @@ func (db *DB) Stats() DBStats {
 
 // Close closes the DB, releasing all resources.
 func (db *DB) Close() error {
+	db.lifecycleMu.Lock()
+	if db.closing || db.closed {
+		done := db.closeDone
+		db.lifecycleMu.Unlock()
+		<-done
+		db.lifecycleMu.Lock()
+		err := db.closeErr
+		db.lifecycleMu.Unlock()
+		return err
+	}
+	db.closing = true
+	db.lifecycleMu.Unlock()
+
 	db.compactCancel()
 	db.compactWg.Wait()
 	db.lifecycleMu.Lock()
@@ -482,7 +618,10 @@ func (db *DB) Close() error {
 	db.maintenanceMu.Lock()
 	maintenanceErr := db.maintenanceErr
 	db.maintenanceMu.Unlock()
-	return errors.Join(firstErr, maintenanceErr)
+	db.closeErr = errors.Join(firstErr, maintenanceErr)
+	db.closed = true
+	close(db.closeDone)
+	return db.closeErr
 }
 
 func syncDirectory(dir string) error {
@@ -504,6 +643,99 @@ func removeBlockDirectory(dir string) error {
 		syncErr = fmt.Errorf("sync block directory parent %s: %w", filepath.Dir(dir), syncErr)
 	}
 	return errors.Join(removeErr, syncErr)
+}
+
+func (db *DB) loadRetentionTombstones() (map[string][]string, error) {
+	dir := filepath.Join(db.dataDir, retentionTombstoneDir)
+	entries, err := os.ReadDir(dir)
+	if os.IsNotExist(err) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	tombstones := make(map[string][]string, len(entries))
+	for _, entry := range entries {
+		if entry.IsDir() || strings.HasPrefix(entry.Name(), ".tmp-") {
+			continue
+		}
+		data, err := os.ReadFile(filepath.Join(dir, entry.Name()))
+		if err != nil {
+			return nil, err
+		}
+		names := strings.Fields(string(data))
+		if len(names) == 0 {
+			return nil, fmt.Errorf("empty retention tombstone %s", entry.Name())
+		}
+		for _, name := range names {
+			if name == "." || name == ".." || filepath.IsAbs(name) || filepath.Base(name) != name {
+				return nil, fmt.Errorf("invalid block name %q in retention tombstone %s", name, entry.Name())
+			}
+		}
+		tombstones[entry.Name()] = names
+	}
+	return tombstones, nil
+}
+
+func (db *DB) writeRetentionTombstone(marker string, names []string) error {
+	dir := filepath.Join(db.dataDir, retentionTombstoneDir)
+	if err := os.MkdirAll(dir, 0755); err != nil {
+		return err
+	}
+	if err := syncDirectory(db.dataDir); err != nil {
+		return err
+	}
+	path := filepath.Join(dir, marker)
+	if _, err := os.Stat(path); err == nil {
+		return nil
+	} else if !os.IsNotExist(err) {
+		return err
+	}
+	f, err := os.CreateTemp(dir, ".tmp-")
+	if err != nil {
+		return err
+	}
+	tmp := f.Name()
+	defer os.Remove(tmp)
+	if _, err := f.WriteString(strings.Join(names, "\n") + "\n"); err != nil {
+		f.Close()
+		return err
+	}
+	if err := f.Sync(); err != nil {
+		f.Close()
+		return err
+	}
+	if err := f.Close(); err != nil {
+		return err
+	}
+	if err := os.Rename(tmp, path); err != nil {
+		return err
+	}
+	return syncDirectory(dir)
+}
+
+func (db *DB) finishRetentionDelete(marker string, names []string) error {
+	var deleteErr error
+	for _, name := range names {
+		if err := db.removeBlockDir(filepath.Join(db.dataDir, name)); err != nil {
+			deleteErr = errors.Join(deleteErr, err)
+		}
+	}
+	if deleteErr != nil {
+		return deleteErr
+	}
+	markerPath := filepath.Join(db.dataDir, retentionTombstoneDir, marker)
+	err := os.Remove(markerPath)
+	if os.IsNotExist(err) {
+		return nil
+	}
+	if err != nil {
+		return fmt.Errorf("remove retention tombstone %s: %w", markerPath, err)
+	}
+	if err := syncDirectory(filepath.Dir(markerPath)); err != nil {
+		return fmt.Errorf("sync retention tombstone directory: %w", err)
+	}
+	return nil
 }
 
 func closeBlockReaders(blocks []*block.Reader) error {
