@@ -4,10 +4,12 @@ package ingot
 import (
 	"container/heap"
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
 	"sort"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -28,17 +30,32 @@ var defaultLevels = []int64{
 	32 * 3600 * 1000, // 32h
 }
 
+// ErrClosed indicates that a lifecycle operation was rejected because Close
+// has started.
+var ErrClosed = errors.New("ingot: database is closing or closed")
+
+const retentionTombstoneDir = ".retention"
+
 // DB is an embedded time-series database.
 type DB struct {
-	dataDir       string
-	opts          Options
-	head          *head.Head
-	blocks        []*block.Reader // sorted by MinTime, then ULID
-	mu            sync.RWMutex    // protects blocks slice
-	compactor     *compact.Compactor
-	compactCtx    context.Context
-	compactCancel context.CancelFunc
-	compactWg     sync.WaitGroup
+	dataDir        string
+	opts           Options
+	head           *head.Head
+	blocks         []*block.Reader // sorted by MinTime, then ULID
+	mu             sync.RWMutex    // protects blocks slice
+	compactor      *compact.Compactor
+	compactCtx     context.Context
+	compactCancel  context.CancelFunc
+	compactWg      sync.WaitGroup
+	lifecycleMu    sync.Mutex // serializes flush, compaction, retention, and close
+	closing        bool
+	closed         bool
+	closeDone      chan struct{}
+	closeErr       error
+	retentionRetry map[string][]string
+	removeBlockDir func(string) error
+	maintenanceMu  sync.Mutex
+	maintenanceErr error
 
 	compactionCount atomic.Int64 // incremented on each successful compaction
 	metricsR        metricsRefs  // cached series refs for self-instrumentation
@@ -131,11 +148,14 @@ func Open(dataDir string, opts Options) (*DB, error) {
 	ctx, cancel := context.WithCancel(context.Background())
 
 	db := &DB{
-		dataDir:       dataDir,
-		opts:          opts,
-		head:          h,
-		compactCtx:    ctx,
-		compactCancel: cancel,
+		dataDir:        dataDir,
+		opts:           opts,
+		head:           h,
+		compactCtx:     ctx,
+		compactCancel:  cancel,
+		closeDone:      make(chan struct{}),
+		retentionRetry: make(map[string][]string),
+		removeBlockDir: removeBlockDirectory,
 	}
 
 	db.compactor = compact.New(dataDir, defaultLevels, opts.retentionMs(), opts.clock())
@@ -155,13 +175,36 @@ func Open(dataDir string, opts Options) (*DB, error) {
 
 // loadBlocks scans dataDir for block directories and opens them.
 func (db *DB) loadBlocks() error {
+	tombstones, err := db.loadRetentionTombstones()
+	if err != nil {
+		return fmt.Errorf("load retention tombstones: %w", err)
+	}
+	var retryErr error
+	blocked := make(map[string]struct{})
+	for marker, names := range tombstones {
+		if err := db.finishRetentionDelete(marker, names); err != nil {
+			db.retentionRetry[marker] = names
+			for _, name := range names {
+				blocked[name] = struct{}{}
+			}
+			retryErr = errors.Join(retryErr, err)
+		}
+	}
+	if retryErr != nil {
+		db.recordMaintenanceError(fmt.Errorf("retry retained block deletion: %w", retryErr))
+	}
+
 	entries, err := os.ReadDir(db.dataDir)
 	if err != nil {
 		return err
 	}
 
+	var opened []*block.Reader
 	for _, e := range entries {
 		if !e.IsDir() || e.Name() == "wal" {
+			continue
+		}
+		if _, tombstoned := blocked[e.Name()]; tombstoned {
 			continue
 		}
 		// Try to open as a block — skip if meta.json is missing.
@@ -171,13 +214,125 @@ func (db *DB) loadBlocks() error {
 		}
 		br, err := block.Open(dir)
 		if err != nil {
-			return fmt.Errorf("open block %s: %w", e.Name(), err)
+			return errors.Join(fmt.Errorf("open block %s: %w", e.Name(), err), closeBlockReaders(opened))
 		}
-		db.blocks = append(db.blocks, br)
+		opened = append(opened, br)
 	}
 
-	sortBlockReaders(db.blocks)
+	active, replaced := reconcileBlockLineage(opened)
+	if len(replaced) > 0 {
+		for _, replacement := range active {
+			if err := validateReferencedChunks(replacement); err != nil {
+				return errors.Join(fmt.Errorf("validate replacement block %s: %w", replacement.Meta.ULID, err), closeBlockReaders(opened))
+			}
+		}
+	}
+	var cleanupErr error
+	for _, b := range replaced {
+		dir := b.Dir()
+		b.Condemn()
+		if b.Release() {
+			cleanupErr = errors.Join(cleanupErr, removeBlockDirectory(dir))
+		}
+	}
+	if cleanupErr != nil {
+		return errors.Join(fmt.Errorf("remove replaced blocks: %w", cleanupErr), closeBlockReaders(active))
+	}
 
+	sortBlockReaders(active)
+	db.blocks = active
+
+	return nil
+}
+
+// reconcileBlockLineage keeps one maximal block for each source lineage.
+// A compacted block replaces every block whose transitive sources are a subset
+// of its sources. Legacy blocks with immediate-only lineage cannot be traced
+// through an intermediate block that was already deleted.
+func reconcileBlockLineage(blocks []*block.Reader) (active, replaced []*block.Reader) {
+	byULID := make(map[string]*block.Reader, len(blocks))
+	for _, b := range blocks {
+		byULID[b.Meta.ULID] = b
+	}
+
+	lineages := make(map[string]map[string]struct{}, len(blocks))
+	var lineage func(*block.Reader, map[string]bool) map[string]struct{}
+	lineage = func(b *block.Reader, visiting map[string]bool) map[string]struct{} {
+		if cached := lineages[b.Meta.ULID]; cached != nil {
+			return cached
+		}
+		if visiting[b.Meta.ULID] {
+			return map[string]struct{}{b.Meta.ULID: {}}
+		}
+		visiting[b.Meta.ULID] = true
+		sources := b.Meta.Compaction.Sources
+		if len(sources) == 0 {
+			sources = []string{b.Meta.ULID}
+		}
+		result := make(map[string]struct{})
+		for _, source := range sources {
+			if source == b.Meta.ULID {
+				result[source] = struct{}{}
+				continue
+			}
+			if parent := byULID[source]; parent != nil {
+				for original := range lineage(parent, visiting) {
+					result[original] = struct{}{}
+				}
+				continue
+			}
+			result[source] = struct{}{}
+		}
+		delete(visiting, b.Meta.ULID)
+		lineages[b.Meta.ULID] = result
+		return result
+	}
+
+	for _, candidate := range blocks {
+		candidateSources := lineage(candidate, make(map[string]bool))
+		obsolete := false
+		for _, replacement := range blocks {
+			if candidate == replacement {
+				continue
+			}
+			replacementSources := lineage(replacement, make(map[string]bool))
+			if !sourceSubset(candidateSources, replacementSources) {
+				continue
+			}
+			if len(candidateSources) < len(replacementSources) || candidate.Meta.ULID < replacement.Meta.ULID {
+				obsolete = true
+				break
+			}
+		}
+		if obsolete {
+			replaced = append(replaced, candidate)
+		} else {
+			active = append(active, candidate)
+		}
+	}
+	return active, replaced
+}
+
+func sourceSubset(a, b map[string]struct{}) bool {
+	if len(a) > len(b) {
+		return false
+	}
+	for source := range a {
+		if _, ok := b[source]; !ok {
+			return false
+		}
+	}
+	return true
+}
+
+func validateReferencedChunks(b *block.Reader) error {
+	for _, series := range b.Series() {
+		for _, chunk := range series.Chunks {
+			if _, err := b.RawChunkData(chunk.Ref); err != nil {
+				return fmt.Errorf("read chunk ref %v: %w", chunk.Ref, err)
+			}
+		}
+	}
 	return nil
 }
 
@@ -210,6 +365,12 @@ func (db *DB) Querier(mint, maxt int64) (*Querier, error) {
 
 // FlushOlderThan flushes sealed head chunks to an immutable block.
 func (db *DB) FlushOlderThan(maxT int64) (string, error) {
+	db.lifecycleMu.Lock()
+	defer db.lifecycleMu.Unlock()
+	if db.closing || db.closed {
+		return "", ErrClosed
+	}
+
 	return db.head.FlushOlderThanAndInstall(maxT, func(ulid string) error {
 		br, err := block.Open(filepath.Join(db.dataDir, ulid))
 		if err != nil {
@@ -225,6 +386,12 @@ func (db *DB) FlushOlderThan(maxT int64) (string, error) {
 
 // RunCompaction performs a single compaction cycle. Exported for testing.
 func (db *DB) RunCompaction() error {
+	db.lifecycleMu.Lock()
+	defer db.lifecycleMu.Unlock()
+	if db.closing || db.closed {
+		return ErrClosed
+	}
+
 	db.mu.RLock()
 	snapshot := make([]*block.Reader, len(db.blocks))
 	copy(snapshot, db.blocks)
@@ -237,12 +404,17 @@ func (db *DB) RunCompaction() error {
 
 	newULID, err := db.compactor.Compact(group.Sources)
 	if err != nil {
-		return fmt.Errorf("ingot: compact: %w", err)
+		var cleanupErr error
+		if newULID != "" {
+			cleanupErr = removeBlockDirectory(filepath.Join(db.dataDir, newULID))
+		}
+		return errors.Join(fmt.Errorf("ingot: compact: %w", err), cleanupErr)
 	}
 
 	newBlock, err := block.Open(filepath.Join(db.dataDir, newULID))
 	if err != nil {
-		return fmt.Errorf("ingot: open compacted block: %w", err)
+		cleanupErr := removeBlockDirectory(filepath.Join(db.dataDir, newULID))
+		return errors.Join(fmt.Errorf("ingot: open compacted block: %w", err), cleanupErr)
 	}
 
 	// Build a set of source ULIDs for fast lookup.
@@ -265,23 +437,58 @@ func (db *DB) RunCompaction() error {
 	db.mu.Unlock()
 
 	// Condemn and release source blocks.
+	var cleanupErr error
 	for _, src := range group.Sources {
 		dir := src.Dir()
 		src.Condemn()
 		if src.Release() {
-			os.RemoveAll(dir)
+			cleanupErr = errors.Join(cleanupErr, removeBlockDirectory(dir))
 		}
 	}
 
 	db.compactionCount.Add(1)
+	if cleanupErr != nil {
+		return fmt.Errorf("ingot: remove compacted source blocks: %w", cleanupErr)
+	}
 	return nil
 }
 
 // ApplyRetention drops blocks whose data is older than the retention window.
-// Exported for testing.
+// Errors are retained and returned by Close. Use RunRetention to receive an
+// immediate error.
 func (db *DB) ApplyRetention() {
-	if db.opts.Retention == 0 {
+	db.lifecycleMu.Lock()
+	defer db.lifecycleMu.Unlock()
+	if db.closing || db.closed {
 		return
+	}
+	if err := db.runRetentionLocked(); err != nil {
+		db.recordMaintenanceError(err)
+	}
+}
+
+// RunRetention applies retention and returns any persistence or deletion error.
+func (db *DB) RunRetention() error {
+	db.lifecycleMu.Lock()
+	defer db.lifecycleMu.Unlock()
+	if db.closing || db.closed {
+		return ErrClosed
+	}
+	return db.runRetentionLocked()
+}
+
+func (db *DB) runRetentionLocked() error {
+	var retryErr error
+	for marker, names := range db.retentionRetry {
+		if err := db.finishRetentionDelete(marker, names); err != nil {
+			retryErr = errors.Join(retryErr, err)
+			continue
+		}
+		delete(db.retentionRetry, marker)
+	}
+
+	if db.opts.Retention == 0 {
+		return retryErr
 	}
 
 	db.mu.RLock()
@@ -291,12 +498,30 @@ func (db *DB) ApplyRetention() {
 
 	expired := db.compactor.Expired(snapshot)
 	if len(expired) == 0 {
-		return
+		return retryErr
 	}
 
 	expiredSet := make(map[string]struct{}, len(expired))
+	tombstones := make(map[string][]string, len(expired))
 	for _, b := range expired {
 		expiredSet[b.Meta.ULID] = struct{}{}
+		names := map[string]struct{}{filepath.Base(b.Dir()): {}}
+		for _, source := range b.Meta.Compaction.Sources {
+			if source == "" || source == "." || source == ".." || filepath.IsAbs(source) || filepath.Base(source) != source {
+				return errors.Join(retryErr, fmt.Errorf("ingot: invalid retention source %q", source))
+			}
+			names[source] = struct{}{}
+		}
+		blockNames := make([]string, 0, len(names))
+		for name := range names {
+			blockNames = append(blockNames, name)
+		}
+		sort.Strings(blockNames)
+		marker := filepath.Base(b.Dir())
+		if err := db.writeRetentionTombstone(marker, blockNames); err != nil {
+			return errors.Join(retryErr, fmt.Errorf("ingot: persist retention tombstone for %s: %w", b.Meta.ULID, err))
+		}
+		tombstones[marker] = blockNames
 	}
 
 	db.mu.Lock()
@@ -310,12 +535,22 @@ func (db *DB) ApplyRetention() {
 	db.mu.Unlock()
 
 	for _, b := range expired {
-		dir := b.Dir()
 		b.Condemn()
-		if b.Release() {
-			os.RemoveAll(dir)
+		b.Release()
+	}
+	// Querier references keep mapped readers alive after POSIX unlink. The
+	// manifest must cover source directories even when those readers are pinned.
+	var cleanupErr error
+	for marker, names := range tombstones {
+		if err := db.finishRetentionDelete(marker, names); err != nil {
+			db.retentionRetry[marker] = names
+			cleanupErr = errors.Join(cleanupErr, err)
 		}
 	}
+	if cleanupErr != nil {
+		cleanupErr = fmt.Errorf("ingot: remove expired blocks: %w", cleanupErr)
+	}
+	return errors.Join(retryErr, cleanupErr)
 }
 
 // compactLoop runs in a background goroutine, periodically flushing the
@@ -330,18 +565,42 @@ func (db *DB) compactLoop() {
 			return
 		case <-ticker.C:
 			db.collectMetrics()
-			db.autoFlush()
-			db.RunCompaction()
-			db.ApplyRetention()
+			if err := db.autoFlush(); err != nil {
+				if errors.Is(err, ErrClosed) {
+					return
+				}
+				db.recordMaintenanceError(err)
+			}
+			if err := db.RunCompaction(); err != nil {
+				if errors.Is(err, ErrClosed) {
+					return
+				}
+				db.recordMaintenanceError(err)
+			}
+			if err := db.RunRetention(); err != nil {
+				if errors.Is(err, ErrClosed) {
+					return
+				}
+				db.recordMaintenanceError(err)
+			}
 		}
 	}
 }
 
 // autoFlush flushes sealed head chunks older than BlockDuration.
-func (db *DB) autoFlush() {
+func (db *DB) autoFlush() error {
 	now := db.opts.clock()()
 	cutoff := now - db.opts.blockDurationMs()
-	db.FlushOlderThan(cutoff)
+	_, err := db.FlushOlderThan(cutoff)
+	return err
+}
+
+func (db *DB) recordMaintenanceError(err error) {
+	db.maintenanceMu.Lock()
+	if db.maintenanceErr == nil {
+		db.maintenanceErr = err
+	}
+	db.maintenanceMu.Unlock()
 }
 
 // DBStats holds summary statistics for the database.
@@ -368,8 +627,23 @@ func (db *DB) Stats() DBStats {
 
 // Close closes the DB, releasing all resources.
 func (db *DB) Close() error {
+	db.lifecycleMu.Lock()
+	if db.closing || db.closed {
+		done := db.closeDone
+		db.lifecycleMu.Unlock()
+		<-done
+		db.lifecycleMu.Lock()
+		err := db.closeErr
+		db.lifecycleMu.Unlock()
+		return err
+	}
+	db.closing = true
+	db.lifecycleMu.Unlock()
+
 	db.compactCancel()
 	db.compactWg.Wait()
+	db.lifecycleMu.Lock()
+	defer db.lifecycleMu.Unlock()
 
 	var firstErr error
 	if err := db.head.Close(); err != nil {
@@ -380,7 +654,13 @@ func (db *DB) Close() error {
 			firstErr = err
 		}
 	}
-	return firstErr
+	db.maintenanceMu.Lock()
+	maintenanceErr := db.maintenanceErr
+	db.maintenanceMu.Unlock()
+	db.closeErr = errors.Join(firstErr, maintenanceErr)
+	db.closed = true
+	close(db.closeDone)
+	return db.closeErr
 }
 
 func syncDirectory(dir string) error {
@@ -390,6 +670,119 @@ func syncDirectory(dir string) error {
 	}
 	defer d.Close()
 	return d.Sync()
+}
+
+func removeBlockDirectory(dir string) error {
+	removeErr := os.RemoveAll(dir)
+	syncErr := syncDirectory(filepath.Dir(dir))
+	if removeErr != nil {
+		removeErr = fmt.Errorf("remove block directory %s: %w", dir, removeErr)
+	}
+	if syncErr != nil {
+		syncErr = fmt.Errorf("sync block directory parent %s: %w", filepath.Dir(dir), syncErr)
+	}
+	return errors.Join(removeErr, syncErr)
+}
+
+func (db *DB) loadRetentionTombstones() (map[string][]string, error) {
+	dir := filepath.Join(db.dataDir, retentionTombstoneDir)
+	entries, err := os.ReadDir(dir)
+	if os.IsNotExist(err) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	tombstones := make(map[string][]string, len(entries))
+	for _, entry := range entries {
+		if entry.IsDir() || strings.HasPrefix(entry.Name(), ".tmp-") {
+			continue
+		}
+		data, err := os.ReadFile(filepath.Join(dir, entry.Name()))
+		if err != nil {
+			return nil, err
+		}
+		names := strings.Fields(string(data))
+		if len(names) == 0 {
+			return nil, fmt.Errorf("empty retention tombstone %s", entry.Name())
+		}
+		for _, name := range names {
+			if name == "." || name == ".." || filepath.IsAbs(name) || filepath.Base(name) != name {
+				return nil, fmt.Errorf("invalid block name %q in retention tombstone %s", name, entry.Name())
+			}
+		}
+		tombstones[entry.Name()] = names
+	}
+	return tombstones, nil
+}
+
+func (db *DB) writeRetentionTombstone(marker string, names []string) error {
+	dir := filepath.Join(db.dataDir, retentionTombstoneDir)
+	if err := os.MkdirAll(dir, 0755); err != nil {
+		return err
+	}
+	if err := syncDirectory(db.dataDir); err != nil {
+		return err
+	}
+	path := filepath.Join(dir, marker)
+	if _, err := os.Stat(path); err == nil {
+		return nil
+	} else if !os.IsNotExist(err) {
+		return err
+	}
+	f, err := os.CreateTemp(dir, ".tmp-")
+	if err != nil {
+		return err
+	}
+	tmp := f.Name()
+	defer os.Remove(tmp)
+	if _, err := f.WriteString(strings.Join(names, "\n") + "\n"); err != nil {
+		f.Close()
+		return err
+	}
+	if err := f.Sync(); err != nil {
+		f.Close()
+		return err
+	}
+	if err := f.Close(); err != nil {
+		return err
+	}
+	if err := os.Rename(tmp, path); err != nil {
+		return err
+	}
+	return syncDirectory(dir)
+}
+
+func (db *DB) finishRetentionDelete(marker string, names []string) error {
+	var deleteErr error
+	for _, name := range names {
+		if err := db.removeBlockDir(filepath.Join(db.dataDir, name)); err != nil {
+			deleteErr = errors.Join(deleteErr, err)
+		}
+	}
+	if deleteErr != nil {
+		return deleteErr
+	}
+	markerPath := filepath.Join(db.dataDir, retentionTombstoneDir, marker)
+	err := os.Remove(markerPath)
+	if os.IsNotExist(err) {
+		return nil
+	}
+	if err != nil {
+		return fmt.Errorf("remove retention tombstone %s: %w", markerPath, err)
+	}
+	if err := syncDirectory(filepath.Dir(markerPath)); err != nil {
+		return fmt.Errorf("sync retention tombstone directory: %w", err)
+	}
+	return nil
+}
+
+func closeBlockReaders(blocks []*block.Reader) error {
+	var err error
+	for _, b := range blocks {
+		err = errors.Join(err, b.Close())
+	}
+	return err
 }
 
 func sortBlockReaders(readers []*block.Reader) {
@@ -488,15 +881,16 @@ func (q *Querier) Select(matchers ...*labels.Matcher) SeriesSet {
 
 // Close releases snapshot references held by this querier.
 func (q *Querier) Close() error {
+	var err error
 	for _, b := range q.blocks {
 		dir := b.Dir()
 		if b.Release() {
-			os.RemoveAll(dir)
+			err = errors.Join(err, removeBlockDirectory(dir))
 		}
 	}
 	q.blocks = nil
 	q.head = nil
-	return nil
+	return err
 }
 
 func resolveBlockPostings(b *block.Reader, matchers []*labels.Matcher) []uint64 {

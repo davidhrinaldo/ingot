@@ -1,14 +1,17 @@
 package ingot
 
 import (
+	"errors"
 	"math"
 	"os"
 	"path/filepath"
 	"reflect"
 	"sort"
+	"strconv"
 	"testing"
 	"time"
 
+	"github.com/davidhrinaldo/ingot/internal/block"
 	"github.com/davidhrinaldo/ingot/internal/wal"
 	"github.com/davidhrinaldo/ingot/labels"
 )
@@ -1287,4 +1290,522 @@ func TestQueryDuringCompaction(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestRestartReconcilesCompactionLineage(t *testing.T) {
+	dir := t.TempDir()
+	db, err := Open(dir, Options{})
+	if err != nil {
+		t.Fatalf("open DB: %v", err)
+	}
+	writeTestBlocks(t, db, []int64{0, 4 * 3600 * 1000})
+
+	q, err := db.Querier(math.MinInt64, math.MaxInt64)
+	if err != nil {
+		t.Fatalf("open querier: %v", err)
+	}
+	if err := db.RunCompaction(); err != nil {
+		t.Fatalf("compact: %v", err)
+	}
+	if got := db.Stats().Blocks; got != 1 {
+		t.Fatalf("blocks after compaction: got %d, want 1", got)
+	}
+	if got := blockDirectoryCount(t, dir); got != 3 {
+		t.Fatalf("block directories while sources are pinned: got %d, want 3", got)
+	}
+
+	if err := db.Close(); err != nil {
+		t.Fatalf("close DB: %v", err)
+	}
+	db, err = Open(dir, Options{})
+	if err != nil {
+		t.Fatalf("reopen DB: %v", err)
+	}
+	defer db.Close()
+	if got := db.Stats().Blocks; got != 1 {
+		t.Fatalf("blocks after restart: got %d, want 1", got)
+	}
+	if got := blockDirectoryCount(t, dir); got != 1 {
+		t.Fatalf("block directories after restart: got %d, want 1", got)
+	}
+	if err := q.Close(); err != nil {
+		t.Fatalf("close lingering querier: %v", err)
+	}
+}
+
+func TestRestartReconcilesFlattenedCompactionLineage(t *testing.T) {
+	const hour = int64(3600 * 1000)
+	dir := t.TempDir()
+	db, err := Open(dir, Options{})
+	if err != nil {
+		t.Fatalf("open DB: %v", err)
+	}
+	writeTestBlocks(t, db, []int64{0, 4 * hour, 12 * hour, 16 * hour})
+
+	q, err := db.Querier(math.MinInt64, math.MaxInt64)
+	if err != nil {
+		t.Fatalf("open querier: %v", err)
+	}
+	for i := 0; i < 3; i++ {
+		if err := db.RunCompaction(); err != nil {
+			t.Fatalf("compaction %d: %v", i+1, err)
+		}
+	}
+	if got := db.Stats().Blocks; got != 1 {
+		t.Fatalf("blocks after cascading compaction: got %d, want 1", got)
+	}
+	db.mu.RLock()
+	sourceCount := len(db.blocks[0].Meta.Compaction.Sources)
+	db.mu.RUnlock()
+	if sourceCount != 4 {
+		t.Fatalf("persisted original sources: got %d, want 4", sourceCount)
+	}
+
+	if err := db.Close(); err != nil {
+		t.Fatalf("close DB: %v", err)
+	}
+	db, err = Open(dir, Options{})
+	if err != nil {
+		t.Fatalf("reopen DB: %v", err)
+	}
+	defer db.Close()
+	if got := db.Stats().Blocks; got != 1 {
+		t.Fatalf("blocks after restart: got %d, want 1", got)
+	}
+	if got := blockDirectoryCount(t, dir); got != 1 {
+		t.Fatalf("block directories after restart: got %d, want 1", got)
+	}
+	if err := q.Close(); err != nil {
+		t.Fatalf("close lingering querier: %v", err)
+	}
+}
+
+func TestRestartPreservesSourcesWhenCompactionReplacementIsCorrupt(t *testing.T) {
+	dir := t.TempDir()
+	db, err := Open(dir, Options{})
+	if err != nil {
+		t.Fatalf("open DB: %v", err)
+	}
+	writeTestBlocks(t, db, []int64{0, 4 * 3600 * 1000})
+
+	q, err := db.Querier(math.MinInt64, math.MaxInt64)
+	if err != nil {
+		t.Fatalf("open querier: %v", err)
+	}
+	if err := db.RunCompaction(); err != nil {
+		t.Fatalf("compact: %v", err)
+	}
+	db.mu.RLock()
+	replacementDir := db.blocks[0].Dir()
+	db.mu.RUnlock()
+	if err := db.Close(); err != nil {
+		t.Fatalf("close DB: %v", err)
+	}
+	corruptLastChunkCRC(t, replacementDir)
+
+	if _, err := Open(dir, Options{}); !errors.Is(err, block.ErrCorruptChunk) {
+		t.Fatalf("open with corrupt replacement: got %v, want %v", err, block.ErrCorruptChunk)
+	}
+	if got := blockDirectoryCount(t, dir); got != 3 {
+		t.Fatalf("block directories after rejected replacement: got %d, want 3", got)
+	}
+
+	if err := os.RemoveAll(replacementDir); err != nil {
+		t.Fatalf("remove corrupt replacement: %v", err)
+	}
+	recovered, err := Open(dir, Options{})
+	if err != nil {
+		t.Fatalf("open healthy sources: %v", err)
+	}
+	if got := recovered.Stats().Blocks; got != 2 {
+		t.Fatalf("healthy source blocks after recovery: got %d, want 2", got)
+	}
+	if err := recovered.Close(); err != nil {
+		t.Fatalf("close recovered DB: %v", err)
+	}
+	if err := q.Close(); err != nil {
+		t.Fatalf("close lingering querier: %v", err)
+	}
+}
+
+func TestConcurrentCompactionsAndRestart(t *testing.T) {
+	dir := t.TempDir()
+	db, err := Open(dir, Options{})
+	if err != nil {
+		t.Fatalf("open DB: %v", err)
+	}
+	writeTestBlocks(t, db, []int64{0, 4 * 3600 * 1000})
+
+	db.lifecycleMu.Lock()
+	started := make(chan struct{}, 2)
+	errs := make(chan error, 2)
+	for range 2 {
+		go func() {
+			started <- struct{}{}
+			errs <- db.RunCompaction()
+		}()
+	}
+	<-started
+	<-started
+	db.lifecycleMu.Unlock()
+
+	for range 2 {
+		if err := <-errs; err != nil {
+			t.Fatalf("concurrent compaction: %v", err)
+		}
+	}
+	if got := db.Stats(); got.Blocks != 1 || got.Compactions != 1 {
+		t.Fatalf("stats after concurrent compactions: got %+v, want 1 block and 1 compaction", got)
+	}
+	if got := blockDirectoryCount(t, dir); got != 1 {
+		t.Fatalf("block directories after concurrent compactions: got %d, want 1", got)
+	}
+
+	if err := db.Close(); err != nil {
+		t.Fatalf("close DB: %v", err)
+	}
+	db, err = Open(dir, Options{})
+	if err != nil {
+		t.Fatalf("reopen DB: %v", err)
+	}
+	defer db.Close()
+	if got := db.Stats().Blocks; got != 1 {
+		t.Fatalf("blocks after restart: got %d, want 1", got)
+	}
+	if got := blockDirectoryCount(t, dir); got != 1 {
+		t.Fatalf("block directories after restart: got %d, want 1", got)
+	}
+}
+
+func TestConcurrentCompactionAndRetention(t *testing.T) {
+	const hour = int64(3600 * 1000)
+	db, err := Open(t.TempDir(), Options{
+		Retention: time.Hour,
+		Clock:     func() int64 { return 100 * hour },
+	})
+	if err != nil {
+		t.Fatalf("open DB: %v", err)
+	}
+	defer db.Close()
+	writeTestBlocks(t, db, []int64{0, 4 * hour})
+
+	db.lifecycleMu.Lock()
+	started := make(chan struct{}, 2)
+	errs := make(chan error, 2)
+	go func() {
+		started <- struct{}{}
+		errs <- db.RunCompaction()
+	}()
+	go func() {
+		started <- struct{}{}
+		errs <- db.RunRetention()
+	}()
+	<-started
+	<-started
+	db.lifecycleMu.Unlock()
+
+	for range 2 {
+		if err := <-errs; err != nil {
+			t.Fatalf("maintenance operation: %v", err)
+		}
+	}
+	if got := db.Stats().Blocks; got != 0 {
+		t.Fatalf("blocks after retention: got %d, want 0", got)
+	}
+}
+
+func TestLifecycleCallsRejectedWhileClosingAndAfterClose(t *testing.T) {
+	db, err := Open(t.TempDir(), Options{Retention: time.Hour})
+	if err != nil {
+		t.Fatalf("open DB: %v", err)
+	}
+	writeTestBlocks(t, db, []int64{0, 4 * 3600 * 1000})
+	wantBlocks := db.Stats().Blocks
+
+	db.compactWg.Add(1)
+	closeErr := make(chan error, 1)
+	go func() {
+		closeErr <- db.Close()
+	}()
+	waitForClosing(t, db)
+	secondCloseErr := make(chan error, 1)
+	go func() {
+		secondCloseErr <- db.Close()
+	}()
+
+	assertLifecycleClosed(t, db)
+	db.ApplyRetention()
+	if got := db.Stats().Blocks; got != wantBlocks {
+		t.Fatalf("ApplyRetention changed blocks while closing: got %d, want %d", got, wantBlocks)
+	}
+
+	db.compactWg.Done()
+	if err := <-closeErr; err != nil {
+		t.Fatalf("close DB: %v", err)
+	}
+	if err := <-secondCloseErr; err != nil {
+		t.Fatalf("concurrent close DB: %v", err)
+	}
+	assertLifecycleClosed(t, db)
+	db.ApplyRetention()
+	if got := db.Stats().Blocks; got != wantBlocks {
+		t.Fatalf("ApplyRetention changed blocks after close: got %d, want %d", got, wantBlocks)
+	}
+}
+
+func TestApplyRetentionReportsDeletionFailureOnClose(t *testing.T) {
+	dir := t.TempDir()
+	db, err := Open(dir, Options{
+		Retention: time.Hour,
+		Clock:     func() int64 { return 100 * 3600 * 1000 },
+	})
+	if err != nil {
+		t.Fatalf("open DB: %v", err)
+	}
+	writeTestBlocks(t, db, []int64{0})
+	db.removeBlockDir = func(string) error { return errors.New("injected deletion failure") }
+	db.ApplyRetention()
+	if err := db.Close(); err == nil {
+		t.Fatal("Close did not report the retention deletion failure")
+	}
+}
+
+func TestRetentionDeletionFailureRetries(t *testing.T) {
+	dir := t.TempDir()
+	db, blockName := openExpiredTestBlock(t, dir)
+	removeErr := errors.New("injected deletion failure")
+	db.removeBlockDir = func(string) error { return removeErr }
+	if err := db.RunRetention(); !errors.Is(err, removeErr) {
+		t.Fatalf("retention deletion: got %v, want %v", err, removeErr)
+	}
+	if got := db.Stats().Blocks; got != 0 {
+		t.Fatalf("active blocks after retention: got %d, want 0", got)
+	}
+	assertRetentionFiles(t, dir, blockName, true)
+
+	db.removeBlockDir = removeBlockDirectory
+	if err := db.RunRetention(); err != nil {
+		t.Fatalf("retry retention deletion: %v", err)
+	}
+	assertRetentionFiles(t, dir, blockName, false)
+	if err := db.Close(); err != nil {
+		t.Fatalf("close DB: %v", err)
+	}
+}
+
+func TestRetentionTombstonePreventsRestartResurrection(t *testing.T) {
+	dir := t.TempDir()
+	db, blockName := openExpiredTestBlock(t, dir)
+	removeErr := errors.New("injected deletion failure")
+	db.removeBlockDir = func(string) error { return removeErr }
+	if err := db.RunRetention(); !errors.Is(err, removeErr) {
+		t.Fatalf("retention deletion: got %v, want %v", err, removeErr)
+	}
+	assertRetentionFiles(t, dir, blockName, true)
+	if err := db.Close(); err != nil {
+		t.Fatalf("close DB: %v", err)
+	}
+
+	db, err := Open(dir, Options{})
+	if err != nil {
+		t.Fatalf("reopen DB: %v", err)
+	}
+	if got := db.Stats().Blocks; got != 0 {
+		t.Fatalf("blocks after tombstone recovery: got %d, want 0", got)
+	}
+	assertRetentionFiles(t, dir, blockName, false)
+	if err := db.Close(); err != nil {
+		t.Fatalf("close reopened DB: %v", err)
+	}
+}
+
+func TestRetentionTombstonesCompactionSources(t *testing.T) {
+	const hour = int64(3600 * 1000)
+	dir := t.TempDir()
+	db, err := Open(dir, Options{
+		Retention: time.Hour,
+		Clock:     func() int64 { return 100 * hour },
+	})
+	if err != nil {
+		t.Fatalf("open DB: %v", err)
+	}
+	writeTestBlocks(t, db, []int64{0, 4 * hour})
+	q, err := db.Querier(math.MinInt64, math.MaxInt64)
+	if err != nil {
+		t.Fatalf("open querier: %v", err)
+	}
+	db.mu.RLock()
+	var sourceDirs []string
+	for _, b := range db.blocks {
+		sourceDirs = append(sourceDirs, b.Dir())
+	}
+	db.mu.RUnlock()
+	if err := db.RunCompaction(); err != nil {
+		t.Fatalf("compact: %v", err)
+	}
+	db.mu.RLock()
+	replacementDir := db.blocks[0].Dir()
+	db.mu.RUnlock()
+	removeErr := errors.New("injected source deletion failure")
+	db.removeBlockDir = func(dir string) error {
+		if dir == replacementDir {
+			return removeBlockDirectory(dir)
+		}
+		return removeErr
+	}
+	if err := db.RunRetention(); !errors.Is(err, removeErr) {
+		t.Fatalf("apply retention: got %v, want %v", err, removeErr)
+	}
+	if got := blockDirectoryCount(t, dir); got != 2 {
+		t.Fatalf("query-pinned source directories: got %d, want 2", got)
+	}
+	for _, sourceDir := range sourceDirs {
+		if _, err := os.Stat(sourceDir); err != nil {
+			t.Fatalf("retained source directory %s: %v", sourceDir, err)
+		}
+	}
+	if _, err := os.Stat(filepath.Join(dir, retentionTombstoneDir, filepath.Base(replacementDir))); err != nil {
+		t.Fatalf("retention lineage tombstone: %v", err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatalf("close DB: %v", err)
+	}
+
+	db, err = Open(dir, Options{})
+	if err != nil {
+		t.Fatalf("reopen DB: %v", err)
+	}
+	if got := db.Stats().Blocks; got != 0 {
+		t.Fatalf("blocks after retention restart: got %d, want 0", got)
+	}
+	if got := blockDirectoryCount(t, dir); got != 0 {
+		t.Fatalf("block directories after retention restart: got %d, want 0", got)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatalf("close reopened DB: %v", err)
+	}
+	if err := q.Close(); err != nil {
+		t.Fatalf("close lingering querier: %v", err)
+	}
+}
+
+func openExpiredTestBlock(t *testing.T, dir string) (*DB, string) {
+	t.Helper()
+	db, err := Open(dir, Options{
+		Retention: time.Hour,
+		Clock:     func() int64 { return 100 * 3600 * 1000 },
+	})
+	if err != nil {
+		t.Fatalf("open DB: %v", err)
+	}
+	writeTestBlocks(t, db, []int64{0})
+	blockName := filepath.Base(db.blocks[0].Dir())
+	return db, blockName
+}
+
+func assertRetentionFiles(t *testing.T, dir, blockName string, want bool) {
+	t.Helper()
+	for _, path := range []string{
+		filepath.Join(dir, blockName),
+		filepath.Join(dir, retentionTombstoneDir, blockName),
+	} {
+		_, err := os.Stat(path)
+		if want && err != nil {
+			t.Errorf("expected %s to exist: %v", path, err)
+		}
+		if !want && !os.IsNotExist(err) {
+			t.Errorf("expected %s to be absent: %v", path, err)
+		}
+	}
+}
+
+func assertLifecycleClosed(t *testing.T, db *DB) {
+	t.Helper()
+	if _, err := db.FlushOlderThan(math.MaxInt64); !errors.Is(err, ErrClosed) {
+		t.Errorf("FlushOlderThan error: got %v, want %v", err, ErrClosed)
+	}
+	if err := db.RunCompaction(); !errors.Is(err, ErrClosed) {
+		t.Errorf("RunCompaction error: got %v, want %v", err, ErrClosed)
+	}
+	if err := db.RunRetention(); !errors.Is(err, ErrClosed) {
+		t.Errorf("RunRetention error: got %v, want %v", err, ErrClosed)
+	}
+}
+
+func waitForClosing(t *testing.T, db *DB) {
+	t.Helper()
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		db.lifecycleMu.Lock()
+		closing := db.closing
+		db.lifecycleMu.Unlock()
+		if closing {
+			return
+		}
+		time.Sleep(time.Millisecond)
+	}
+	t.Fatal("DB did not enter closing state")
+}
+
+func corruptLastChunkCRC(t *testing.T, blockDir string) {
+	t.Helper()
+	entries, err := os.ReadDir(filepath.Join(blockDir, "chunks"))
+	if err != nil {
+		t.Fatalf("read chunk directory: %v", err)
+	}
+	if len(entries) == 0 {
+		t.Fatal("replacement has no chunk segments")
+	}
+	chunkPath := filepath.Join(blockDir, "chunks", entries[len(entries)-1].Name())
+	data, err := os.ReadFile(chunkPath)
+	if err != nil {
+		t.Fatalf("read chunk segment: %v", err)
+	}
+	data[len(data)-1] ^= 0xff
+	if err := os.WriteFile(chunkPath, data, 0644); err != nil {
+		t.Fatalf("corrupt chunk CRC: %v", err)
+	}
+}
+
+func writeTestBlocks(t *testing.T, db *DB, starts []int64) {
+	t.Helper()
+	for _, start := range starts {
+		var ref uint64
+		app := db.Appender()
+		for i := 0; i < 130; i++ {
+			ls := []labels.Label(nil)
+			if ref == 0 {
+				ls = labels.FromStrings("__name__", "lifecycle_test", "block", strconv.FormatInt(start, 10))
+			}
+			var err error
+			ref, err = app.Append(ref, ls, start+int64(i)*15000, float64(i))
+			if err != nil {
+				t.Fatalf("append sample: %v", err)
+			}
+		}
+		if err := app.Commit(); err != nil {
+			t.Fatalf("commit samples: %v", err)
+		}
+		if _, err := db.FlushOlderThan(math.MaxInt64); err != nil {
+			t.Fatalf("flush block: %v", err)
+		}
+	}
+}
+
+func blockDirectoryCount(t *testing.T, dir string) int {
+	t.Helper()
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		t.Fatalf("read data directory: %v", err)
+	}
+	count := 0
+	for _, entry := range entries {
+		if !entry.IsDir() || entry.Name() == "wal" {
+			continue
+		}
+		if _, err := os.Stat(filepath.Join(dir, entry.Name(), "meta.json")); err == nil {
+			count++
+		}
+	}
+	return count
 }
