@@ -363,7 +363,7 @@ func (db *DB) Querier(mint, maxt int64) (*Querier, error) {
 	}, nil
 }
 
-// FlushOlderThan flushes sealed head chunks to an immutable block.
+// FlushOlderThan flushes complete head chunks to an immutable block.
 func (db *DB) FlushOlderThan(maxT int64) (string, error) {
 	db.lifecycleMu.Lock()
 	defer db.lifecycleMu.Unlock()
@@ -587,7 +587,7 @@ func (db *DB) compactLoop() {
 	}
 }
 
-// autoFlush flushes sealed head chunks older than BlockDuration.
+// autoFlush flushes complete head chunks older than BlockDuration.
 func (db *DB) autoFlush() error {
 	now := db.opts.clock()()
 	cutoff := now - db.opts.blockDurationMs()

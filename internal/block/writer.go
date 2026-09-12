@@ -15,7 +15,7 @@ type ChunkData struct {
 	Data []byte // raw XOR chunk bytes (including 2-byte sample count header)
 }
 
-// SeriesFlush describes a series with its sealed chunks for block writing.
+// SeriesFlush describes a series with its chunks for block writing.
 type SeriesFlush struct {
 	Ref    uint64
 	Labels []labels.Label
