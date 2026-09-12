@@ -1,10 +1,14 @@
 package wal
 
 import (
+	"errors"
+	"io"
 	"os"
 	"path/filepath"
 	"reflect"
+	"sync"
 	"testing"
+	"time"
 
 	"github.com/davidhrinaldo/ingot/labels"
 )
@@ -141,7 +145,7 @@ func TestWAL(t *testing.T) {
 					t.Fatalf("unexpected error: %v", err)
 				}
 			},
-			wantRecords: 1,  // only the last segment's record(s) survive
+			wantRecords: 1, // only the last segment's record(s) survive
 			wantMinSegs: 1,
 		},
 		{
@@ -255,9 +259,9 @@ func TestWAL(t *testing.T) {
 	}
 }
 
-// TestTornWriteRecovery is the headline test from DESIGN.md: for every possible
-// byte offset, truncate the WAL there and verify recovery produces a valid
-// prefix of the original record sequence.
+// TestTornWriteRecovery appends every possible partial prefix of a new final
+// record. Recovery must remove only that unacknowledged tail and preserve every
+// complete record that preceded it.
 func TestTornWriteRecovery(t *testing.T) {
 	tests := []struct {
 		name string
@@ -311,6 +315,9 @@ func TestTornWriteRecovery(t *testing.T) {
 				t.Fatalf("unexpected error: %v", err)
 			}
 			tc.recs(t, w)
+			if err := w.Commit(); err != nil {
+				t.Fatalf("commit reference WAL: %v", err)
+			}
 			if err := w.Close(); err != nil {
 				t.Fatalf("unexpected error: %v", err)
 			}
@@ -335,11 +342,12 @@ func TestTornWriteRecovery(t *testing.T) {
 				segData[idx] = data
 			}
 
-			// Truncate the last segment at every byte offset.
+			// Append a partial record at every incomplete byte offset.
 			lastSeg := segs[len(segs)-1]
 			lastData := segData[lastSeg]
+			tail := EncodeRecord(nil, RecordSamples, EncodeSamplesRecord(nil, []RefSample{{Ref: 999, T: 999, V: 999}}))
 
-			for cutoff := 0; cutoff <= len(lastData); cutoff++ {
+			for cutoff := 0; cutoff < len(tail); cutoff++ {
 				walDir := filepath.Join(t.TempDir(), "wal")
 				if err := os.MkdirAll(walDir, 0755); err != nil {
 					t.Fatalf("cutoff=%d: unexpected error: %v", cutoff, err)
@@ -351,8 +359,10 @@ func TestTornWriteRecovery(t *testing.T) {
 						t.Fatalf("cutoff=%d: unexpected error: %v", cutoff, err)
 					}
 				}
-				// Write truncated last segment.
-				if err := os.WriteFile(segmentPath(walDir, lastSeg), lastData[:cutoff], 0644); err != nil {
+				// Keep every complete record and append only the torn tail.
+				data := append([]byte(nil), lastData...)
+				data = append(data, tail[:cutoff]...)
+				if err := os.WriteFile(segmentPath(walDir, lastSeg), data, 0644); err != nil {
 					t.Fatalf("cutoff=%d: unexpected error: %v", cutoff, err)
 				}
 
@@ -365,9 +375,8 @@ func TestTornWriteRecovery(t *testing.T) {
 					t.Fatalf("cutoff=%d: unexpected error: %v", cutoff, err)
 				}
 
-				// Must be a valid prefix.
-				if !(len(recovered) <= len(origRecs)) {
-					t.Errorf("cutoff=%d: got %d records, want <= %d", cutoff, len(recovered), len(origRecs))
+				if len(recovered) != len(origRecs) {
+					t.Errorf("cutoff=%d: got %d records, want %d", cutoff, len(recovered), len(origRecs))
 				}
 				for i, rec := range recovered {
 					if origRecs[i].Type != rec.Type {
@@ -377,6 +386,521 @@ func TestTornWriteRecovery(t *testing.T) {
 						t.Errorf("cutoff=%d rec=%d data: got %v, want %v", cutoff, i, rec.Data, origRecs[i].Data)
 					}
 				}
+				repaired, err := os.ReadFile(segmentPath(walDir, lastSeg))
+				if err != nil {
+					t.Fatalf("cutoff=%d: read repaired tail: %v", cutoff, err)
+				}
+				if !reflect.DeepEqual(repaired, lastData) {
+					t.Fatalf("cutoff=%d: repaired segment differs from acknowledged baseline", cutoff)
+				}
+			}
+		})
+	}
+}
+
+// TestExternallyTruncatedDurableFinalRecordLimit documents the ambiguity that
+// remains without a persisted durable-offset watermark. An externally
+// truncated durable final frame is indistinguishable from an interrupted append.
+func TestExternallyTruncatedDurableFinalRecordLimit(t *testing.T) {
+	dir := filepath.Join(t.TempDir(), "wal")
+	w, err := Open(dir, Options{})
+	if err != nil {
+		t.Fatalf("open WAL: %v", err)
+	}
+	for i := 0; i < 2; i++ {
+		if err := w.LogSamples([]RefSample{{Ref: 1, T: int64(i), V: float64(i)}}); err != nil {
+			t.Fatalf("log sample %d: %v", i, err)
+		}
+		if err := w.Commit(); err != nil {
+			t.Fatalf("commit sample %d: %v", i, err)
+		}
+	}
+	if err := w.Close(); err != nil {
+		t.Fatalf("close WAL: %v", err)
+	}
+
+	path := segmentPath(dir, 1)
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read WAL: %v", err)
+	}
+	if err := os.WriteFile(path, data[:len(data)-1], 0644); err != nil {
+		t.Fatalf("truncate durable final record: %v", err)
+	}
+
+	w, err = Open(dir, Options{})
+	if err != nil {
+		t.Fatalf("recover externally truncated final record: %v", err)
+	}
+	recovered := collectRecords(t, dir)
+	if len(recovered) != 1 {
+		t.Fatalf("recovered records: got %d, want 1", len(recovered))
+	}
+	if err := w.Close(); err != nil {
+		t.Fatalf("close recovered WAL: %v", err)
+	}
+}
+
+func TestFinalSegmentCorruptionLeavesWALIntact(t *testing.T) {
+	tests := []struct {
+		name        string
+		recordIndex int
+		corrupt     func([]byte, int, int)
+		wantErr     error
+	}{
+		{
+			name:        "checksum_before_later_record",
+			recordIndex: 1,
+			corrupt:     func(data []byte, off, size int) { data[off+size-1] ^= 0xff },
+			wantErr:     ErrCorruptRecord,
+		},
+		{
+			name:        "checksum_at_tail",
+			recordIndex: 2,
+			corrupt:     func(data []byte, off, size int) { data[off+size-1] ^= 0xff },
+			wantErr:     ErrCorruptRecord,
+		},
+		{
+			name:        "invalid_length_before_later_record",
+			recordIndex: 1,
+			corrupt: func(data []byte, off, _ int) {
+				copy(data[off+1:off+recordHeaderSize], []byte{0xff, 0xff, 0xff, 0xff})
+			},
+			wantErr: ErrInvalidRecord,
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			dir := filepath.Join(t.TempDir(), "wal")
+			w, err := Open(dir, Options{})
+			if err != nil {
+				t.Fatalf("open WAL: %v", err)
+			}
+			for i := 0; i < 3; i++ {
+				if err := w.LogSamples([]RefSample{{Ref: 1, T: int64(i), V: float64(i)}}); err != nil {
+					t.Fatalf("log sample %d: %v", i, err)
+				}
+			}
+			if err := w.Commit(); err != nil {
+				t.Fatalf("commit WAL: %v", err)
+			}
+			if err := w.Close(); err != nil {
+				t.Fatalf("close WAL: %v", err)
+			}
+
+			path := segmentPath(dir, 1)
+			data, err := os.ReadFile(path)
+			if err != nil {
+				t.Fatalf("read WAL: %v", err)
+			}
+			off := 0
+			for i := 0; i <= tc.recordIndex; i++ {
+				_, _, consumed, err := DecodeRecord(data[off:])
+				if err != nil {
+					t.Fatalf("decode record %d: %v", i, err)
+				}
+				if i == tc.recordIndex {
+					tc.corrupt(data, off, consumed)
+					break
+				}
+				off += consumed
+			}
+			if err := os.WriteFile(path, data, 0644); err != nil {
+				t.Fatalf("corrupt final segment: %v", err)
+			}
+
+			before := append([]byte(nil), data...)
+			if _, err := Open(dir, Options{}); !errors.Is(err, tc.wantErr) {
+				t.Fatalf("reopen error: got %v, want %v", err, tc.wantErr)
+			}
+			after, err := os.ReadFile(path)
+			if err != nil {
+				t.Fatalf("read final segment after failed recovery: %v", err)
+			}
+			if !reflect.DeepEqual(after, before) {
+				t.Fatal("final segment changed during failed recovery")
+			}
+		})
+	}
+}
+
+func TestClosedSegmentCorruptionLeavesWALIntact(t *testing.T) {
+	tests := []struct {
+		name    string
+		corrupt func([]byte) []byte
+		wantErr error
+	}{
+		{
+			name: "checksum",
+			corrupt: func(data []byte) []byte {
+				data[len(data)-1] ^= 0xff
+				return data
+			},
+			wantErr: ErrCorruptRecord,
+		},
+		{
+			name: "truncated",
+			corrupt: func(data []byte) []byte {
+				return data[:len(data)-1]
+			},
+			wantErr: ErrInvalidRecord,
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			dir := filepath.Join(t.TempDir(), "wal")
+			opts := Options{SegmentMaxSize: 50}
+			w, err := Open(dir, opts)
+			if err != nil {
+				t.Fatalf("open WAL: %v", err)
+			}
+			for i := 0; i < 4; i++ {
+				if err := w.LogSamples([]RefSample{{Ref: 1, T: int64(i), V: float64(i)}}); err != nil {
+					t.Fatalf("log sample %d: %v", i, err)
+				}
+			}
+			if err := w.Close(); err != nil {
+				t.Fatalf("close WAL: %v", err)
+			}
+
+			segs, err := listSegments(dir)
+			if err != nil {
+				t.Fatalf("list segments: %v", err)
+			}
+			if len(segs) < 3 {
+				t.Fatalf("segment count: got %d, want at least 3", len(segs))
+			}
+			closed := segs[0]
+			path := segmentPath(dir, closed)
+			data, err := os.ReadFile(path)
+			if err != nil {
+				t.Fatalf("read closed segment: %v", err)
+			}
+			if err := os.WriteFile(path, tc.corrupt(data), 0644); err != nil {
+				t.Fatalf("corrupt closed segment: %v", err)
+			}
+
+			before := make(map[int][]byte, len(segs))
+			for _, idx := range segs {
+				before[idx], err = os.ReadFile(segmentPath(dir, idx))
+				if err != nil {
+					t.Fatalf("snapshot segment %d: %v", idx, err)
+				}
+			}
+
+			if _, err := Open(dir, opts); !errors.Is(err, tc.wantErr) {
+				t.Fatalf("reopen error: got %v, want %v", err, tc.wantErr)
+			}
+			afterSegs, err := listSegments(dir)
+			if err != nil {
+				t.Fatalf("list segments after failed recovery: %v", err)
+			}
+			if !reflect.DeepEqual(afterSegs, segs) {
+				t.Fatalf("segments changed: got %v, want %v", afterSegs, segs)
+			}
+			for _, idx := range segs {
+				after, err := os.ReadFile(segmentPath(dir, idx))
+				if err != nil {
+					t.Fatalf("read segment %d after failed recovery: %v", idx, err)
+				}
+				if !reflect.DeepEqual(after, before[idx]) {
+					t.Fatalf("segment %d changed during failed recovery", idx)
+				}
+			}
+		})
+	}
+}
+
+func TestCommitSyncPolicy(t *testing.T) {
+	tests := []struct {
+		name            string
+		opts            Options
+		wantCommitSyncs int
+	}{
+		{name: "default_syncs_on_commit", opts: Options{}, wantCommitSyncs: 1},
+		{
+			name:            "periodic_commit_does_not_sync",
+			opts:            Options{SyncPolicy: SyncPeriodic, SyncInterval: time.Hour},
+			wantCommitSyncs: 0,
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			var syncs int
+			tc.opts.sync = func(*os.File) error {
+				syncs++
+				return nil
+			}
+			w, err := Open(filepath.Join(t.TempDir(), "wal"), tc.opts)
+			if err != nil {
+				t.Fatalf("open WAL: %v", err)
+			}
+			if err := w.LogSamples([]RefSample{{Ref: 1, T: 1, V: 1}}); err != nil {
+				t.Fatalf("log sample: %v", err)
+			}
+			if err := w.Commit(); err != nil {
+				t.Fatalf("commit WAL: %v", err)
+			}
+			if syncs != tc.wantCommitSyncs {
+				t.Fatalf("sync count after commit: got %d, want %d", syncs, tc.wantCommitSyncs)
+			}
+			if err := w.Close(); err != nil {
+				t.Fatalf("close WAL: %v", err)
+			}
+		})
+	}
+}
+
+func TestCheckpointActivationRequiresSourceValidation(t *testing.T) {
+	validationFailure := errors.New("injected source validation failure")
+	dir := filepath.Join(t.TempDir(), "wal")
+	w, err := Open(dir, Options{})
+	if err != nil {
+		t.Fatalf("open WAL: %v", err)
+	}
+	cp, err := w.Checkpoint("source-block", nil, nil)
+	if err != nil {
+		t.Fatalf("write checkpoint: %v", err)
+	}
+
+	if err := w.ActivateCheckpoint(cp, func() error { return validationFailure }); !errors.Is(err, validationFailure) {
+		t.Fatalf("activation validation error: got %v, want %v", err, validationFailure)
+	}
+	if err := w.ActivateCheckpoint(cp, nil); err == nil {
+		t.Fatal("activation without validation succeeded")
+	}
+	for _, rec := range collectRecords(t, dir) {
+		if rec.Type == RecordCheckpointActivate {
+			t.Fatal("failed validation wrote a checkpoint activation record")
+		}
+	}
+
+	if err := w.ActivateCheckpoint(cp, func() error { return nil }); err != nil {
+		t.Fatalf("activate validated checkpoint: %v", err)
+	}
+	if err := w.Close(); err != nil {
+		t.Fatalf("close WAL: %v", err)
+	}
+}
+
+func TestCommitSyncFailureIsSticky(t *testing.T) {
+	syncFailure := errors.New("injected fsync failure")
+	var syncs int
+	opts := Options{sync: func(*os.File) error {
+		syncs++
+		if syncs == 1 {
+			return syncFailure
+		}
+		return nil
+	}}
+	w, err := Open(filepath.Join(t.TempDir(), "wal"), opts)
+	if err != nil {
+		t.Fatalf("open WAL: %v", err)
+	}
+	if err := w.LogSamples([]RefSample{{Ref: 1, T: 1, V: 1}}); err != nil {
+		t.Fatalf("log sample: %v", err)
+	}
+	if err := w.Commit(); !errors.Is(err, syncFailure) {
+		t.Fatalf("commit error: got %v, want %v", err, syncFailure)
+	}
+	if err := w.Commit(); !errors.Is(err, syncFailure) {
+		t.Fatalf("second commit error: got %v, want %v", err, syncFailure)
+	}
+	if err := w.Close(); !errors.Is(err, syncFailure) {
+		t.Fatalf("close error: got %v, want %v", err, syncFailure)
+	}
+	if syncs != 2 {
+		t.Fatalf("sync count: got %d, want 2", syncs)
+	}
+}
+
+func TestWriteFailuresPoisonWAL(t *testing.T) {
+	writeFailure := errors.New("injected write failure")
+	tests := []struct {
+		name    string
+		write   func(*os.File, []byte) (int, error)
+		wantErr error
+	}{
+		{
+			name: "write_error",
+			write: func(*os.File, []byte) (int, error) {
+				return 0, writeFailure
+			},
+			wantErr: writeFailure,
+		},
+		{
+			name: "short_write",
+			write: func(f *os.File, b []byte) (int, error) {
+				return f.Write(b[:len(b)/2])
+			},
+			wantErr: io.ErrShortWrite,
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			w, err := Open(filepath.Join(t.TempDir(), "wal"), Options{write: tc.write})
+			if err != nil {
+				t.Fatalf("open WAL: %v", err)
+			}
+			if err := w.LogSamples([]RefSample{{Ref: 1, T: 1, V: 1}}); !errors.Is(err, tc.wantErr) {
+				t.Fatalf("write error: got %v, want %v", err, tc.wantErr)
+			}
+			if err := w.Commit(); !errors.Is(err, tc.wantErr) {
+				t.Fatalf("commit after write failure: got %v, want %v", err, tc.wantErr)
+			}
+			if err := w.LogSamples([]RefSample{{Ref: 1, T: 2, V: 2}}); !errors.Is(err, tc.wantErr) {
+				t.Fatalf("write after write failure: got %v, want %v", err, tc.wantErr)
+			}
+			if err := w.Close(); !errors.Is(err, tc.wantErr) {
+				t.Fatalf("close after write failure: got %v, want %v", err, tc.wantErr)
+			}
+		})
+	}
+}
+
+func TestRotationFailuresPoisonWAL(t *testing.T) {
+	rotationFailure := errors.New("injected rotation failure")
+	tests := []struct {
+		name string
+		opts func() Options
+	}{
+		{
+			name: "segment_sync",
+			opts: func() Options {
+				calls := 0
+				return Options{sync: func(f *os.File) error {
+					calls++
+					if calls == 1 {
+						return rotationFailure
+					}
+					return f.Sync()
+				}}
+			},
+		},
+		{
+			name: "segment_close",
+			opts: func() Options {
+				calls := 0
+				return Options{close: func(f *os.File) error {
+					calls++
+					if calls == 1 {
+						return rotationFailure
+					}
+					return f.Close()
+				}}
+			},
+		},
+		{
+			name: "segment_create",
+			opts: func() Options {
+				calls := 0
+				return Options{createSegment: func(dir string, index int) (*os.File, error) {
+					calls++
+					if calls == 2 {
+						return nil, rotationFailure
+					}
+					return createSegment(dir, index)
+				}}
+			},
+		},
+		{
+			name: "directory_sync",
+			opts: func() Options {
+				calls := 0
+				return Options{syncDir: func(dir string) error {
+					calls++
+					if calls == 3 {
+						return rotationFailure
+					}
+					return syncDir(dir)
+				}}
+			},
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			opts := tc.opts()
+			opts.SegmentMaxSize = 1
+			w, err := Open(filepath.Join(t.TempDir(), "wal"), opts)
+			if err != nil {
+				t.Fatalf("open WAL: %v", err)
+			}
+			if err := w.LogSamples([]RefSample{{Ref: 1, T: 1, V: 1}}); !errors.Is(err, rotationFailure) {
+				t.Fatalf("rotation error: got %v, want %v", err, rotationFailure)
+			}
+			if err := w.Commit(); !errors.Is(err, rotationFailure) {
+				t.Fatalf("commit after rotation failure: got %v, want %v", err, rotationFailure)
+			}
+			if err := w.Close(); !errors.Is(err, rotationFailure) {
+				t.Fatalf("close after rotation failure: got %v, want %v", err, rotationFailure)
+			}
+		})
+	}
+}
+
+func TestTruncationDirectorySyncFailurePoisonsWAL(t *testing.T) {
+	dirSyncFailure := errors.New("injected directory sync failure")
+	w, err := Open(filepath.Join(t.TempDir(), "wal"), Options{SegmentMaxSize: 50})
+	if err != nil {
+		t.Fatalf("open WAL: %v", err)
+	}
+	for i := 0; i < 3; i++ {
+		if err := w.LogSamples([]RefSample{{Ref: 1, T: int64(i), V: float64(i)}}); err != nil {
+			t.Fatalf("log sample %d: %v", i, err)
+		}
+	}
+	w.opts.syncDir = func(string) error { return dirSyncFailure }
+	if err := w.Truncate(w.LastSegment()); !errors.Is(err, dirSyncFailure) {
+		t.Fatalf("truncate error: got %v, want %v", err, dirSyncFailure)
+	}
+	if err := w.Commit(); !errors.Is(err, dirSyncFailure) {
+		t.Fatalf("commit after directory sync failure: got %v, want %v", err, dirSyncFailure)
+	}
+	if err := w.Close(); !errors.Is(err, dirSyncFailure) {
+		t.Fatalf("close after directory sync failure: got %v, want %v", err, dirSyncFailure)
+	}
+}
+
+func TestBackgroundSyncErrorIsReported(t *testing.T) {
+	syncFailure := errors.New("injected fsync failure")
+
+	for _, operation := range []string{"commit", "close"} {
+		t.Run(operation, func(t *testing.T) {
+			called := make(chan struct{})
+			var once sync.Once
+			opts := Options{
+				SyncPolicy:   SyncPeriodic,
+				SyncInterval: time.Millisecond,
+				sync: func(*os.File) error {
+					once.Do(func() { close(called) })
+					return syncFailure
+				},
+			}
+			w, err := Open(filepath.Join(t.TempDir(), "wal"), opts)
+			if err != nil {
+				t.Fatalf("open WAL: %v", err)
+			}
+			if err := w.LogSamples([]RefSample{{Ref: 1, T: 1, V: 1}}); err != nil {
+				t.Fatalf("log sample: %v", err)
+			}
+			select {
+			case <-called:
+			case <-time.After(time.Second):
+				t.Fatal("background sync did not run")
+			}
+
+			if operation == "commit" {
+				if err := w.Commit(); !errors.Is(err, syncFailure) {
+					t.Fatalf("commit error: got %v, want %v", err, syncFailure)
+				}
+			}
+			if err := w.Close(); !errors.Is(err, syncFailure) {
+				t.Fatalf("close error: got %v, want %v", err, syncFailure)
 			}
 		})
 	}

@@ -7,6 +7,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/davidhrinaldo/ingot/internal/wal"
 	"github.com/davidhrinaldo/ingot/labels"
 )
 
@@ -18,7 +19,7 @@ type sample struct {
 
 // oracle is a naive reference implementation for query comparison.
 type oracle struct {
-	series map[uint64][]sample      // ref -> samples in order
+	series map[uint64][]sample       // ref -> samples in order
 	labels map[uint64][]labels.Label // ref -> labels
 }
 
@@ -127,11 +128,131 @@ func openTestDB(t *testing.T) *DB {
 	return db
 }
 
+func TestAppenderRejectsStaleCommit(t *testing.T) {
+	db := openTestDB(t)
+	firstLabels := labels.FromStrings("__name__", "first")
+	secondLabels := labels.FromStrings("__name__", "second")
+
+	seed := db.Appender()
+	firstRef, err := seed.Append(0, firstLabels, 1, 1)
+	if err != nil {
+		t.Fatalf("append first seed sample: %v", err)
+	}
+	secondRef, err := seed.Append(0, secondLabels, 1, 1)
+	if err != nil {
+		t.Fatalf("append second seed sample: %v", err)
+	}
+	if err := seed.Commit(); err != nil {
+		t.Fatalf("commit seed samples: %v", err)
+	}
+
+	stale := db.Appender()
+	if _, err := stale.Append(firstRef, nil, 2, 2); err != nil {
+		t.Fatalf("append non-conflicting sample: %v", err)
+	}
+	if _, err := stale.Append(secondRef, nil, 2, 2); err != nil {
+		t.Fatalf("append stale sample: %v", err)
+	}
+	winner := db.Appender()
+	if _, err := winner.Append(secondRef, nil, 3, 3); err != nil {
+		t.Fatalf("append winning sample: %v", err)
+	}
+	if err := winner.Commit(); err != nil {
+		t.Fatalf("commit winning sample: %v", err)
+	}
+	if err := stale.Commit(); err == nil {
+		t.Fatal("stale commit succeeded")
+	}
+
+	q, err := db.Querier(math.MinInt64, math.MaxInt64)
+	if err != nil {
+		t.Fatalf("open querier: %v", err)
+	}
+	defer q.Close()
+	got := collectSeriesSet(t, q.Select())
+	want := map[uint64][]sample{
+		labels.Hash(firstLabels):  {{t: 1, v: 1}},
+		labels.Hash(secondLabels): {{t: 1, v: 1}, {t: 3, v: 3}},
+	}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("samples after rejected commit: got %v, want %v", got, want)
+	}
+}
+
+func TestAppenderRejectsAppendAfterClose(t *testing.T) {
+	for _, closeAppender := range []struct {
+		name string
+		fn   func(*Appender) error
+	}{
+		{name: "commit", fn: func(app *Appender) error { return app.Commit() }},
+		{name: "rollback", fn: func(app *Appender) error { return app.Rollback() }},
+	} {
+		t.Run(closeAppender.name, func(t *testing.T) {
+			db := openTestDB(t)
+			app := db.Appender()
+			if err := closeAppender.fn(app); err != nil {
+				t.Fatalf("close appender: %v", err)
+			}
+			if _, err := app.Append(0, labels.FromStrings("__name__", "closed"), 1, 1); err == nil {
+				t.Fatal("append after close succeeded")
+			}
+			if got := db.Stats().HeadSeries; got != 0 {
+				t.Fatalf("registered series after close: got %d, want 0", got)
+			}
+		})
+	}
+}
+
+func TestSyncPolicyOptions(t *testing.T) {
+	tests := []struct {
+		name         string
+		opts         Options
+		wantPolicy   wal.SyncPolicy
+		wantInterval time.Duration
+		wantErr      bool
+	}{
+		{name: "default_is_sync_on_commit", opts: Options{}, wantPolicy: wal.SyncOnCommit},
+		{
+			name:         "periodic_default_interval",
+			opts:         Options{SyncPolicy: SyncPeriodic},
+			wantPolicy:   wal.SyncPeriodic,
+			wantInterval: time.Second,
+		},
+		{
+			name:         "periodic_custom_interval",
+			opts:         Options{SyncPolicy: SyncPeriodic, SyncInterval: 25 * time.Millisecond},
+			wantPolicy:   wal.SyncPeriodic,
+			wantInterval: 25 * time.Millisecond,
+		},
+		{name: "commit_rejects_interval", opts: Options{SyncInterval: time.Second}, wantErr: true},
+		{name: "periodic_rejects_negative_interval", opts: Options{SyncPolicy: SyncPeriodic, SyncInterval: -1}, wantErr: true},
+		{name: "rejects_unknown_policy", opts: Options{SyncPolicy: SyncPolicy(99)}, wantErr: true},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			got, err := tc.opts.walOptions()
+			if (err != nil) != tc.wantErr {
+				t.Fatalf("wal options error: got %v, want error=%v", err, tc.wantErr)
+			}
+			if tc.wantErr {
+				return
+			}
+			if got.SyncPolicy != tc.wantPolicy {
+				t.Errorf("sync policy: got %v, want %v", got.SyncPolicy, tc.wantPolicy)
+			}
+			if got.SyncInterval != tc.wantInterval {
+				t.Errorf("sync interval: got %v, want %v", got.SyncInterval, tc.wantInterval)
+			}
+		})
+	}
+}
+
 func TestQueryOracle(t *testing.T) {
 	tests := []struct {
-		name     string
-		setup    func(t *testing.T, db *DB, o *oracle)
-		queries  []queryCase
+		name    string
+		setup   func(t *testing.T, db *DB, o *oracle)
+		queries []queryCase
 	}{
 		{
 			name: "head_only",
@@ -363,9 +484,9 @@ func TestQueryOracle(t *testing.T) {
 					matchers: []*labels.Matcher{labels.MustNewMatcher(labels.MatchEqual, "room", "office")},
 				},
 				{
-					name:     "combined_matchers",
-					mint:     math.MinInt64,
-					maxt:     math.MaxInt64,
+					name: "combined_matchers",
+					mint: math.MinInt64,
+					maxt: math.MaxInt64,
 					matchers: []*labels.Matcher{
 						labels.MustNewMatcher(labels.MatchEqual, "__name__", "temp"),
 						labels.MustNewMatcher(labels.MatchEqual, "room", "office"),
@@ -528,6 +649,159 @@ func TestQueryOracle(t *testing.T) {
 				})
 			}
 		})
+	}
+}
+
+func TestQuerierSnapshotsHeadAcrossFlush(t *testing.T) {
+	tests := []struct {
+		name         string
+		selectBefore bool
+	}{
+		{name: "select_and_iterator_after_flush"},
+		{name: "iterator_after_flush", selectBefore: true},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			db := openTestDB(t)
+			app := db.Appender()
+			ref, err := app.Append(0, labels.FromStrings("__name__", "temp"), 0, 0)
+			if err != nil {
+				t.Fatalf("append first sample: %v", err)
+			}
+			for i := 1; i < 250; i++ {
+				if _, err := app.Append(ref, nil, int64(i), float64(i)); err != nil {
+					t.Fatalf("append sample %d: %v", i, err)
+				}
+			}
+			if err := app.Commit(); err != nil {
+				t.Fatalf("commit: %v", err)
+			}
+
+			q, err := db.Querier(math.MinInt64, math.MaxInt64)
+			if err != nil {
+				t.Fatalf("create querier: %v", err)
+			}
+			defer q.Close()
+
+			var ss SeriesSet
+			if tc.selectBefore {
+				ss = q.Select(labels.MustNewMatcher(labels.MatchEqual, "__name__", "temp"))
+			}
+			if _, err := db.FlushOlderThan(math.MaxInt64); err != nil {
+				t.Fatalf("flush: %v", err)
+			}
+			if !tc.selectBefore {
+				ss = q.Select(labels.MustNewMatcher(labels.MatchEqual, "__name__", "temp"))
+			}
+
+			if !ss.Next() {
+				t.Fatalf("missing series after flush: %v", ss.Err())
+			}
+			it := ss.At().Iterator()
+			for i := 0; i < 250; i++ {
+				if !it.Next() {
+					t.Fatalf("sample count: got %d, want 250: %v", i, it.Err())
+				}
+				gotT, gotV := it.At()
+				if gotT != int64(i) || gotV != float64(i) {
+					t.Fatalf("sample %d: got (%d, %v), want (%d, %d)", i, gotT, gotV, i, i)
+				}
+			}
+			if it.Next() {
+				t.Fatal("iterator returned more than 250 samples")
+			}
+			if err := it.Err(); err != nil {
+				t.Fatalf("iterate: %v", err)
+			}
+			if ss.Next() {
+				t.Fatal("series set returned more than one series")
+			}
+			if err := ss.Err(); err != nil {
+				t.Fatalf("select: %v", err)
+			}
+		})
+	}
+}
+
+func TestQuerierExcludesCommitsAfterCreation(t *testing.T) {
+	db := openTestDB(t)
+	app := db.Appender()
+	ref, err := app.Append(0, labels.FromStrings("__name__", "temp", "room", "office"), 1, 1)
+	if err != nil {
+		t.Fatalf("append initial sample: %v", err)
+	}
+	if err := app.Commit(); err != nil {
+		t.Fatalf("commit initial sample: %v", err)
+	}
+
+	q, err := db.Querier(math.MinInt64, math.MaxInt64)
+	if err != nil {
+		t.Fatalf("create querier: %v", err)
+	}
+	defer q.Close()
+
+	app = db.Appender()
+	if _, err := app.Append(ref, nil, 2, 2); err != nil {
+		t.Fatalf("append to existing series: %v", err)
+	}
+	if _, err := app.Append(0, labels.FromStrings("__name__", "temp", "room", "kitchen"), 1, 10); err != nil {
+		t.Fatalf("append new series: %v", err)
+	}
+	if err := app.Commit(); err != nil {
+		t.Fatalf("commit later samples: %v", err)
+	}
+
+	ss := q.Select(labels.MustNewMatcher(labels.MatchEqual, "__name__", "temp"))
+	if !ss.Next() {
+		t.Fatalf("missing snapshot series: %v", ss.Err())
+	}
+	it := ss.At().Iterator()
+	if !it.Next() {
+		t.Fatalf("missing snapshot sample: %v", it.Err())
+	}
+	if gotT, gotV := it.At(); gotT != 1 || gotV != 1 {
+		t.Fatalf("snapshot sample: got (%d, %v), want (1, 1)", gotT, gotV)
+	}
+	if it.Next() {
+		t.Fatal("post-creation sample leaked into querier")
+	}
+	if err := it.Err(); err != nil {
+		t.Fatalf("iterate: %v", err)
+	}
+	if ss.Next() {
+		t.Fatal("post-creation series leaked into querier")
+	}
+	if err := ss.Err(); err != nil {
+		t.Fatalf("select: %v", err)
+	}
+}
+
+func TestQuerierCloseReleasesHeadSnapshot(t *testing.T) {
+	db := openTestDB(t)
+	app := db.Appender()
+	if _, err := app.Append(0, labels.FromStrings("__name__", "temp"), 1, 1); err != nil {
+		t.Fatalf("append: %v", err)
+	}
+	if err := app.Commit(); err != nil {
+		t.Fatalf("commit: %v", err)
+	}
+
+	q, err := db.Querier(math.MinInt64, math.MaxInt64)
+	if err != nil {
+		t.Fatalf("create querier: %v", err)
+	}
+	if q.head == nil {
+		t.Fatal("querier has no head snapshot")
+	}
+	if err := q.Close(); err != nil {
+		t.Fatalf("close querier: %v", err)
+	}
+	if q.head != nil {
+		t.Fatal("closed querier retained its head snapshot")
+	}
+	if err := q.Close(); err != nil {
+		t.Fatalf("close querier again: %v", err)
 	}
 }
 

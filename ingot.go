@@ -51,6 +51,44 @@ type Options struct {
 	// Clock returns the current time in milliseconds. Defaults to
 	// time.Now().UnixMilli(). Injected for testing with simulated time.
 	Clock func() int64
+	// SyncPolicy controls WAL fsync behavior. The zero value, SyncOnCommit,
+	// makes a successful Commit durable before it returns.
+	SyncPolicy SyncPolicy
+	// SyncInterval controls fsync frequency for SyncPeriodic. Zero uses 1s.
+	SyncInterval time.Duration
+}
+
+// SyncPolicy controls when committed WAL records are fsynced.
+type SyncPolicy uint8
+
+const (
+	// SyncOnCommit fsyncs each appender batch before Commit returns. This is
+	// the default.
+	SyncOnCommit SyncPolicy = iota
+	// SyncPeriodic fsyncs in the background. A process or machine crash may
+	// lose commits made since the last successful background fsync.
+	SyncPeriodic
+)
+
+func (o *Options) walOptions() (wal.Options, error) {
+	switch o.SyncPolicy {
+	case SyncOnCommit:
+		if o.SyncInterval != 0 {
+			return wal.Options{}, fmt.Errorf("SyncInterval requires SyncPeriodic")
+		}
+		return wal.Options{SyncPolicy: wal.SyncOnCommit}, nil
+	case SyncPeriodic:
+		if o.SyncInterval < 0 {
+			return wal.Options{}, fmt.Errorf("SyncInterval must not be negative")
+		}
+		interval := o.SyncInterval
+		if interval == 0 {
+			interval = time.Second
+		}
+		return wal.Options{SyncPolicy: wal.SyncPeriodic, SyncInterval: interval}, nil
+	default:
+		return wal.Options{}, fmt.Errorf("invalid SyncPolicy %d", o.SyncPolicy)
+	}
 }
 
 func (o *Options) clock() func() int64 {
@@ -73,6 +111,10 @@ func (o *Options) retentionMs() int64 {
 
 // Open opens or creates a DB at the given directory.
 func Open(dataDir string, opts Options) (*DB, error) {
+	walOpts, err := opts.walOptions()
+	if err != nil {
+		return nil, fmt.Errorf("ingot: %w", err)
+	}
 	if err := os.MkdirAll(dataDir, 0755); err != nil {
 		return nil, fmt.Errorf("ingot: create data dir: %w", err)
 	}
@@ -81,7 +123,7 @@ func Open(dataDir string, opts Options) (*DB, error) {
 	}
 
 	walDir := filepath.Join(dataDir, "wal")
-	h, err := head.Open(walDir, wal.Options{})
+	h, err := head.Open(walDir, walOpts)
 	if err != nil {
 		return nil, fmt.Errorf("ingot: open head: %w", err)
 	}
@@ -146,20 +188,22 @@ func (db *DB) Appender() *Appender {
 
 // Querier returns a Querier over [mint, maxt].
 func (db *DB) Querier(mint, maxt int64) (*Querier, error) {
-	db.mu.RLock()
 	var overlapping []*block.Reader
-	for _, b := range db.blocks {
-		if b.Meta.MaxTime >= mint && b.Meta.MinTime <= maxt {
-			b.Ref()
-			overlapping = append(overlapping, b)
+	headSnapshot := db.head.Snapshot(func() {
+		db.mu.RLock()
+		defer db.mu.RUnlock()
+		for _, b := range db.blocks {
+			if b.Meta.MaxTime >= mint && b.Meta.MinTime <= maxt {
+				b.Ref()
+				overlapping = append(overlapping, b)
+			}
 		}
-	}
-	db.mu.RUnlock()
+	})
 
 	return &Querier{
 		mint:   mint,
 		maxt:   maxt,
-		head:   db.head,
+		head:   headSnapshot,
 		blocks: overlapping,
 	}, nil
 }
@@ -367,7 +411,9 @@ func (a *Appender) Append(ref uint64, ls []labels.Label, t int64, v float64) (ui
 	return a.inner.Append(ref, ls, t, v)
 }
 
-// Commit writes the batch to the WAL and applies it to the head.
+// Commit writes the batch to the WAL according to the configured sync policy,
+// then applies it to the head. With the default SyncOnCommit policy, success
+// means the batch is durable on disk.
 func (a *Appender) Commit() error {
 	return a.inner.Commit()
 }
@@ -380,7 +426,7 @@ func (a *Appender) Rollback() error {
 // Querier queries the DB over a time range.
 type Querier struct {
 	mint, maxt int64
-	head       *head.Head
+	head       *head.Snapshot
 	blocks     []*block.Reader
 }
 
@@ -439,7 +485,7 @@ func (q *Querier) Select(matchers ...*labels.Matcher) SeriesSet {
 	return &sliceSeriesSet{series: entries}
 }
 
-// Close releases block references held by this querier.
+// Close releases snapshot references held by this querier.
 func (q *Querier) Close() error {
 	for _, b := range q.blocks {
 		dir := b.Dir()
@@ -448,6 +494,7 @@ func (q *Querier) Close() error {
 		}
 	}
 	q.blocks = nil
+	q.head = nil
 	return nil
 }
 
@@ -485,7 +532,7 @@ func resolveBlockPostings(b *block.Reader, matchers []*labels.Matcher) []uint64 
 	return postings.Intersect(lists...)
 }
 
-func resolveHeadPostings(h *head.Head, matchers []*labels.Matcher) []uint64 {
+func resolveHeadPostings(h *head.Snapshot, matchers []*labels.Matcher) []uint64 {
 	if len(matchers) == 0 {
 		return h.AllPostings()
 	}
