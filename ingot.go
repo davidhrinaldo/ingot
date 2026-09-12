@@ -50,6 +50,44 @@ type Options struct {
 	// Clock returns the current time in milliseconds. Defaults to
 	// time.Now().UnixMilli(). Injected for testing with simulated time.
 	Clock func() int64
+	// SyncPolicy controls WAL fsync behavior. The zero value, SyncOnCommit,
+	// makes a successful Commit durable before it returns.
+	SyncPolicy SyncPolicy
+	// SyncInterval controls fsync frequency for SyncPeriodic. Zero uses 1s.
+	SyncInterval time.Duration
+}
+
+// SyncPolicy controls when committed WAL records are fsynced.
+type SyncPolicy uint8
+
+const (
+	// SyncOnCommit fsyncs each appender batch before Commit returns. This is
+	// the default.
+	SyncOnCommit SyncPolicy = iota
+	// SyncPeriodic fsyncs in the background. A process or machine crash may
+	// lose commits made since the last successful background fsync.
+	SyncPeriodic
+)
+
+func (o *Options) walOptions() (wal.Options, error) {
+	switch o.SyncPolicy {
+	case SyncOnCommit:
+		if o.SyncInterval != 0 {
+			return wal.Options{}, fmt.Errorf("SyncInterval requires SyncPeriodic")
+		}
+		return wal.Options{SyncPolicy: wal.SyncOnCommit}, nil
+	case SyncPeriodic:
+		if o.SyncInterval < 0 {
+			return wal.Options{}, fmt.Errorf("SyncInterval must not be negative")
+		}
+		interval := o.SyncInterval
+		if interval == 0 {
+			interval = time.Second
+		}
+		return wal.Options{SyncPolicy: wal.SyncPeriodic, SyncInterval: interval}, nil
+	default:
+		return wal.Options{}, fmt.Errorf("invalid SyncPolicy %d", o.SyncPolicy)
+	}
 }
 
 func (o *Options) clock() func() int64 {
@@ -72,6 +110,10 @@ func (o *Options) retentionMs() int64 {
 
 // Open opens or creates a DB at the given directory.
 func Open(dataDir string, opts Options) (*DB, error) {
+	walOpts, err := opts.walOptions()
+	if err != nil {
+		return nil, fmt.Errorf("ingot: %w", err)
+	}
 	if err := os.MkdirAll(dataDir, 0755); err != nil {
 		return nil, fmt.Errorf("ingot: create data dir: %w", err)
 	}
@@ -80,7 +122,7 @@ func Open(dataDir string, opts Options) (*DB, error) {
 	}
 
 	walDir := filepath.Join(dataDir, "wal")
-	h, err := head.Open(walDir, wal.Options{})
+	h, err := head.Open(walDir, walOpts)
 	if err != nil {
 		return nil, fmt.Errorf("ingot: open head: %w", err)
 	}
@@ -365,7 +407,9 @@ func (a *Appender) Append(ref uint64, ls []labels.Label, t int64, v float64) (ui
 	return a.inner.Append(ref, ls, t, v)
 }
 
-// Commit writes the batch to the WAL and applies it to the head.
+// Commit writes the batch to the WAL according to the configured sync policy,
+// then applies it to the head. With the default SyncOnCommit policy, success
+// means the batch is durable on disk.
 func (a *Appender) Commit() error {
 	return a.inner.Commit()
 }
