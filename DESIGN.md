@@ -109,9 +109,9 @@ Default fsync on segment rotation plus a periodic (~1s) background sync, with `O
 
 ### WAL format
 - Segments of fixed max size (default 128 MiB), numbered files.
-- Records: `type(1) | len(4) | payload | crc32(4)`. Types: `series` (ref + labels), `samples` (batch of ref/ts/val).
+- Records: `type(1) | len(4) | payload | crc32(4)`. Types include normal `series` and `samples` records plus checkpoint begin, series, samples, and commit records.
 - Replay on `Open`: scan segments in order, stop at first CRC failure or truncated record, truncate the tail there. Everything before the corruption point is recovered.
-- Truncation: after a head cutoff successfully flushes a block and fsyncs the block dir, WAL segments containing only flushed data are deleted. Ordering is invariant: block fsync -> meta.json write -> WAL truncate. Never reordered.
+- Truncation: a head cutoff prepares and fsyncs block data, writes and fsyncs a checkpoint containing the remaining live head, atomically publishes `meta.json`, records checkpoint activation, then deletes pre-checkpoint WAL segments. Recovery ignores an unactivated checkpoint whose block was not published, so a crash on either side of publication retains a complete copy. Ordering is invariant: block data fsync -> checkpoint fsync -> meta.json publication -> activation fsync -> WAL truncate. Never reordered.
 
 ## 7. Chunk Encoding
 Gorilla (Facebook, VLDB 2015), same scheme Prometheus uses:
@@ -193,4 +193,3 @@ Matches the build roadmap:
 - ULID vs. sequential block IDs: ULID gives sortable uniqueness for free; sequential is simpler to fsck. Leaning ULID (Prometheus-compatible mental model).
 - `labels` package: depend on `prometheus/prometheus/model/lables` or vendor a minimal copy? Leaning minimal copy - zero-dependency is part of the pitch.
 - Snappy/zstd over sealed chunk files on top of Gorilla: measure first. Gorilla output is high-entropy; likely not worth it.
-

@@ -195,7 +195,7 @@ func recover(dir string) error {
 					return err
 				}
 			}
-			return nil
+			return syncDir(dir)
 		}
 	}
 	return nil
@@ -230,7 +230,19 @@ func recoverSegment(dir string, index int) (bool, error) {
 	}
 
 	// Truncate the file at the last valid boundary.
-	if err := os.Truncate(path, int64(validEnd)); err != nil {
+	f, err := os.OpenFile(path, os.O_WRONLY, 0644)
+	if err != nil {
+		return false, err
+	}
+	if err := f.Truncate(int64(validEnd)); err != nil {
+		f.Close()
+		return false, err
+	}
+	if err := f.Sync(); err != nil {
+		f.Close()
+		return false, err
+	}
+	if err := f.Close(); err != nil {
 		return false, err
 	}
 	return true, nil

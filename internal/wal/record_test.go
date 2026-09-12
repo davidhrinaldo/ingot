@@ -41,9 +41,9 @@ func TestRecord(t *testing.T) {
 			encode: true,
 		},
 		{
-			name: "large_payload",
-			data: EncodeRecord(nil, RecordSamples, make([]byte, 8192)),
-			want: decodeResult{RecordSamples, make([]byte, 8192), RecordSize(8192), nil},
+			name:   "large_payload",
+			data:   EncodeRecord(nil, RecordSamples, make([]byte, 8192)),
+			want:   decodeResult{RecordSamples, make([]byte, 8192), RecordSize(8192), nil},
 			encode: true,
 		},
 		{
@@ -182,6 +182,24 @@ func TestRecordSize(t *testing.T) {
 	for _, tc := range tests {
 		if got := RecordSize(tc.payloadLen); got != tc.want {
 			t.Errorf("RecordSize(%d): got %v, want %v", tc.payloadLen, got, tc.want)
+		}
+	}
+}
+
+func TestCheckpointCodec(t *testing.T) {
+	want := Checkpoint{StartSegment: 42, BlockULID: "01JTESTBLOCK"}
+	encoded := EncodeCheckpoint(nil, want)
+	got, err := DecodeCheckpoint(encoded)
+	if err != nil {
+		t.Fatalf("decode checkpoint: %v", err)
+	}
+	if got != want {
+		t.Fatalf("checkpoint: got %+v, want %+v", got, want)
+	}
+
+	for _, invalid := range [][]byte{nil, make([]byte, 8)} {
+		if _, err := DecodeCheckpoint(invalid); err != ErrInvalidRecord {
+			t.Fatalf("decode invalid checkpoint: got %v, want %v", err, ErrInvalidRecord)
 		}
 	}
 }

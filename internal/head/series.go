@@ -21,16 +21,18 @@ type memSeries struct {
 	labels []labels.Label
 
 	// Active chunk and its appender.
-	chunk    *chunkenc.XORChunk
-	chunkApp chunkenc.ChunkAppender
+	chunk     *chunkenc.XORChunk
+	chunkApp  chunkenc.ChunkAppender
 	chunkMinT int64
 
 	// Sealed chunks awaiting block flush.
 	sealed []chunkMeta
 
 	// Timestamp of last appended sample (for OOO rejection).
-	lastT    int64
-	hasData  bool // false until the first sample is appended
+	lastT         int64
+	hasData       bool // false until the first sample is appended
+	walLogged     bool // protected by Head.commitMu
+	sharedPending bool // protected by Head.commitMu
 }
 
 // append adds a sample to the series. Caller must hold s.mu.
@@ -121,6 +123,6 @@ func (m *multiIterator) Err() error {
 // emptyIterator is returned when a series has no data in the requested range.
 type emptyIterator struct{}
 
-func (e *emptyIterator) Next() bool        { return false }
+func (e *emptyIterator) Next() bool           { return false }
 func (e *emptyIterator) At() (int64, float64) { return 0, 0 }
-func (e *emptyIterator) Err() error        { return nil }
+func (e *emptyIterator) Err() error           { return nil }

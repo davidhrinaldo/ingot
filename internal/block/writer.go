@@ -30,27 +30,66 @@ type SeriesFlush struct {
 //
 // Returns the block ULID and any error.
 func Flush(dataDir string, series []SeriesFlush) (string, error) {
-	return flushBlock(dataDir, series, 1, nil)
+	prepared, err := PrepareFlush(dataDir, series)
+	if err != nil {
+		return "", err
+	}
+	if err := prepared.Publish(); err != nil {
+		return prepared.ULID, err
+	}
+	return prepared.ULID, nil
+}
+
+// PreparedBlock contains durable block data that is not visible to readers
+// until Publish writes meta.json.
+type PreparedBlock struct {
+	ULID    string
+	dataDir string
+	dir     string
+	meta    BlockMeta
+}
+
+// PrepareFlush writes and fsyncs a block without publishing its meta.json.
+func PrepareFlush(dataDir string, series []SeriesFlush) (*PreparedBlock, error) {
+	return prepareBlock(dataDir, series, 1, nil)
+}
+
+// Publish makes a prepared block visible and durable.
+func (p *PreparedBlock) Publish() error {
+	if err := writeMeta(p.dir, p.meta); err != nil {
+		return err
+	}
+	if err := syncDir(p.dir); err != nil {
+		return err
+	}
+	return syncDir(p.dataDir)
 }
 
 // FlushCompacted writes a new immutable block from compacted series data,
 // recording the compaction level and source block ULIDs.
 func FlushCompacted(dataDir string, series []SeriesFlush, level int, sources []string) (string, error) {
-	return flushBlock(dataDir, series, level, sources)
+	prepared, err := prepareBlock(dataDir, series, level, sources)
+	if err != nil {
+		return "", err
+	}
+	if err := prepared.Publish(); err != nil {
+		return prepared.ULID, err
+	}
+	return prepared.ULID, nil
 }
 
-func flushBlock(dataDir string, series []SeriesFlush, level int, sources []string) (string, error) {
+func prepareBlock(dataDir string, series []SeriesFlush, level int, sources []string) (*PreparedBlock, error) {
 	ulid := newULID()
 	blockDir := filepath.Join(dataDir, ulid)
 
 	if err := os.MkdirAll(blockDir, 0755); err != nil {
-		return "", err
+		return nil, err
 	}
 
 	// Write chunk files and collect index entries.
 	cw, err := newChunkWriter(blockDir)
 	if err != nil {
-		return "", err
+		return nil, err
 	}
 
 	var (
@@ -74,7 +113,7 @@ func flushBlock(dataDir string, series []SeriesFlush, level int, sources []strin
 			ref, err := cw.writeChunk(cd.Data)
 			if err != nil {
 				cw.close()
-				return "", err
+				return nil, err
 			}
 			chunks = append(chunks, index.ChunkMeta{
 				MinT: cd.MinT,
@@ -102,14 +141,17 @@ func flushBlock(dataDir string, series []SeriesFlush, level int, sources []strin
 	}
 
 	if err := cw.close(); err != nil {
-		return "", err
+		return nil, err
+	}
+	if err := syncDir(filepath.Join(blockDir, chunksDirName)); err != nil {
+		return nil, err
 	}
 
 	// Write index file.
 	indexPath := filepath.Join(blockDir, "index")
 	indexFile, err := os.Create(indexPath)
 	if err != nil {
-		return "", err
+		return nil, err
 	}
 
 	iw := index.NewWriter(indexFile)
@@ -118,32 +160,25 @@ func flushBlock(dataDir string, series []SeriesFlush, level int, sources []strin
 	}
 	if _, err := iw.WriteTo(); err != nil {
 		indexFile.Close()
-		return "", err
+		return nil, err
 	}
 	if err := indexFile.Sync(); err != nil {
 		indexFile.Close()
-		return "", err
+		return nil, err
 	}
 	if err := indexFile.Close(); err != nil {
-		return "", err
+		return nil, err
 	}
 
 	// Fsync the block directory to ensure all files are durable.
 	if err := syncDir(blockDir); err != nil {
-		return "", err
+		return nil, err
 	}
-
-	// Write meta.json last — the immutability gate.
-	if err := writeMeta(blockDir, meta); err != nil {
-		return "", err
-	}
-
-	// Fsync the data directory so the block directory entry is visible.
 	if err := syncDir(dataDir); err != nil {
-		return "", err
+		return nil, err
 	}
 
-	return ulid, nil
+	return &PreparedBlock{ULID: ulid, dataDir: dataDir, dir: blockDir, meta: meta}, nil
 }
 
 func syncDir(dir string) error {

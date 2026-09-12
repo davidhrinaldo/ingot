@@ -4,8 +4,10 @@ package head
 
 import (
 	"fmt"
+	"os"
 	"path/filepath"
 	"sort"
+	"sync"
 	"sync/atomic"
 
 	"github.com/davidhrinaldo/ingot/internal/block"
@@ -16,10 +18,11 @@ import (
 
 // Head is the in-memory store for active series and their chunks.
 type Head struct {
-	dataDir string // parent directory containing WAL and block dirs
-	series  *seriesMap
-	wal     *wal.WAL
-	nextRef atomic.Uint64
+	dataDir  string // parent directory containing WAL and block dirs
+	series   *seriesMap
+	wal      *wal.WAL
+	nextRef  atomic.Uint64
+	commitMu sync.Mutex
 
 	minTime atomic.Int64
 	maxTime atomic.Int64
@@ -54,8 +57,16 @@ func (h *Head) replay() error {
 	if err != nil {
 		return err
 	}
-	defer r.Close()
 
+	var acceptedCheckpoint int
+	var checkpoint struct {
+		marker    wal.Checkpoint
+		series    []wal.SeriesRecord
+		samples   [][]wal.RefSample
+		active    bool
+		committed bool
+		applied   bool
+	}
 	for r.Next() {
 		rec := r.Record()
 		switch rec.Type {
@@ -73,9 +84,131 @@ func (h *Head) replay() error {
 			for _, s := range samples {
 				h.applySample(s.Ref, s.T, s.V)
 			}
+		case wal.RecordCheckpointBegin:
+			cp, err := wal.DecodeCheckpoint(rec.Data)
+			if err != nil {
+				return fmt.Errorf("head: replay checkpoint begin: %w", err)
+			}
+			checkpoint.marker = cp
+			checkpoint.series = nil
+			checkpoint.samples = nil
+			checkpoint.active = true
+			checkpoint.committed = false
+			checkpoint.applied = false
+		case wal.RecordCheckpointSeries:
+			if !checkpoint.active {
+				continue
+			}
+			sr, err := wal.DecodeSeriesRecord(rec.Data)
+			if err != nil {
+				return fmt.Errorf("head: replay checkpoint series: %w", err)
+			}
+			checkpoint.series = append(checkpoint.series, sr)
+		case wal.RecordCheckpointSamples:
+			if !checkpoint.active {
+				continue
+			}
+			samples, err := wal.DecodeSamplesRecord(rec.Data)
+			if err != nil {
+				return fmt.Errorf("head: replay checkpoint samples: %w", err)
+			}
+			checkpoint.samples = append(checkpoint.samples, samples)
+		case wal.RecordCheckpointCommit:
+			cp, err := wal.DecodeCheckpoint(rec.Data)
+			if err != nil {
+				return fmt.Errorf("head: replay checkpoint commit: %w", err)
+			}
+			if !checkpoint.active || cp != checkpoint.marker {
+				continue
+			}
+			checkpoint.active = false
+			checkpoint.committed = true
+			valid, err := h.checkpointValid(cp)
+			// A later activation record is authoritative even if the source
+			// block has since been compacted, retained, or cannot be opened.
+			if err != nil {
+				valid = false
+			}
+			if valid {
+				h.applyReplayCheckpoint(checkpoint.series, checkpoint.samples)
+				checkpoint.applied = true
+				acceptedCheckpoint = cp.StartSegment
+			}
+		case wal.RecordCheckpointActivate:
+			cp, err := wal.DecodeCheckpoint(rec.Data)
+			if err != nil {
+				return fmt.Errorf("head: replay checkpoint activation: %w", err)
+			}
+			if !checkpoint.committed || checkpoint.applied || cp != checkpoint.marker {
+				continue
+			}
+			h.applyReplayCheckpoint(checkpoint.series, checkpoint.samples)
+			checkpoint.applied = true
+			acceptedCheckpoint = cp.StartSegment
 		}
 	}
-	return r.Err()
+	if err := r.Err(); err != nil {
+		r.Close()
+		return err
+	}
+	if err := r.Close(); err != nil {
+		return err
+	}
+	if acceptedCheckpoint != 0 {
+		return h.wal.Truncate(acceptedCheckpoint)
+	}
+	return nil
+}
+
+func (h *Head) applyReplayCheckpoint(series []wal.SeriesRecord, samples [][]wal.RefSample) {
+	h.resetReplayState()
+	for _, sr := range series {
+		h.replaySeries(sr)
+	}
+	for _, batch := range samples {
+		for _, s := range batch {
+			h.applySample(s.Ref, s.T, s.V)
+		}
+	}
+}
+
+func (h *Head) checkpointValid(cp wal.Checkpoint) (bool, error) {
+	hasOlder, err := h.wal.HasSegmentBefore(cp.StartSegment)
+	if err != nil {
+		return false, err
+	}
+	if !hasOlder {
+		return true, nil
+	}
+	blockDir := filepath.Join(h.dataDir, cp.BlockULID)
+	br, err := block.Open(blockDir)
+	if err == nil {
+		if br.Meta.ULID != cp.BlockULID {
+			br.Close()
+			return false, nil
+		}
+		for _, entry := range br.Series() {
+			for _, chunk := range entry.Chunks {
+				if _, err := br.RawChunkData(chunk.Ref); err != nil {
+					br.Close()
+					return false, err
+				}
+			}
+		}
+		return true, br.Close()
+	}
+	if os.IsNotExist(err) {
+		return false, nil
+	}
+	return false, err
+}
+
+func (h *Head) resetReplayState() {
+	h.series = newSeriesMap()
+	h.nextRef.Store(0)
+	h.minTime.Store(0)
+	h.maxTime.Store(0)
+	h.minSet.Store(false)
 }
 
 func (h *Head) replaySeries(sr wal.SeriesRecord) {
@@ -97,8 +230,9 @@ func (h *Head) replaySeries(sr wal.SeriesRecord) {
 	}
 
 	s := &memSeries{
-		ref:    sr.Ref,
-		labels: sr.Labels,
+		ref:       sr.Ref,
+		labels:    sr.Labels,
+		walLogged: true,
 	}
 	h.series.set(hash, s)
 }
@@ -153,66 +287,128 @@ func (h *Head) Close() error {
 }
 
 // FlushOlderThan collects all sealed chunks with maxT <= threshold from all
-// series, writes them to an immutable block, and truncates the WAL.
+// series, writes them to an immutable block, and checkpoints the remaining head.
 //
-// The ordering invariant is enforced: block fsync -> meta.json write -> WAL truncate.
+// The ordering invariant is enforced: block data fsync -> WAL checkpoint fsync ->
+// meta.json publication -> WAL truncate.
 // Returns the block ULID (empty string if nothing to flush) and any error.
 func (h *Head) FlushOlderThan(maxT int64) (string, error) {
+	return h.flushOlderThan(maxT, nil)
+}
+
+// FlushOlderThanAndInstall installs a published block before its chunks are
+// evicted from the head, preventing a gap for concurrent DB queries.
+func (h *Head) FlushOlderThanAndInstall(maxT int64, install func(string) error) (string, error) {
+	return h.flushOlderThan(maxT, install)
+}
+
+func (h *Head) flushOlderThan(maxT int64, install func(string) error) (string, error) {
 	var flushData []block.SeriesFlush
+	var checkpointSeries []wal.SeriesRecord
+	var checkpointSamples [][]wal.RefSample
+	var snapshotErr error
+
+	h.commitMu.Lock()
+	defer h.commitMu.Unlock()
 
 	h.series.forEach(func(s *memSeries) {
+		if snapshotErr != nil {
+			return
+		}
 		s.mu.Lock()
 		defer s.mu.Unlock()
 
 		var toFlush []chunkMeta
-		var remaining []chunkMeta
+		var remainingSamples []wal.RefSample
 		for _, cm := range s.sealed {
 			if cm.maxT <= maxT {
 				toFlush = append(toFlush, cm)
 			} else {
-				remaining = append(remaining, cm)
+				remainingSamples, snapshotErr = appendCheckpointSamples(remainingSamples, s.ref, cm.chunk.Iterator())
 			}
 		}
-		if len(toFlush) == 0 {
+		if s.chunk != nil && s.chunk.NumSamples() > 0 {
+			remainingSamples, snapshotErr = appendCheckpointSamples(remainingSamples, s.ref, s.chunk.Iterator())
+		}
+		if snapshotErr != nil {
 			return
 		}
-
-		sf := block.SeriesFlush{
-			Ref:    s.ref,
-			Labels: s.labels,
+		if len(remainingSamples) > 0 || s.walLogged {
+			checkpointSeries = append(checkpointSeries, wal.SeriesRecord{Ref: s.ref, Labels: s.labels})
 		}
-		for _, cm := range toFlush {
-			sf.Chunks = append(sf.Chunks, block.ChunkData{
-				MinT: cm.minT,
-				MaxT: cm.maxT,
-				Data: append([]byte(nil), cm.chunk.Bytes()...),
-			})
+		if len(remainingSamples) > 0 {
+			checkpointSamples = append(checkpointSamples, remainingSamples)
 		}
-		flushData = append(flushData, sf)
 
-		// Clear flushed chunks from the series.
-		s.sealed = remaining
+		if len(toFlush) > 0 {
+			sf := block.SeriesFlush{Ref: s.ref, Labels: s.labels}
+			for _, cm := range toFlush {
+				sf.Chunks = append(sf.Chunks, block.ChunkData{
+					MinT: cm.minT,
+					MaxT: cm.maxT,
+					Data: append([]byte(nil), cm.chunk.Bytes()...),
+				})
+			}
+			flushData = append(flushData, sf)
+		}
 	})
+	if snapshotErr != nil {
+		return "", fmt.Errorf("head: snapshot checkpoint: %w", snapshotErr)
+	}
 
 	if len(flushData) == 0 {
 		return "", nil
 	}
+	sort.Slice(flushData, func(i, j int) bool { return flushData[i].Ref < flushData[j].Ref })
+	sort.Slice(checkpointSeries, func(i, j int) bool { return checkpointSeries[i].Ref < checkpointSeries[j].Ref })
 
-	// Write block. Flush handles: chunk files + index + fsync + meta.json.
-	ulid, err := block.Flush(h.dataDir, flushData)
+	prepared, err := block.PrepareFlush(h.dataDir, flushData)
 	if err != nil {
-		return "", fmt.Errorf("head: flush block: %w", err)
+		return "", fmt.Errorf("head: prepare block: %w", err)
 	}
 
-	// WAL truncation: safe because the block is fully fsynced.
-	// Truncate all segments below the current one — the flushed data is now
-	// in the block and doesn't need WAL replay.
-	lastSeg := h.wal.LastSegment()
-	if err := h.wal.Truncate(lastSeg); err != nil {
-		return ulid, fmt.Errorf("head: truncate WAL: %w", err)
+	checkpoint, err := h.wal.Checkpoint(prepared.ULID, checkpointSeries, checkpointSamples)
+	if err != nil {
+		return "", fmt.Errorf("head: write WAL checkpoint: %w", err)
+	}
+	if err := prepared.Publish(); err != nil {
+		return "", fmt.Errorf("head: publish block: %w", err)
+	}
+	if err := h.wal.ActivateCheckpoint(checkpoint); err != nil {
+		return prepared.ULID, fmt.Errorf("head: activate WAL checkpoint: %w", err)
+	}
+	if install != nil {
+		if err := install(prepared.ULID); err != nil {
+			return prepared.ULID, err
+		}
 	}
 
-	return ulid, nil
+	// The published block makes the checkpoint authoritative. Remove the
+	// flushed chunks in memory before cleaning up now-redundant WAL segments.
+	h.series.forEach(func(s *memSeries) {
+		s.mu.Lock()
+		remaining := s.sealed[:0]
+		for _, cm := range s.sealed {
+			if cm.maxT > maxT {
+				remaining = append(remaining, cm)
+			}
+		}
+		s.sealed = remaining
+		s.mu.Unlock()
+	})
+	if err := h.wal.Truncate(checkpoint.StartSegment); err != nil {
+		return prepared.ULID, fmt.Errorf("head: truncate WAL: %w", err)
+	}
+
+	return prepared.ULID, nil
+}
+
+func appendCheckpointSamples(dst []wal.RefSample, ref uint64, it chunkenc.ChunkIterator) ([]wal.RefSample, error) {
+	for it.Next() {
+		t, v := it.At()
+		dst = append(dst, wal.RefSample{Ref: ref, T: t, V: v})
+	}
+	return dst, it.Err()
 }
 
 // Postings returns sorted series refs where the series has label name=value.
@@ -290,7 +486,7 @@ func (h *Head) Stats() HeadStats {
 
 // HeadStats holds a snapshot of head statistics.
 type HeadStats struct {
-	NumSeries      int
+	NumSeries       int
 	NumActiveChunks int
 }
 

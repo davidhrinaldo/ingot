@@ -39,8 +39,8 @@ type DB struct {
 	compactCancel context.CancelFunc
 	compactWg     sync.WaitGroup
 
-	compactionCount atomic.Int64  // incremented on each successful compaction
-	metricsR        metricsRefs   // cached series refs for self-instrumentation
+	compactionCount atomic.Int64 // incremented on each successful compaction
+	metricsR        metricsRefs  // cached series refs for self-instrumentation
 }
 
 // Options configures a DB.
@@ -74,6 +74,9 @@ func (o *Options) retentionMs() int64 {
 func Open(dataDir string, opts Options) (*DB, error) {
 	if err := os.MkdirAll(dataDir, 0755); err != nil {
 		return nil, fmt.Errorf("ingot: create data dir: %w", err)
+	}
+	if err := syncDirectory(filepath.Dir(dataDir)); err != nil {
+		return nil, fmt.Errorf("ingot: sync data dir parent: %w", err)
 	}
 
 	walDir := filepath.Join(dataDir, "wal")
@@ -164,29 +167,19 @@ func (db *DB) Querier(mint, maxt int64) (*Querier, error) {
 
 // FlushOlderThan flushes sealed head chunks to an immutable block.
 func (db *DB) FlushOlderThan(maxT int64) (string, error) {
-	ulid, err := db.head.FlushOlderThan(maxT)
-	if err != nil {
-		return "", err
-	}
-	if ulid == "" {
-		return "", nil
-	}
-
-	// Open the new block and add it to the block list.
-	dir := filepath.Join(db.dataDir, ulid)
-	br, err := block.Open(dir)
-	if err != nil {
-		return ulid, fmt.Errorf("ingot: open flushed block: %w", err)
-	}
-
-	db.mu.Lock()
-	db.blocks = append(db.blocks, br)
-	sort.Slice(db.blocks, func(i, j int) bool {
-		return db.blocks[i].Meta.MinTime < db.blocks[j].Meta.MinTime
+	return db.head.FlushOlderThanAndInstall(maxT, func(ulid string) error {
+		br, err := block.Open(filepath.Join(db.dataDir, ulid))
+		if err != nil {
+			return fmt.Errorf("ingot: open flushed block: %w", err)
+		}
+		db.mu.Lock()
+		db.blocks = append(db.blocks, br)
+		sort.Slice(db.blocks, func(i, j int) bool {
+			return db.blocks[i].Meta.MinTime < db.blocks[j].Meta.MinTime
+		})
+		db.mu.Unlock()
+		return nil
 	})
-	db.mu.Unlock()
-
-	return ulid, nil
 }
 
 // RunCompaction performs a single compaction cycle. Exported for testing.
@@ -349,6 +342,15 @@ func (db *DB) Close() error {
 		}
 	}
 	return firstErr
+}
+
+func syncDirectory(dir string) error {
+	d, err := os.Open(dir)
+	if err != nil {
+		return err
+	}
+	defer d.Close()
+	return d.Sync()
 }
 
 // Appender buffers samples and new series for atomic commit.
@@ -650,9 +652,9 @@ type errIterator struct {
 	err error
 }
 
-func (e *errIterator) Next() bool            { return false }
-func (e *errIterator) At() (int64, float64)  { return 0, 0 }
-func (e *errIterator) Err() error            { return e.err }
+func (e *errIterator) Next() bool           { return false }
+func (e *errIterator) At() (int64, float64) { return 0, 0 }
+func (e *errIterator) Err() error           { return e.err }
 
 // ensure interfaces are satisfied.
 var (
