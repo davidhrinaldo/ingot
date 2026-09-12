@@ -381,6 +381,47 @@ func TestXORChunkFromBytes(t *testing.T) {
 	}
 }
 
+func TestXORIteratorRejectsInvalidWindows(t *testing.T) {
+	tests := []struct {
+		name      string
+		newWindow bool
+		leading   uint64
+		sigbits   uint64
+	}{
+		{name: "reuse_before_window"},
+		{name: "leading_plus_significant_bits_exceeds_word", newWindow: true, leading: 31, sigbits: 63},
+		{name: "64_significant_bits_with_nonzero_leading", newWindow: true, leading: 1, sigbits: 0},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			stream := bstream{stream: make([]byte, 2)}
+			stream.writeBits(uint64(100), 64)
+			stream.writeBits(math.Float64bits(1), 64)
+			stream.writeBit(false)
+			stream.writeBits(1, 14)
+			stream.writeBit(true)
+			stream.writeBit(tc.newWindow)
+			if tc.newWindow {
+				stream.writeBits(tc.leading, 5)
+				stream.writeBits(tc.sigbits, 6)
+			}
+			binary.BigEndian.PutUint16(stream.stream[:2], 2)
+
+			iterator := XORChunkFromBytes(stream.stream).Iterator()
+			if !iterator.Next() {
+				t.Fatal("first sample did not decode")
+			}
+			if iterator.Next() {
+				t.Fatal("invalid window decoded a second sample")
+			}
+			if !errors.Is(iterator.Err(), ErrInvalidXORWindow) {
+				t.Fatalf("got %v, want ErrInvalidXORWindow", iterator.Err())
+			}
+		})
+	}
+}
+
 func FuzzXORIterator(f *testing.F) {
 	c := NewXORChunk()
 	a, _ := c.Appender()

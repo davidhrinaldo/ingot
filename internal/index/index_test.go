@@ -2,7 +2,11 @@ package index
 
 import (
 	"bytes"
+	"encoding/binary"
+	"errors"
+	"fmt"
 	"reflect"
+	"strings"
 	"testing"
 
 	"github.com/davidhrinaldo/ingot/labels"
@@ -20,6 +24,68 @@ func writeIndex(t *testing.T, entries []SeriesEntry) []byte {
 		t.Fatalf("unexpected error: %v", err)
 	}
 	return buf.Bytes()
+}
+
+func TestWriterRejectsOversizedLabelBeforeWriting(t *testing.T) {
+	var buf bytes.Buffer
+	w := NewWriter(&buf)
+	w.AddSeries(SeriesEntry{
+		Ref:    1,
+		Labels: []labels.Label{{Name: "name", Value: strings.Repeat("v", 1<<16)}},
+	})
+
+	if _, err := w.WriteTo(); !errors.Is(err, labels.ErrLabelTooLong) {
+		t.Fatalf("write error: got %v, want %v", err, labels.ErrLabelTooLong)
+	}
+	if buf.Len() != 0 {
+		t.Fatalf("wrote %d bytes before rejecting oversized label", buf.Len())
+	}
+}
+
+func TestWriterLabelCountLimit(t *testing.T) {
+	tests := []struct {
+		name    string
+		count   int
+		wantErr error
+	}{
+		{name: "65535", count: 1<<16 - 1},
+		{name: "65536", count: 1 << 16, wantErr: labels.ErrTooManyLabels},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			ls := make([]labels.Label, tc.count)
+			for i := range ls {
+				ls[i].Name = fmt.Sprintf("label_%05d", i)
+			}
+
+			var buf bytes.Buffer
+			w := NewWriter(&buf)
+			w.AddSeries(SeriesEntry{Ref: 1, Labels: ls})
+			n, err := w.WriteTo()
+			if !errors.Is(err, tc.wantErr) {
+				t.Fatalf("write error: got %v, want %v", err, tc.wantErr)
+			}
+			if tc.wantErr != nil {
+				if n != 0 || buf.Len() != 0 {
+					t.Fatalf("wrote %d bytes before rejecting %d labels", buf.Len(), tc.count)
+				}
+				return
+			}
+
+			r, err := NewReader(buf.Bytes())
+			if err != nil {
+				t.Fatalf("read index: %v", err)
+			}
+			entries := r.Series()
+			if len(entries) != 1 {
+				t.Fatalf("series count after read: got %d, want 1", len(entries))
+			}
+			if len(entries[0].Labels) != tc.count {
+				t.Fatalf("label count after read: got %d, want %d", len(entries[0].Labels), tc.count)
+			}
+		})
+	}
 }
 
 func TestIndexRoundTrip(t *testing.T) {
@@ -304,6 +370,140 @@ func TestIndexCorruptData(t *testing.T) {
 			_, err := NewReader(tc.data)
 			if err != tc.wantErr {
 				t.Errorf("got %v, want %v", err, tc.wantErr)
+			}
+		})
+	}
+}
+
+func TestIndexRejectsInvalidRefsAndPostings(t *testing.T) {
+	baseEntries := []SeriesEntry{
+		{Ref: 1, Labels: labels.FromStrings("__name__", "a")},
+		{Ref: 2, Labels: labels.FromStrings("__name__", "b")},
+	}
+	tests := []struct {
+		name      string
+		data      func() []byte
+		wantMatch string
+	}{
+		{
+			name: "zero_series_ref",
+			data: func() []byte {
+				return writeIndex(t, []SeriesEntry{{Ref: 0, Labels: labels.FromStrings("__name__", "a")}})
+			},
+			wantMatch: "invalid series ref 0",
+		},
+		{
+			name: "duplicate_series_ref",
+			data: func() []byte {
+				return writeIndex(t, []SeriesEntry{
+					{Ref: 1, Labels: labels.FromStrings("__name__", "a")},
+					{Ref: 1, Labels: labels.FromStrings("__name__", "b")},
+				})
+			},
+			wantMatch: "duplicate series ref 1",
+		},
+		{
+			name: "postings_missing_series",
+			data: func() []byte {
+				data := writeIndex(t, baseEntries)
+				binary.BigEndian.PutUint64(data[firstPostingRefOffset(data):], 999)
+				return data
+			},
+			wantMatch: "reference missing series 999",
+		},
+		{
+			name: "postings_wrong_series",
+			data: func() []byte {
+				data := writeIndex(t, baseEntries)
+				binary.BigEndian.PutUint64(data[firstPostingRefOffset(data):], 2)
+				return data
+			},
+			wantMatch: "reference wrong series 2",
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			_, err := NewReader(tc.data())
+			if !errors.Is(err, ErrCorruptIndex) || !strings.Contains(err.Error(), tc.wantMatch) {
+				t.Fatalf("got %v, want ErrCorruptIndex containing %q", err, tc.wantMatch)
+			}
+		})
+	}
+}
+
+func firstPostingRefOffset(data []byte) int {
+	toc := data[len(data)-tocLen:]
+	postingsOffset := int(binary.BigEndian.Uint64(toc[16:24]))
+	return postingsOffset + 4 + 12
+}
+
+func TestIndexRejectsStructurallyImpossibleCounts(t *testing.T) {
+	newData := func() []byte {
+		return writeIndex(t, []SeriesEntry{{
+			Ref:    1,
+			Labels: labels.FromStrings("__name__", "a"),
+			Chunks: []ChunkMeta{{MinT: 1, MaxT: 2, Ref: NewChunkRef(1, 5)}},
+		}})
+	}
+	tests := []struct {
+		name   string
+		mutate func([]byte)
+	}{
+		{
+			name: "symbols",
+			mutate: func(data []byte) {
+				binary.BigEndian.PutUint32(data[headerLen:], ^uint32(0))
+			},
+		},
+		{
+			name: "series",
+			mutate: func(data []byte) {
+				toc := data[len(data)-tocLen:]
+				off := int(binary.BigEndian.Uint64(toc[8:16]))
+				binary.BigEndian.PutUint32(data[off:], ^uint32(0))
+			},
+		},
+		{
+			name: "labels",
+			mutate: func(data []byte) {
+				toc := data[len(data)-tocLen:]
+				off := int(binary.BigEndian.Uint64(toc[8:16])) + 4 + 8
+				binary.BigEndian.PutUint16(data[off:], ^uint16(0))
+			},
+		},
+		{
+			name: "chunks",
+			mutate: func(data []byte) {
+				toc := data[len(data)-tocLen:]
+				off := int(binary.BigEndian.Uint64(toc[8:16])) + 4 + 8 + 2 + 8
+				binary.BigEndian.PutUint32(data[off:], ^uint32(0))
+			},
+		},
+		{
+			name: "postings",
+			mutate: func(data []byte) {
+				toc := data[len(data)-tocLen:]
+				off := int(binary.BigEndian.Uint64(toc[16:24]))
+				binary.BigEndian.PutUint32(data[off:], ^uint32(0))
+			},
+		},
+		{
+			name: "posting_refs",
+			mutate: func(data []byte) {
+				toc := data[len(data)-tocLen:]
+				off := int(binary.BigEndian.Uint64(toc[16:24])) + 4 + 8
+				binary.BigEndian.PutUint32(data[off:], ^uint32(0))
+			},
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			data := newData()
+			tc.mutate(data)
+			if _, err := NewReader(data); !errors.Is(err, ErrCorruptIndex) {
+				t.Fatalf("got %v, want ErrCorruptIndex", err)
 			}
 		})
 	}

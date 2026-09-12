@@ -12,7 +12,7 @@ Target users:
 ## 2. Goals
 - Single-import Go library. `ingot.Open(dir)`
 - Compression competitive with Prometheus TSDB (~1.4 bytes/sample on regular metric data, per the Gorilla paper).
-- Crash safety: `kill -9` at any point loses at most the samples not yet committed. Never corrupts the store.
+- Crash safety: with the default `SyncOnCommit` policy, `kill -9` loses at most the samples not yet committed. Never corrupts the store. `SyncPeriodic` trades that guarantee for throughput.
 - Bounded resources: flat memory under steady ingest, disk bounded by retention policy.
 - Query by label matchers over a time range, merged transparently across memory and disk.
 - Readable codebase. This is also a reference implementation; clarity beats cleverness where they conflict.
@@ -42,7 +42,7 @@ db, err := ingot.Open("./data", ingot.Options{
     BlockDuration: 2 * time.Hour,
 })
 
-// Write path — Appender is a lightweight batch, Commit makes it durable.
+// Write path — Appender is a lightweight batch. The default policy makes Commit durable.
 app := db.Appender()
 ref, err := app.Append(0, labels.FromStrings("__name__", "temp", "room", "office"), ts, 71.3)
 _, err = app.Append(ref, nil, ts+15000, 71.4) // ref fast-path skips label hashing
@@ -101,17 +101,18 @@ ingot/              public API: Open, Options, Appender, Querier
 ## 6. Write path
 1. `Append` resolves labels->series ref (hash lookup; creates series + WAL series record on miss).
 2. Sample buffered in the Appender.
-3. `Commit`: a. Encode samples into a WAL record, append, and (per sync policy) fsync. b. Apply samples to head: append to each series' active chunk.
+3. `Commit`: a. Encode samples into a WAL record and append it. b. With the default policy, fsync the WAL. c. Apply samples to the head only after the configured durability step succeeds.
 4. When a series' active chunk hits ~120 samples (Gorilla's sweet spot) it's sealed and a new one starts.
 
 ### Durability policy
-Default fsync on segment rotation plus a periodic (~1s) background sync, with `Options.SyncEvery` for stricter needs. Fsync-per-commit is available but documented as a throughput cliff. The window of loss is stated plainly in the README.md rather than hidden.
+The zero-value `Options{}` uses `SyncOnCommit`: each successful `Appender.Commit` has fsynced its WAL records before changing the in-memory head or returning. `SyncPeriodic` is an explicit throughput-oriented alternative controlled by `Options.SyncInterval`, which defaults to one second. It can lose successful commits made after the last fsync if the process or machine crashes. A write, short write, rotation, fsync, or directory-sync failure poisons the WAL. No later commit can succeed, and `Close` returns the original failure. This rule also applies to background fsync errors.
 
 ### WAL format
 - Segments of fixed max size (default 128 MiB), numbered files.
-- Records: `type(1) | len(4) | payload | crc32(4)`. Types include normal `series` and `samples` records plus checkpoint begin, series, samples, and commit records.
-- Replay on `Open`: scan segments in order, stop at first CRC failure or truncated record, truncate the tail there. Everything before the corruption point is recovered.
-- Truncation: a head cutoff prepares and fsyncs block data, writes and fsyncs a checkpoint containing the remaining live head, atomically publishes `meta.json`, records checkpoint activation, then deletes pre-checkpoint WAL segments. Recovery ignores an unactivated checkpoint whose block was not published, so a crash on either side of publication retains a complete copy. Ordering is invariant: block data fsync -> checkpoint fsync -> meta.json publication -> activation fsync -> WAL truncate. Never reordered.
+- Records: `type(1) | len(4) | payload | crc32(4)`. Types include normal `series` and `samples` records plus checkpoint begin, series, samples, commit, and activation records.
+- Replay on `Open`: scan segments in order. A CRC mismatch in any segment fails startup without modifying WAL files. An incomplete record in a non-final segment also fails. Only an incomplete record at the physical end of the final segment is treated as an interrupted append and truncated to its last valid boundary.
+- Final-tail limit: the WAL has no persisted durable-offset watermark. An external truncation through a previously durable final record is indistinguishable from an interrupted append and may lose that record during recovery. External WAL mutation is unsupported. CRC corruption, including corruption before later valid records, remains distinguishable and always fails without mutation.
+- Truncation: a head cutoff prepares and fsyncs block data, writes and fsyncs a checkpoint containing the remaining live head, atomically publishes `meta.json`, validates the published source block, records checkpoint activation, then deletes pre-checkpoint WAL segments. Recovery ignores an unactivated checkpoint whose block was not published, so a crash on either side of publication retains a complete copy. An activated checkpoint remains valid if compaction or retention removed its whole source block. If the source directory still exists, recovery validates the block before accepting the checkpoint and deleting the old WAL. Ordering is invariant: block data fsync -> checkpoint fsync -> meta.json publication -> source validation -> activation fsync -> WAL truncate. Never reordered.
 
 ## 7. Chunk Encoding
 Gorilla (Facebook, VLDB 2015), same scheme Prometheus uses:
@@ -136,6 +137,8 @@ data/
 
 - Every file opens with a magic number and a format version byte. Version 1 readers reject version 2 files loudly instead of misparsing them. Committed now because disk-format migration after users exist is misery.
 - Blocks are immutable after the meta.json write. Readers mmap chunk files and the index; the page cace is the caching strategy.
+- Block open and `ingotctl fsck` validate version 1 metadata, index relationships, chunk entry boundaries and CRCs, decoded sample bounds, ordering, and summary stats. This adds no fields or checksums, so the on-disk version remains 1 and valid existing version 1 blocks need no migration.
+- Version 1 writers before block integrity validation stored `MaxTime: 0` when every sample timestamp was negative. Readers accept only that exact decoded mismatch and normalize `MaxTime` in memory; other metadata bound mismatches remain invalid.
 
 ### Index file
 Simplified Prometheus index shape:
@@ -150,7 +153,7 @@ Simplifications defended: no postings offset table sparse index (blocks are smal
 ## 9. Read Path
 1. `Querier(mint, maxt)` snapshots the set of overlapping blocks plus the head.
 2. `Select(matchers...)` resolves each matcher to a postings list (equality = direct lookup; regex = scan matching values), intersects/unions them.
-3. Per-series iterator merges chunks across head and blocks in time order; exact-duplicate timestamps dedupe to the block value (blocks are the durable record).
+3. Per-series iterators merge chunks, blocks, and head data in time order. At an exact-duplicate timestamp, a block value wins over the head because blocks are the durable record. Conflicting values in separate blocks have a deterministic winner for the current block set (`MinTime`, then ULID), but that winner is not stable across compaction: replacing several blocks changes both the replacement's global time range and its identity. Applications must not rely on precedence between conflicting blocks.
 4. Correctness oracle: tests compare every query result against a naive `[]sample` in-memory reference implementation fed the same appends. The merge across the head/block boundary is where the bugs live.
 
 Block reaping while a Querier holds references is handled by refcounting block readers; the compactor deletes directories only at refcount zero.
@@ -164,13 +167,13 @@ Block reaping while a Querier holds references is handled by refcounting block r
 ## 11. Resource Bounds
 - Memory: head holds <= BlockDuration of data. 10k series x 120-sample active chunk + sealed head chunks ~= tens of MB. Label interning keeps series overhead down.
 - Disk: retention-bound. Worst-case ~2x steady state traniently during compaction (sources + destination coexist).
-- Goroutines: exactly two background: WAL syncer, compactor. No pools, no surprises.
+- Goroutines: the compactor plus an optional WAL syncer when `SyncPeriodic` is selected.
 
 ## 12. Testing Strategy
 
 - chunkenc: Property round-trips (rapid), fuzzing the decoder, adversarial cases: NaN, +- Inf, single sample, counter resets, max deltas
-- wal: Torn-write harness: truncate segments at every byte offset, assert recovery to last valid record
-- head: Race detector on concurrent append/query; `kill -9` simulation via process-level test
+- wal: Torn-write harness appends every incomplete prefix after acknowledged records; corruption tests assert that CRC damage never mutates the WAL and damaged closed segments retain all later segments
+- head: Race detector on concurrent append/query; checkpoint crash-boundary tests cover publication, activation, missing source blocks, and corrupt source blocks
 - query: Oracle comparison against naive reference implementation, boundary emphasis on head/block seam
 - system: Soak: 10k series @15s interval, 48h via fake clock - assert flat RSS, bounded disk, zero errors
 - benchmarks: ns/append, bytes/sample, query latency; tracked in-repo, regressions fail CI

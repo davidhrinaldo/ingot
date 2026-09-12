@@ -1,6 +1,7 @@
 package main
 
 import (
+	"encoding/json"
 	"os"
 	"path/filepath"
 	"strings"
@@ -11,7 +12,10 @@ import (
 	"github.com/davidhrinaldo/ingot/labels"
 )
 
-func makeChunk(t *testing.T, samples []struct{ t int64; v float64 }) []byte {
+func makeChunk(t *testing.T, samples []struct {
+	t int64
+	v float64
+}) []byte {
 	t.Helper()
 	c := chunkenc.NewXORChunk()
 	a, err := c.Appender()
@@ -28,7 +32,10 @@ func setupTestData(t *testing.T) string {
 	t.Helper()
 	dir := t.TempDir()
 
-	samples := []struct{ t int64; v float64 }{
+	samples := []struct {
+		t int64
+		v float64
+	}{
 		{0, 1.0}, {15000, 2.0}, {30000, 3.0},
 	}
 	chunk := makeChunk(t, samples)
@@ -292,6 +299,32 @@ func TestCmdFsck(t *testing.T) {
 				t.Errorf("got %q, want substring %q", errString(err), tc.wantErr)
 			}
 		})
+	}
+}
+
+func TestCmdFsckRejectsSemanticCorruption(t *testing.T) {
+	dataDir := setupTestData(t)
+	blockDir := blockDir(t, dataDir)
+	meta, err := block.ReadMeta(blockDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	meta.MaxTime++
+	data, err := json.MarshalIndent(meta, "", "  ")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(blockDir, "meta.json"), data, 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	var cmdErr error
+	output := captureStdout(func() { cmdErr = cmdFsck([]string{dataDir}) })
+	if cmdErr == nil {
+		t.Fatal("fsck accepted corrupt metadata")
+	}
+	if !strings.Contains(output, "do not match decoded samples") {
+		t.Fatalf("got %q, want decoded bounds error", output)
 	}
 }
 
