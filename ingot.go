@@ -147,20 +147,22 @@ func (db *DB) Appender() *Appender {
 
 // Querier returns a Querier over [mint, maxt].
 func (db *DB) Querier(mint, maxt int64) (*Querier, error) {
-	db.mu.RLock()
 	var overlapping []*block.Reader
-	for _, b := range db.blocks {
-		if b.Meta.MaxTime >= mint && b.Meta.MinTime <= maxt {
-			b.Ref()
-			overlapping = append(overlapping, b)
+	headSnapshot := db.head.Snapshot(func() {
+		db.mu.RLock()
+		defer db.mu.RUnlock()
+		for _, b := range db.blocks {
+			if b.Meta.MaxTime >= mint && b.Meta.MinTime <= maxt {
+				b.Ref()
+				overlapping = append(overlapping, b)
+			}
 		}
-	}
-	db.mu.RUnlock()
+	})
 
 	return &Querier{
 		mint:   mint,
 		maxt:   maxt,
-		head:   db.head,
+		head:   headSnapshot,
 		blocks: overlapping,
 	}, nil
 }
@@ -376,7 +378,7 @@ func (a *Appender) Rollback() error {
 // Querier queries the DB over a time range.
 type Querier struct {
 	mint, maxt int64
-	head       *head.Head
+	head       *head.Snapshot
 	blocks     []*block.Reader
 }
 
@@ -481,7 +483,7 @@ func resolveBlockPostings(b *block.Reader, matchers []*labels.Matcher) []uint64 
 	return postings.Intersect(lists...)
 }
 
-func resolveHeadPostings(h *head.Head, matchers []*labels.Matcher) []uint64 {
+func resolveHeadPostings(h *head.Snapshot, matchers []*labels.Matcher) []uint64 {
 	if len(matchers) == 0 {
 		return h.AllPostings()
 	}

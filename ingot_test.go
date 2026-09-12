@@ -531,6 +531,131 @@ func TestQueryOracle(t *testing.T) {
 	}
 }
 
+func TestQuerierSnapshotsHeadAcrossFlush(t *testing.T) {
+	tests := []struct {
+		name         string
+		selectBefore bool
+	}{
+		{name: "select_and_iterator_after_flush"},
+		{name: "iterator_after_flush", selectBefore: true},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			db := openTestDB(t)
+			app := db.Appender()
+			ref, err := app.Append(0, labels.FromStrings("__name__", "temp"), 0, 0)
+			if err != nil {
+				t.Fatalf("append first sample: %v", err)
+			}
+			for i := 1; i < 250; i++ {
+				if _, err := app.Append(ref, nil, int64(i), float64(i)); err != nil {
+					t.Fatalf("append sample %d: %v", i, err)
+				}
+			}
+			if err := app.Commit(); err != nil {
+				t.Fatalf("commit: %v", err)
+			}
+
+			q, err := db.Querier(math.MinInt64, math.MaxInt64)
+			if err != nil {
+				t.Fatalf("create querier: %v", err)
+			}
+			defer q.Close()
+
+			var ss SeriesSet
+			if tc.selectBefore {
+				ss = q.Select(labels.MustNewMatcher(labels.MatchEqual, "__name__", "temp"))
+			}
+			if _, err := db.FlushOlderThan(math.MaxInt64); err != nil {
+				t.Fatalf("flush: %v", err)
+			}
+			if !tc.selectBefore {
+				ss = q.Select(labels.MustNewMatcher(labels.MatchEqual, "__name__", "temp"))
+			}
+
+			if !ss.Next() {
+				t.Fatalf("missing series after flush: %v", ss.Err())
+			}
+			it := ss.At().Iterator()
+			for i := 0; i < 250; i++ {
+				if !it.Next() {
+					t.Fatalf("sample count: got %d, want 250: %v", i, it.Err())
+				}
+				gotT, gotV := it.At()
+				if gotT != int64(i) || gotV != float64(i) {
+					t.Fatalf("sample %d: got (%d, %v), want (%d, %d)", i, gotT, gotV, i, i)
+				}
+			}
+			if it.Next() {
+				t.Fatal("iterator returned more than 250 samples")
+			}
+			if err := it.Err(); err != nil {
+				t.Fatalf("iterate: %v", err)
+			}
+			if ss.Next() {
+				t.Fatal("series set returned more than one series")
+			}
+			if err := ss.Err(); err != nil {
+				t.Fatalf("select: %v", err)
+			}
+		})
+	}
+}
+
+func TestQuerierExcludesCommitsAfterCreation(t *testing.T) {
+	db := openTestDB(t)
+	app := db.Appender()
+	ref, err := app.Append(0, labels.FromStrings("__name__", "temp", "room", "office"), 1, 1)
+	if err != nil {
+		t.Fatalf("append initial sample: %v", err)
+	}
+	if err := app.Commit(); err != nil {
+		t.Fatalf("commit initial sample: %v", err)
+	}
+
+	q, err := db.Querier(math.MinInt64, math.MaxInt64)
+	if err != nil {
+		t.Fatalf("create querier: %v", err)
+	}
+	defer q.Close()
+
+	app = db.Appender()
+	if _, err := app.Append(ref, nil, 2, 2); err != nil {
+		t.Fatalf("append to existing series: %v", err)
+	}
+	if _, err := app.Append(0, labels.FromStrings("__name__", "temp", "room", "kitchen"), 1, 10); err != nil {
+		t.Fatalf("append new series: %v", err)
+	}
+	if err := app.Commit(); err != nil {
+		t.Fatalf("commit later samples: %v", err)
+	}
+
+	ss := q.Select(labels.MustNewMatcher(labels.MatchEqual, "__name__", "temp"))
+	if !ss.Next() {
+		t.Fatalf("missing snapshot series: %v", ss.Err())
+	}
+	it := ss.At().Iterator()
+	if !it.Next() {
+		t.Fatalf("missing snapshot sample: %v", it.Err())
+	}
+	if gotT, gotV := it.At(); gotT != 1 || gotV != 1 {
+		t.Fatalf("snapshot sample: got (%d, %v), want (1, 1)", gotT, gotV)
+	}
+	if it.Next() {
+		t.Fatal("post-creation sample leaked into querier")
+	}
+	if err := it.Err(); err != nil {
+		t.Fatalf("iterate: %v", err)
+	}
+	if ss.Next() {
+		t.Fatal("post-creation series leaked into querier")
+	}
+	if err := ss.Err(); err != nil {
+		t.Fatalf("select: %v", err)
+	}
+}
+
 type queryCase struct {
 	name     string
 	mint     int64
