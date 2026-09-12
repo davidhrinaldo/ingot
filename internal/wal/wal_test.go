@@ -35,7 +35,7 @@ func collectRecords(t *testing.T, dir string) []Record {
 
 func TestLogSeriesRejectsOversizedBatchBeforeWriting(t *testing.T) {
 	dir := filepath.Join(t.TempDir(), "wal")
-	w, err := Open(dir, Options{SyncInterval: -1})
+	w, err := Open(dir, Options{})
 	if err != nil {
 		t.Fatalf("open WAL: %v", err)
 	}
