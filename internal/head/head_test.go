@@ -606,22 +606,22 @@ func TestFlushOlderThan(t *testing.T) {
 		wantULID        bool // whether flush produces a block
 		wantBlockSeries int  // number of series in the block (0 if no block)
 		wantBlockCount  int  // samples in the block (0 if no block)
-		wantHeadCount   int  // minimum samples remaining in head after flush
+		wantHeadCount   int  // samples remaining in head after flush
 	}{
 		{
-			name:            "flush_sealed_chunks",
+			name:            "flush_sealed_and_active_chunks",
 			numSamples:      250,
 			flushMaxT:       math.MaxInt64,
 			postFlushAppend: 0,
 			wantULID:        true,
 			wantBlockSeries: 1,
-			wantBlockCount:  240,
-			wantHeadCount:   10,
+			wantBlockCount:  250,
+			wantHeadCount:   0,
 		},
 		{
-			name:            "nothing_to_flush",
+			name:            "active_chunk_crosses_cutoff",
 			numSamples:      50,
-			flushMaxT:       math.MaxInt64,
+			flushMaxT:       25 * 15000,
 			postFlushAppend: 0,
 			wantULID:        false,
 			wantBlockSeries: 0,
@@ -636,7 +636,7 @@ func TestFlushOlderThan(t *testing.T) {
 			wantULID:        true,
 			wantBlockSeries: 1,
 			wantBlockCount:  120,
-			wantHeadCount:   10,
+			wantHeadCount:   130,
 		},
 		{
 			name:            "flush_then_continue_appending",
@@ -645,8 +645,35 @@ func TestFlushOlderThan(t *testing.T) {
 			postFlushAppend: 10,
 			wantULID:        true,
 			wantBlockSeries: 1,
-			wantBlockCount:  240,
+			wantBlockCount:  250,
 			wantHeadCount:   10,
+		},
+		{
+			name:            "one_old_sample",
+			numSamples:      1,
+			flushMaxT:       math.MaxInt64,
+			wantULID:        true,
+			wantBlockSeries: 1,
+			wantBlockCount:  1,
+			wantHeadCount:   0,
+		},
+		{
+			name:            "119_old_samples",
+			numSamples:      119,
+			flushMaxT:       math.MaxInt64,
+			wantULID:        true,
+			wantBlockSeries: 1,
+			wantBlockCount:  119,
+			wantHeadCount:   0,
+		},
+		{
+			name:            "120_old_samples",
+			numSamples:      120,
+			flushMaxT:       math.MaxInt64,
+			wantULID:        true,
+			wantBlockSeries: 1,
+			wantBlockCount:  120,
+			wantHeadCount:   0,
 		},
 	}
 
@@ -721,12 +748,183 @@ func TestFlushOlderThan(t *testing.T) {
 				t.Errorf("block sample count: got %v, want %v", blockCount, tc.wantBlockCount)
 			}
 
-			// Assert head still has data.
+			// Assert the exact head remainder.
 			headSamples := collectSamples(t, h, ref, math.MinInt64, math.MaxInt64)
-			if len(headSamples) < tc.wantHeadCount {
-				t.Errorf("head sample count: got %v, want >= %v", len(headSamples), tc.wantHeadCount)
+			if len(headSamples) != tc.wantHeadCount {
+				t.Errorf("head sample count: got %v, want %v", len(headSamples), tc.wantHeadCount)
 			}
 		})
+	}
+}
+
+func TestSparseFlushCheckpointRecovery(t *testing.T) {
+	dir := t.TempDir()
+	walDir := filepath.Join(dir, "wal")
+	h, err := Open(walDir, wal.Options{SyncInterval: -1})
+	if err != nil {
+		t.Fatalf("open head: %v", err)
+	}
+
+	app := h.Appender()
+	ref, err := app.Append(0, []labels.Label{{Name: "__name__", Value: "sparse"}}, 1, 1)
+	if err != nil {
+		t.Fatalf("append first sample: %v", err)
+	}
+	for i := 2; i <= 119; i++ {
+		if _, err := app.Append(ref, nil, int64(i), float64(i)); err != nil {
+			t.Fatalf("append sample %d: %v", i, err)
+		}
+	}
+	if err := app.Commit(); err != nil {
+		t.Fatalf("commit: %v", err)
+	}
+	ulid, err := h.FlushOlderThan(119)
+	if err != nil {
+		t.Fatalf("flush: %v", err)
+	}
+	if ulid == "" {
+		t.Fatal("flush did not create a block")
+	}
+	if got := len(collectSamples(t, h, ref, math.MinInt64, math.MaxInt64)); got != 0 {
+		t.Fatalf("head samples after flush: got %d, want 0", got)
+	}
+	if err := h.Close(); err != nil {
+		t.Fatalf("close head: %v", err)
+	}
+
+	h, err = Open(walDir, wal.Options{SyncInterval: -1})
+	if err != nil {
+		t.Fatalf("reopen head: %v", err)
+	}
+	defer h.Close()
+	if got := len(collectSamples(t, h, ref, math.MinInt64, math.MaxInt64)); got != 0 {
+		t.Fatalf("replayed head samples: got %d, want 0", got)
+	}
+
+	app = h.Appender()
+	if _, err := app.Append(ref, nil, 119, 120); err != ErrOutOfOrder {
+		t.Fatalf("append at flushed frontier: got %v, want %v", err, ErrOutOfOrder)
+	}
+	if _, err := app.Append(ref, nil, 120, 120); err != nil {
+		t.Fatalf("append after flushed frontier: %v", err)
+	}
+	if err := app.Commit(); err != nil {
+		t.Fatalf("commit after restart: %v", err)
+	}
+	if got := collectSamples(t, h, ref, math.MinInt64, math.MaxInt64); !reflect.DeepEqual(got, []sample{s(120, 120)}) {
+		t.Fatalf("head samples after restart append: got %v, want %v", got, []sample{s(120, 120)})
+	}
+}
+
+func TestActiveChunkWaitsForCompleteCutoff(t *testing.T) {
+	h := openHead(t)
+	app := h.Appender()
+	ref, err := app.Append(0, []labels.Label{{Name: "__name__", Value: "partial"}}, 0, 0)
+	if err != nil {
+		t.Fatalf("append first sample: %v", err)
+	}
+	for i := 1; i < 119; i++ {
+		if _, err := app.Append(ref, nil, int64(i), float64(i)); err != nil {
+			t.Fatalf("append sample %d: %v", i, err)
+		}
+	}
+	if err := app.Commit(); err != nil {
+		t.Fatalf("commit: %v", err)
+	}
+
+	ulid, err := h.FlushOlderThan(60)
+	if err != nil {
+		t.Fatalf("partial flush: %v", err)
+	}
+	if ulid != "" {
+		t.Fatalf("partial flush created block %s", ulid)
+	}
+	if got := len(collectSamples(t, h, ref, math.MinInt64, math.MaxInt64)); got != 119 {
+		t.Fatalf("head samples after partial flush: got %d, want 119", got)
+	}
+
+	ulid, err = h.FlushOlderThan(118)
+	if err != nil {
+		t.Fatalf("complete flush: %v", err)
+	}
+	if ulid == "" {
+		t.Fatal("complete flush did not create a block")
+	}
+	br, err := block.Open(filepath.Join(h.DataDir(), ulid))
+	if err != nil {
+		t.Fatalf("open block: %v", err)
+	}
+	defer br.Close()
+	if br.Meta.Stats.NumSamples != 119 {
+		t.Fatalf("block samples: got %d, want 119", br.Meta.Stats.NumSamples)
+	}
+	if got := len(collectSamples(t, h, ref, math.MinInt64, math.MaxInt64)); got != 0 {
+		t.Fatalf("head samples after complete flush: got %d, want 0", got)
+	}
+}
+
+func TestFlushRecomputesHeadTimeBounds(t *testing.T) {
+	h := openHead(t)
+	app := h.Appender()
+	_, err := app.Append(0, []labels.Label{{Name: "series", Value: "old"}}, 10, 1)
+	if err != nil {
+		t.Fatalf("append old sample: %v", err)
+	}
+	if _, err := app.Append(0, []labels.Label{{Name: "series", Value: "recent"}}, 100, 2); err != nil {
+		t.Fatalf("append recent sample: %v", err)
+	}
+	if err := app.Commit(); err != nil {
+		t.Fatalf("commit: %v", err)
+	}
+
+	if _, err := h.FlushOlderThan(10); err != nil {
+		t.Fatalf("flush old series: %v", err)
+	}
+	if h.MinTime() != 100 || h.MaxTime() != 100 {
+		t.Fatalf("head bounds after partial eviction: got [%d, %d], want [100, 100]", h.MinTime(), h.MaxTime())
+	}
+	if _, err := h.FlushOlderThan(100); err != nil {
+		t.Fatalf("flush recent series: %v", err)
+	}
+	if h.MinTime() != 0 || h.MaxTime() != 0 {
+		t.Fatalf("empty head bounds: got [%d, %d], want [0, 0]", h.MinTime(), h.MaxTime())
+	}
+}
+
+func TestAllNegativeHeadAndBlockTimeBounds(t *testing.T) {
+	h := openHead(t)
+	app := h.Appender()
+	ref, err := app.Append(0, []labels.Label{{Name: "__name__", Value: "negative"}}, -30, 1)
+	if err != nil {
+		t.Fatalf("append first sample: %v", err)
+	}
+	if _, err := app.Append(ref, nil, -20, 2); err != nil {
+		t.Fatalf("append second sample: %v", err)
+	}
+	if _, err := app.Append(ref, nil, -10, 3); err != nil {
+		t.Fatalf("append third sample: %v", err)
+	}
+	if err := app.Commit(); err != nil {
+		t.Fatalf("commit: %v", err)
+	}
+	if h.MinTime() != -30 || h.MaxTime() != -10 {
+		t.Fatalf("negative head bounds: got [%d, %d], want [-30, -10]", h.MinTime(), h.MaxTime())
+	}
+
+	ulid, err := h.FlushOlderThan(-10)
+	if err != nil {
+		t.Fatalf("flush: %v", err)
+	}
+	br, err := block.Open(filepath.Join(h.DataDir(), ulid))
+	if err != nil {
+		t.Fatalf("open block: %v", err)
+	}
+	defer br.Close()
+	if br.Meta.MinTime != -30 || br.Meta.MaxTime != -10 {
+		t.Fatalf("negative block bounds: got [%d, %d], want [-30, -10]", br.Meta.MinTime, br.Meta.MaxTime)
+	}
+	if h.MinTime() != 0 || h.MaxTime() != 0 {
+		t.Fatalf("empty head bounds: got [%d, %d], want [0, 0]", h.MinTime(), h.MaxTime())
 	}
 }
 

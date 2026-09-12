@@ -77,6 +77,26 @@ func TestSeriesRecord(t *testing.T) {
 				Labels: []labels.Label{{Name: "", Value: ""}},
 			}, nil},
 		},
+		{
+			name: "ingestion_frontier",
+			data: EncodeSeriesRecord(nil, SeriesRecord{
+				Ref:     8,
+				Labels:  []labels.Label{{Name: "__name__", Value: "temp"}},
+				LastT:   -5000,
+				HasData: true,
+			}),
+			want: result{SeriesRecord{
+				Ref:     8,
+				Labels:  []labels.Label{{Name: "__name__", Value: "temp"}},
+				LastT:   -5000,
+				HasData: true,
+			}, nil},
+		},
+		{
+			name: "record_without_ingestion_frontier",
+			data: EncodeSeriesRecord(nil, SeriesRecord{Ref: 9}),
+			want: result{SeriesRecord{Ref: 9, Labels: []labels.Label{}}, nil},
+		},
 
 		// Error cases.
 		{

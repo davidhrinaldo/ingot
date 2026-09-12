@@ -1,6 +1,7 @@
 package block
 
 import (
+	"math"
 	"os"
 	"path/filepath"
 
@@ -15,7 +16,7 @@ type ChunkData struct {
 	Data []byte // raw XOR chunk bytes (including 2-byte sample count header)
 }
 
-// SeriesFlush describes a series with its sealed chunks for block writing.
+// SeriesFlush describes a series with its chunks for block writing.
 type SeriesFlush struct {
 	Ref    uint64
 	Labels []labels.Label
@@ -104,8 +105,8 @@ func prepareBlock(dataDir string, series []SeriesFlush, level int, sources []str
 	} else {
 		meta.Compaction.Sources = []string{ulid}
 	}
-	meta.MinTime = int64(^uint64(0) >> 1) // max int64
-	meta.MaxTime = int64(0)
+	meta.MinTime = math.MaxInt64
+	meta.MaxTime = math.MinInt64
 
 	for _, sf := range series {
 		var chunks []index.ChunkMeta

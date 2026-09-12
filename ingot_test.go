@@ -272,7 +272,7 @@ func TestQueryOracle(t *testing.T) {
 					t.Fatalf("unexpected error: %v", err)
 				}
 
-				// Flush sealed chunks to block.
+				// Flush complete chunks to a block.
 				_, err = db.FlushOlderThan(math.MaxInt64)
 				if err != nil {
 					t.Fatalf("unexpected error: %v", err)
@@ -750,6 +750,85 @@ func TestDBLifecycle(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestSparseSeriesAutoFlushAndRetention(t *testing.T) {
+	dir := t.TempDir()
+	now := int64(100 * time.Hour / time.Millisecond)
+	opts := Options{
+		BlockDuration: 2 * time.Hour,
+		Retention:     24 * time.Hour,
+		Clock:         func() int64 { return now },
+	}
+	db, err := Open(dir, opts)
+	if err != nil {
+		t.Fatalf("open DB: %v", err)
+	}
+
+	app := db.Appender()
+	ref, err := app.Append(0, labels.FromStrings("__name__", "sparse"), now-int64(50*time.Hour/time.Millisecond), 1)
+	if err != nil {
+		t.Fatalf("append: %v", err)
+	}
+	if err := app.Commit(); err != nil {
+		t.Fatalf("commit: %v", err)
+	}
+	db.autoFlush()
+	if stats := db.Stats(); stats.Blocks != 1 || stats.HeadChunks != 0 {
+		t.Fatalf("stats after auto-flush: got %+v, want one block and no head chunks", stats)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatalf("close DB: %v", err)
+	}
+
+	db, err = Open(dir, opts)
+	if err != nil {
+		t.Fatalf("reopen DB: %v", err)
+	}
+	defer db.Close()
+	if got := querySampleCount(t, db, labels.MustNewMatcher(labels.MatchEqual, "__name__", "sparse")); got != 1 {
+		t.Fatalf("samples after restart: got %d, want 1", got)
+	}
+
+	app = db.Appender()
+	if _, err := app.Append(ref, nil, now-int64(50*time.Hour/time.Millisecond), 2); err == nil {
+		t.Fatal("append at flushed timestamp succeeded after restart")
+	}
+	if err := app.Rollback(); err != nil {
+		t.Fatalf("rollback rejected append: %v", err)
+	}
+
+	db.ApplyRetention()
+	if got := querySampleCount(t, db, labels.MustNewMatcher(labels.MatchEqual, "__name__", "sparse")); got != 0 {
+		t.Fatalf("samples after retention: got %d, want 0", got)
+	}
+	if stats := db.Stats(); stats.Blocks != 0 || stats.HeadChunks != 0 {
+		t.Fatalf("stats after retention: got %+v, want no blocks or head chunks", stats)
+	}
+}
+
+func querySampleCount(t *testing.T, db *DB, matchers ...*labels.Matcher) int {
+	t.Helper()
+	q, err := db.Querier(math.MinInt64, math.MaxInt64)
+	if err != nil {
+		t.Fatalf("open querier: %v", err)
+	}
+	defer q.Close()
+	ss := q.Select(matchers...)
+	count := 0
+	for ss.Next() {
+		it := ss.At().Iterator()
+		for it.Next() {
+			count++
+		}
+		if err := it.Err(); err != nil {
+			t.Fatalf("iterate samples: %v", err)
+		}
+	}
+	if err := ss.Err(); err != nil {
+		t.Fatalf("iterate series: %v", err)
+	}
+	return count
 }
 
 func TestQueryDuringCompaction(t *testing.T) {

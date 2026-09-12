@@ -10,10 +10,12 @@ import (
 
 var ErrShortPayload = errors.New("wal: payload too short")
 
-// SeriesRecord is a WAL record that registers a new series.
+// SeriesRecord registers a series and optionally preserves its latest timestamp.
 type SeriesRecord struct {
-	Ref    uint64
-	Labels []labels.Label
+	Ref     uint64
+	Labels  []labels.Label
+	LastT   int64
+	HasData bool
 }
 
 // RefSample is a single sample keyed by series ref.
@@ -25,11 +27,15 @@ type RefSample struct {
 
 // EncodeSeriesRecord appends the encoded series record to dst.
 //
-//	ref(8) | nlabels(4) | for each: namelen(2) name valuelen(2) value
+//	ref(8) | nlabels(4) | for each: namelen(2) name valuelen(2) value |
+//	[hasData(1) | lastT(8)]
 func EncodeSeriesRecord(dst []byte, rec SeriesRecord) []byte {
 	n := 8 + 4
 	for _, l := range rec.Labels {
 		n += 2 + len(l.Name) + 2 + len(l.Value)
+	}
+	if rec.HasData {
+		n += 9
 	}
 	dst = grow(dst, n)
 	off := len(dst) - n
@@ -46,6 +52,11 @@ func EncodeSeriesRecord(dst []byte, rec SeriesRecord) []byte {
 		binary.BigEndian.PutUint16(dst[off:], uint16(len(l.Value)))
 		off += 2
 		off += copy(dst[off:], l.Value)
+	}
+	if rec.HasData {
+		dst[off] = 1
+		off++
+		binary.BigEndian.PutUint64(dst[off:], uint64(rec.LastT))
 	}
 
 	return dst
@@ -89,7 +100,16 @@ func DecodeSeriesRecord(data []byte) (SeriesRecord, error) {
 		ls[i] = labels.Label{Name: name, Value: value}
 	}
 
-	return SeriesRecord{Ref: ref, Labels: ls}, nil
+	rec := SeriesRecord{Ref: ref, Labels: ls}
+	if off == len(data) {
+		return rec, nil // Records written before ingestion frontiers were added.
+	}
+	if off+9 > len(data) {
+		return SeriesRecord{}, ErrShortPayload
+	}
+	rec.HasData = data[off] != 0
+	rec.LastT = int64(binary.BigEndian.Uint64(data[off+1:]))
+	return rec, nil
 }
 
 // EncodeSamplesRecord appends the encoded samples record to dst.

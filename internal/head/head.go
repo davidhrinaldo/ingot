@@ -26,7 +26,7 @@ type Head struct {
 
 	minTime atomic.Int64
 	maxTime atomic.Int64
-	minSet  atomic.Bool
+	timeSet atomic.Bool
 }
 
 // Open creates or recovers a Head backed by a WAL in walDir.
@@ -208,7 +208,7 @@ func (h *Head) resetReplayState() {
 	h.nextRef.Store(0)
 	h.minTime.Store(0)
 	h.maxTime.Store(0)
-	h.minSet.Store(false)
+	h.timeSet.Store(false)
 }
 
 func (h *Head) replaySeries(sr wal.SeriesRecord) {
@@ -232,6 +232,8 @@ func (h *Head) replaySeries(sr wal.SeriesRecord) {
 	s := &memSeries{
 		ref:       sr.Ref,
 		labels:    sr.Labels,
+		lastT:     sr.LastT,
+		hasData:   sr.HasData,
 		walLogged: true,
 	}
 	h.series.set(hash, s)
@@ -249,9 +251,14 @@ func (h *Head) applySample(ref uint64, t int64, v float64) {
 	s.mu.Unlock()
 
 	// Update head time bounds.
-	if !h.minSet.Load() || t < h.minTime.Load() {
+	if !h.timeSet.Load() {
 		h.minTime.Store(t)
-		h.minSet.Store(true)
+		h.maxTime.Store(t)
+		h.timeSet.Store(true)
+		return
+	}
+	if t < h.minTime.Load() {
+		h.minTime.Store(t)
 	}
 	if t > h.maxTime.Load() {
 		h.maxTime.Store(t)
@@ -286,8 +293,8 @@ func (h *Head) Close() error {
 	return h.wal.Close()
 }
 
-// FlushOlderThan collects all sealed chunks with maxT <= threshold from all
-// series, writes them to an immutable block, and checkpoints the remaining head.
+// FlushOlderThan collects all chunks with maxT <= threshold from all series,
+// writes them to an immutable block, and checkpoints the remaining head.
 //
 // The ordering invariant is enforced: block data fsync -> WAL checkpoint fsync ->
 // meta.json publication -> WAL truncate.
@@ -328,13 +335,19 @@ func (h *Head) flushOlderThan(maxT int64, install func(string) error) (string, e
 			}
 		}
 		if s.chunk != nil && s.chunk.NumSamples() > 0 {
-			remainingSamples, snapshotErr = appendCheckpointSamples(remainingSamples, s.ref, s.chunk.Iterator())
+			if s.lastT <= maxT {
+				toFlush = append(toFlush, chunkMeta{chunk: s.chunk, minT: s.chunkMinT, maxT: s.lastT})
+			} else {
+				remainingSamples, snapshotErr = appendCheckpointSamples(remainingSamples, s.ref, s.chunk.Iterator())
+			}
 		}
 		if snapshotErr != nil {
 			return
 		}
 		if len(remainingSamples) > 0 || s.walLogged {
-			checkpointSeries = append(checkpointSeries, wal.SeriesRecord{Ref: s.ref, Labels: s.labels})
+			checkpointSeries = append(checkpointSeries, wal.SeriesRecord{
+				Ref: s.ref, Labels: s.labels, LastT: s.lastT, HasData: s.hasData,
+			})
 		}
 		if len(remainingSamples) > 0 {
 			checkpointSamples = append(checkpointSamples, remainingSamples)
@@ -394,13 +407,55 @@ func (h *Head) flushOlderThan(maxT int64, install func(string) error) (string, e
 			}
 		}
 		s.sealed = remaining
+		if s.chunk != nil && s.chunk.NumSamples() > 0 && s.lastT <= maxT {
+			s.chunk = nil
+			s.chunkApp = nil
+			s.chunkMinT = 0
+		}
 		s.mu.Unlock()
 	})
+	h.recomputeTimeBounds()
 	if err := h.wal.Truncate(checkpoint.StartSegment); err != nil {
 		return prepared.ULID, fmt.Errorf("head: truncate WAL: %w", err)
 	}
 
 	return prepared.ULID, nil
+}
+
+func (h *Head) recomputeTimeBounds() {
+	var mint, maxt int64
+	set := false
+	h.series.forEach(func(s *memSeries) {
+		s.mu.Lock()
+		defer s.mu.Unlock()
+		for _, cm := range s.sealed {
+			if !set || cm.minT < mint {
+				mint = cm.minT
+			}
+			if !set || cm.maxT > maxt {
+				maxt = cm.maxT
+			}
+			set = true
+		}
+		if s.chunk != nil && s.chunk.NumSamples() > 0 {
+			if !set || s.chunkMinT < mint {
+				mint = s.chunkMinT
+			}
+			if !set || s.lastT > maxt {
+				maxt = s.lastT
+			}
+			set = true
+		}
+	})
+	if !set {
+		h.minTime.Store(0)
+		h.maxTime.Store(0)
+		h.timeSet.Store(false)
+		return
+	}
+	h.minTime.Store(mint)
+	h.maxTime.Store(maxt)
+	h.timeSet.Store(true)
 }
 
 func appendCheckpointSamples(dst []wal.RefSample, ref uint64, it chunkenc.ChunkIterator) ([]wal.RefSample, error) {
