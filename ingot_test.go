@@ -7,6 +7,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/davidhrinaldo/ingot/internal/wal"
 	"github.com/davidhrinaldo/ingot/labels"
 )
 
@@ -197,6 +198,46 @@ func TestAppenderRejectsAppendAfterClose(t *testing.T) {
 			}
 			if got := db.Stats().HeadSeries; got != 0 {
 				t.Fatalf("registered series after close: got %d, want 0", got)
+func TestSyncPolicyOptions(t *testing.T) {
+	tests := []struct {
+		name         string
+		opts         Options
+		wantPolicy   wal.SyncPolicy
+		wantInterval time.Duration
+		wantErr      bool
+	}{
+		{name: "default_is_sync_on_commit", opts: Options{}, wantPolicy: wal.SyncOnCommit},
+		{
+			name:         "periodic_default_interval",
+			opts:         Options{SyncPolicy: SyncPeriodic},
+			wantPolicy:   wal.SyncPeriodic,
+			wantInterval: time.Second,
+		},
+		{
+			name:         "periodic_custom_interval",
+			opts:         Options{SyncPolicy: SyncPeriodic, SyncInterval: 25 * time.Millisecond},
+			wantPolicy:   wal.SyncPeriodic,
+			wantInterval: 25 * time.Millisecond,
+		},
+		{name: "commit_rejects_interval", opts: Options{SyncInterval: time.Second}, wantErr: true},
+		{name: "periodic_rejects_negative_interval", opts: Options{SyncPolicy: SyncPeriodic, SyncInterval: -1}, wantErr: true},
+		{name: "rejects_unknown_policy", opts: Options{SyncPolicy: SyncPolicy(99)}, wantErr: true},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			got, err := tc.opts.walOptions()
+			if (err != nil) != tc.wantErr {
+				t.Fatalf("wal options error: got %v, want error=%v", err, tc.wantErr)
+			}
+			if tc.wantErr {
+				return
+			}
+			if got.SyncPolicy != tc.wantPolicy {
+				t.Errorf("sync policy: got %v, want %v", got.SyncPolicy, tc.wantPolicy)
+			}
+			if got.SyncInterval != tc.wantInterval {
+				t.Errorf("sync interval: got %v, want %v", got.SyncInterval, tc.wantInterval)
 			}
 		})
 	}

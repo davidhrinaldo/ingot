@@ -150,6 +150,9 @@ func (a *Appender) Commit() error {
 			return err
 		}
 	}
+	if err := a.head.wal.Commit(); err != nil {
+		return err
+	}
 
 	// Apply samples to head.
 	a.head.applyMu.Lock()
