@@ -136,6 +136,7 @@ data/
 
 - Every file opens with a magic number and a format version byte. Version 1 readers reject version 2 files loudly instead of misparsing them. Committed now because disk-format migration after users exist is misery.
 - Blocks are immutable after the meta.json write. Readers mmap chunk files and the index; the page cace is the caching strategy.
+- Block open and `ingotctl fsck` validate version 1 metadata, index relationships, chunk entry boundaries and CRCs, decoded sample bounds, ordering, and summary stats. This adds no fields or checksums, so the on-disk version remains 1 and valid existing version 1 blocks need no migration.
 
 ### Index file
 Simplified Prometheus index shape:

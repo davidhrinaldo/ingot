@@ -29,7 +29,10 @@ type CompactionInfo struct {
 	Sources []string `json:"sources"`
 }
 
-const metaFilename = "meta.json"
+const (
+	metaFilename = "meta.json"
+	metaVersion  = 1
+)
 
 // readMeta reads a block's meta.json from the given block directory.
 func readMeta(dir string) (BlockMeta, error) {

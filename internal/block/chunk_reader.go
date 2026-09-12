@@ -15,15 +15,17 @@ import (
 )
 
 var (
-	ErrInvalidChunkMagic   = errors.New("block: invalid chunk file magic")
-	ErrInvalidChunkVersion = errors.New("block: unsupported chunk file version")
-	ErrCorruptChunk        = errors.New("block: corrupt chunk (CRC mismatch)")
-	ErrChunkNotFound       = errors.New("block: chunk ref out of bounds")
+	ErrInvalidChunkMagic    = errors.New("block: invalid chunk file magic")
+	ErrInvalidChunkVersion  = errors.New("block: unsupported chunk file version")
+	ErrInvalidChunkEncoding = errors.New("block: unsupported chunk encoding")
+	ErrCorruptChunk         = errors.New("block: corrupt chunk (CRC mismatch)")
+	ErrChunkNotFound        = errors.New("block: chunk ref out of bounds")
 )
 
 // chunkReader reads chunk data from mmap'd segment files.
 type chunkReader struct {
 	segments map[int][]byte // segment index -> mmap'd data
+	entries  map[index.ChunkRef]scannedChunk
 }
 
 func newChunkReader(blockDir string) (*chunkReader, error) {
@@ -33,7 +35,10 @@ func newChunkReader(blockDir string) (*chunkReader, error) {
 		return nil, err
 	}
 
-	cr := &chunkReader{segments: make(map[int][]byte)}
+	cr := &chunkReader{
+		segments: make(map[int][]byte),
+		entries:  make(map[index.ChunkRef]scannedChunk),
+	}
 
 	for _, e := range entries {
 		if e.IsDir() {
@@ -49,6 +54,7 @@ func newChunkReader(blockDir string) (*chunkReader, error) {
 			cr.close()
 			return nil, fmt.Errorf("block: mmap segment %s: %w", e.Name(), err)
 		}
+		cr.segments[idx] = data
 
 		// Validate header.
 		if len(data) < chunkHeaderLen {
@@ -64,8 +70,15 @@ func newChunkReader(blockDir string) (*chunkReader, error) {
 			cr.close()
 			return nil, ErrInvalidChunkVersion
 		}
+		parsed, _, errs := scanChunkSegment(data, e.Name(), idx)
+		if len(errs) > 0 {
+			cr.close()
+			return nil, fmt.Errorf("block: %s", errs[0])
+		}
 
-		cr.segments[idx] = data
+		for ref, chunk := range parsed {
+			cr.entries[ref] = chunk
+		}
 	}
 
 	return cr, nil
@@ -75,6 +88,9 @@ func newChunkReader(blockDir string) (*chunkReader, error) {
 func (cr *chunkReader) chunkData(ref index.ChunkRef) ([]byte, error) {
 	seg := int(ref.Segment())
 	off := int(ref.Offset())
+	if _, ok := cr.entries[ref]; !ok {
+		return nil, ErrChunkNotFound
+	}
 
 	data, ok := cr.segments[seg]
 	if !ok {
@@ -87,6 +103,9 @@ func (cr *chunkReader) chunkData(ref index.ChunkRef) ([]byte, error) {
 
 	dataLen := int(binary.BigEndian.Uint32(data[off : off+4]))
 	encoding := data[off+4]
+	if encoding != encodingXOR {
+		return nil, ErrInvalidChunkEncoding
+	}
 	off += chunkEntryHeaderLen
 
 	end := off + dataLen + chunkEntryCRCLen
@@ -123,6 +142,7 @@ func (cr *chunkReader) close() error {
 		syscall.Munmap(data)
 	}
 	cr.segments = nil
+	cr.entries = nil
 	return nil
 }
 

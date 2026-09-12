@@ -6,6 +6,7 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"strings"
 	"testing"
 
 	"github.com/davidhrinaldo/ingot/internal/chunkenc"
@@ -340,6 +341,19 @@ func TestBlockMetaTimeBounds(t *testing.T) {
 			wantMinT: 100,
 			wantMaxT: 900,
 		},
+		{
+			name: "negative_timestamps",
+			series: []SeriesFlush{
+				{Ref: 1, Labels: []labels.Label{{Name: "__name__", Value: "a"}}, Chunks: []ChunkData{{MinT: -500, MaxT: -100, Data: makeChunkFromPairs([]int64{-500, -100}, []float64{1.0, 2.0})}}},
+			},
+			wantMinT: -500,
+			wantMaxT: -100,
+		},
+		{
+			name:     "empty_block",
+			wantMinT: 0,
+			wantMaxT: 0,
+		},
 	}
 
 	for _, tc := range tests {
@@ -384,7 +398,7 @@ func TestBlockCorruption(t *testing.T) {
 	tests := []struct {
 		name        string
 		corruptFunc func(t *testing.T, blockDir string, chunkRef index.ChunkRef)
-		wantErr     error
+		wantErr     string
 	}{
 		{
 			name: "corrupt_chunk_data_byte",
@@ -400,7 +414,7 @@ func TestBlockCorruption(t *testing.T) {
 					t.Fatalf("unexpected error: %v", err)
 				}
 			},
-			wantErr: ErrCorruptChunk,
+			wantErr: "CRC mismatch",
 		},
 		{
 			name: "corrupt_chunk_crc",
@@ -421,7 +435,7 @@ func TestBlockCorruption(t *testing.T) {
 					t.Fatalf("unexpected error: %v", err)
 				}
 			},
-			wantErr: ErrCorruptChunk,
+			wantErr: "CRC mismatch",
 		},
 	}
 
@@ -455,15 +469,9 @@ func TestBlockCorruption(t *testing.T) {
 
 			tc.corruptFunc(t, blockDir, chunkRef)
 
-			r, err = Open(blockDir)
-			if err != nil {
-				t.Fatalf("unexpected error: %v", err)
-			}
-			defer r.Close()
-
-			_, err = r.ChunkIterator(chunkRef)
-			if err != tc.wantErr {
-				t.Errorf("got %v, want %v", err, tc.wantErr)
+			_, err = Open(blockDir)
+			if err == nil || !strings.Contains(err.Error(), tc.wantErr) {
+				t.Errorf("got %v, want error containing %q", err, tc.wantErr)
 			}
 		})
 	}

@@ -1,6 +1,7 @@
 package block
 
 import (
+	"fmt"
 	"os"
 	"path/filepath"
 	"sync/atomic"
@@ -26,6 +27,10 @@ func Open(dir string) (*Reader, error) {
 	if err != nil {
 		return nil, err
 	}
+	blockName := filepath.Base(filepath.Clean(dir))
+	if errs := validateMeta(blockName, meta); len(errs) > 0 {
+		return nil, fmt.Errorf("block: validation failed: %s", errs[0])
+	}
 
 	// Read the index file into memory.
 	indexData, err := os.ReadFile(filepath.Join(dir, "index"))
@@ -40,6 +45,10 @@ func Open(dir string) (*Reader, error) {
 	cr, err := newChunkReader(dir)
 	if err != nil {
 		return nil, err
+	}
+	if errs := validateRelationships(blockName, meta, idx, cr.entries); len(errs) > 0 {
+		cr.close()
+		return nil, fmt.Errorf("block: validation failed: %s", errs[0])
 	}
 
 	r := &Reader{
@@ -181,6 +190,6 @@ func (m *multiIterator) Err() error {
 
 type emptyIterator struct{}
 
-func (e *emptyIterator) Next() bool        { return false }
+func (e *emptyIterator) Next() bool           { return false }
 func (e *emptyIterator) At() (int64, float64) { return 0, 0 }
-func (e *emptyIterator) Err() error        { return nil }
+func (e *emptyIterator) Err() error           { return nil }
