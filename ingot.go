@@ -34,6 +34,9 @@ var defaultLevels = []int64{
 // has started.
 var ErrClosed = errors.New("ingot: database is closing or closed")
 
+// ErrDataDirLocked indicates that another DB owns the data directory.
+var ErrDataDirLocked = errors.New("ingot: data directory is locked")
+
 const retentionTombstoneDir = ".retention"
 
 // DB is an embedded time-series database.
@@ -54,6 +57,7 @@ type DB struct {
 	closeErr       error
 	retentionRetry map[string][]string
 	removeBlockDir func(string) error
+	dirLock        *dataDirLock
 	maintenanceMu  sync.Mutex
 	maintenanceErr error
 
@@ -63,7 +67,11 @@ type DB struct {
 
 // Options configures a DB.
 type Options struct {
-	Retention     time.Duration
+	// Retention controls whole-block expiry. Zero disables retention. Nonzero
+	// values must be at least one millisecond.
+	Retention time.Duration
+	// BlockDuration controls the head flush cutoff. Zero uses two hours.
+	// Nonzero values must be at least one millisecond.
 	BlockDuration time.Duration
 	// Clock returns the current time in milliseconds. Defaults to
 	// time.Now().UnixMilli(). Injected for testing with simulated time.
@@ -126,10 +134,23 @@ func (o *Options) retentionMs() int64 {
 	return o.Retention.Milliseconds()
 }
 
+func (o *Options) validateDurations() error {
+	if o.Retention < 0 || (o.Retention > 0 && o.Retention < time.Millisecond) {
+		return fmt.Errorf("retention must be zero or at least 1ms")
+	}
+	if o.BlockDuration < 0 || (o.BlockDuration > 0 && o.BlockDuration < time.Millisecond) {
+		return fmt.Errorf("block duration must be zero or at least 1ms")
+	}
+	return nil
+}
+
 // Open opens or creates a DB at the given directory.
 func Open(dataDir string, opts Options) (*DB, error) {
 	walOpts, err := opts.walOptions()
 	if err != nil {
+		return nil, fmt.Errorf("ingot: %w", err)
+	}
+	if err := opts.validateDurations(); err != nil {
 		return nil, fmt.Errorf("ingot: %w", err)
 	}
 	if err := os.MkdirAll(dataDir, 0755); err != nil {
@@ -138,11 +159,15 @@ func Open(dataDir string, opts Options) (*DB, error) {
 	if err := syncDirectory(filepath.Dir(dataDir)); err != nil {
 		return nil, fmt.Errorf("ingot: sync data dir parent: %w", err)
 	}
+	dirLock, err := acquireDataDirLock(dataDir)
+	if err != nil {
+		return nil, err
+	}
 
 	walDir := filepath.Join(dataDir, "wal")
 	h, err := head.Open(walDir, walOpts)
 	if err != nil {
-		return nil, fmt.Errorf("ingot: open head: %w", err)
+		return nil, errors.Join(fmt.Errorf("ingot: open head: %w", err), dirLock.Close())
 	}
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -156,14 +181,14 @@ func Open(dataDir string, opts Options) (*DB, error) {
 		closeDone:      make(chan struct{}),
 		retentionRetry: make(map[string][]string),
 		removeBlockDir: removeBlockDirectory,
+		dirLock:        dirLock,
 	}
 
 	db.compactor = compact.New(dataDir, defaultLevels, opts.retentionMs(), opts.clock())
 
 	if err := db.loadBlocks(); err != nil {
 		cancel()
-		h.Close()
-		return nil, fmt.Errorf("ingot: load blocks: %w", err)
+		return nil, errors.Join(fmt.Errorf("ingot: load blocks: %w", err), h.Close(), dirLock.Close())
 	}
 
 	// Start background compaction goroutine.
@@ -657,7 +682,9 @@ func (db *DB) Close() error {
 	db.maintenanceMu.Lock()
 	maintenanceErr := db.maintenanceErr
 	db.maintenanceMu.Unlock()
-	db.closeErr = errors.Join(firstErr, maintenanceErr)
+	lockErr := db.dirLock.Close()
+	db.dirLock = nil
+	db.closeErr = errors.Join(firstErr, maintenanceErr, lockErr)
 	db.closed = true
 	close(db.closeDone)
 	return db.closeErr

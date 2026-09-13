@@ -29,9 +29,20 @@ const (
 )
 
 var (
-	ErrInvalidRecord = errors.New("wal: invalid record")
-	ErrCorruptRecord = errors.New("wal: corrupt record (CRC mismatch)")
+	ErrInvalidRecord     = errors.New("wal: invalid record")
+	ErrCorruptRecord     = errors.New("wal: corrupt record (CRC mismatch)")
+	ErrUnknownRecordType = errors.New("wal: unknown record type")
 )
+
+func isKnownRecordType(typ RecordType) bool {
+	switch typ {
+	case RecordSeries, RecordSamples, RecordCheckpointBegin, RecordCheckpointSeries,
+		RecordCheckpointSamples, RecordCheckpointCommit, RecordCheckpointActivate:
+		return true
+	default:
+		return false
+	}
+}
 
 var castagnoliTable = crc32.MakeTable(crc32.Castagnoli)
 

@@ -209,6 +209,9 @@ func Open(dir string, opts Options) (*WAL, error) {
 // Log writes a framed record to the WAL. The payload is wrapped with
 // the record envelope (type + length + CRC).
 func (w *WAL) Log(typ RecordType, payload []byte) error {
+	if !isKnownRecordType(typ) {
+		return fmt.Errorf("%w: %d", ErrUnknownRecordType, typ)
+	}
 	w.mu.Lock()
 	defer w.mu.Unlock()
 	if err := w.previousFailure(); err != nil {
@@ -448,6 +451,9 @@ func (w *WAL) rotate() error {
 
 // logLocked writes a record while w.mu is held.
 func (w *WAL) logLocked(typ RecordType, payload []byte) error {
+	if !isKnownRecordType(typ) {
+		return fmt.Errorf("%w: %d", ErrUnknownRecordType, typ)
+	}
 	w.buf = EncodeRecord(w.buf[:0], typ, payload)
 	if w.segmentOff+int64(len(w.buf)) > int64(w.opts.segmentMaxSize()) {
 		if err := w.rotate(); err != nil {

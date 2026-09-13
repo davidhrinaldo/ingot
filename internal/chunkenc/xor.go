@@ -49,10 +49,17 @@ func XORIteratorFromBytes(data []byte) ChunkIterator {
 }
 
 func (c *XORChunk) NumSamples() int {
-	return int(binary.BigEndian.Uint16(c.b.bytes()))
+	data := c.b.bytes()
+	if len(data) < 2 {
+		return 0
+	}
+	return int(binary.BigEndian.Uint16(data))
 }
 
 func (c *XORChunk) Appender() (ChunkAppender, error) {
+	if len(c.b.bytes()) < 2 {
+		return nil, ErrShortStream
+	}
 	if c.NumSamples() > 0 {
 		return nil, errors.New("chunkenc: appender on non-empty chunk")
 	}
@@ -190,8 +197,12 @@ func (a *xorAppender) writeVDelta(v float64) {
 // Iterator decodes the chunk. Snapshot semantics: it reads the byte slice
 // as it exists at creation; don't append concurrently.
 func (c *XORChunk) Iterator() ChunkIterator {
+	data := c.b.bytes()
+	if len(data) < 2 {
+		return &xorIterator{err: ErrShortStream}
+	}
 	return &xorIterator{
-		br:    newBReader(c.b.bytes()[2:]),
+		br:    newBReader(data[2:]),
 		total: uint16(c.NumSamples()),
 	}
 }

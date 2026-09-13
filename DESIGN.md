@@ -24,7 +24,7 @@ Explicit and load-bearing. Each of these is a decision, not an omission.
 - PromQL or any query language: v1 ships matchers + range queries. A query language is its own project.
 - Value types beyond float64: Gorilla XOR compression assumes floats. Histograms, strings, exemplars: later or never.
 - Deletes/tombstones: Retention-based expiry only. Tombstones infect every layer (index, compaction, queries) for a feature metric workloads rarely use.
-- Multi-process access: Single writer, single process. No file locking protocol, no shared-memory coordination.
+- Multi-process access: Single writer, single process. `Open` takes an exclusive advisory lock and rejects a second owner; shared access and coordination remain unsupported.
 - Out-of-order writes: Samples must arrive in timestamp order per series (small tolerance window TBD in implementation). OOO ingestion doubles head complexity; Prometheus took years to add it.
 - Windows support: mmap path is POSIX-first. Documented as unsupported, not broken-by-surprise.
 - Backfill/bulk import: Follows from the OOO restriction. Revisit post-v1. It's the most-requested feature this will generate.
@@ -61,6 +61,8 @@ q.Close()
 
 db.Close()
 ```
+
+`Retention: 0` disables retention, and `BlockDuration: 0` uses the two-hour default. Nonzero values for either option must be at least one millisecond.
 
 Everything else lives under `internal/`.
 
@@ -111,6 +113,7 @@ The zero-value `Options{}` uses `SyncOnCommit`: each successful `Appender.Commit
 - Segments of fixed max size (default 128 MiB), numbered files.
 - Records: `type(1) | len(4) | payload | crc32(4)`. Types include normal `series` and `samples` records plus checkpoint begin, series, samples, commit, and activation records.
 - Replay on `Open`: scan segments in order. A CRC mismatch in any segment fails startup without modifying WAL files. An incomplete record in a non-final segment also fails. Only an incomplete record at the physical end of the final segment is treated as an interrupted append and truncated to its last valid boundary.
+- Unknown record types: a complete record with an unsupported type fails startup without modifying the WAL. Current readers accept the `v0.1.1` framing, but downgrade compatibility is not guaranteed after a newer writer creates checkpoint records.
 - Final-tail limit: the WAL has no persisted durable-offset watermark. An external truncation through a previously durable final record is indistinguishable from an interrupted append and may lose that record during recovery. External WAL mutation is unsupported. CRC corruption, including corruption before later valid records, remains distinguishable and always fails without mutation.
 - Truncation: a head cutoff prepares and fsyncs block data, writes and fsyncs a checkpoint containing the remaining live head, atomically publishes `meta.json`, validates the published source block, records checkpoint activation, then deletes pre-checkpoint WAL segments. Recovery ignores an unactivated checkpoint whose block was not published, so a crash on either side of publication retains a complete copy. An activated checkpoint remains valid if compaction or retention removed its whole source block. If the source directory still exists, recovery validates the block before accepting the checkpoint and deleting the old WAL. Ordering is invariant: block data fsync -> checkpoint fsync -> meta.json publication -> source validation -> activation fsync -> WAL truncate. Never reordered.
 
@@ -120,12 +123,13 @@ Gorilla (Facebook, VLDB 2015), same scheme Prometheus uses:
 - Values: XOR against the previous value. Identical value = one bit. Similar values share exponent/mantissa prefixes, so the XOR has long leading/trailing zero runs; encode meaningful bits only.
 - Target: <= 1.5 bytes/sample on realistic sensor data (the paper's 1.37 is the benchmark to cite, not necessarily to beat).
 
-`chunkenc` is pure functions over byte slices - no I/O, no clocks - which makes it property-testable and fuzzable in isolation. The decoder must be total: any byte input returns data or an error, never a panic. `go test -fuzz` gates every release of this package.
+`chunkenc` is pure functions over byte slices - no I/O, no clocks - which makes it property-testable and fuzzable in isolation. The decoder is total: any byte input returns data or a decoding error, never a panic. Fuzz targets are available for manual and automated runs.
 
 ## 8. On-Disk Format
 
 ### Block directory
 data/
+    lock            persistent advisory-lock file
     wal\
         00000001
         00000002

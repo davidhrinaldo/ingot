@@ -76,14 +76,16 @@ func (r *Reader) Next() bool {
 			return false
 		}
 
-		// Validate CRC over header + payload.
-		full := append(header, body[:payloadLen]...)
+		// Validate the frame before interpreting its type.
 		_, _, _, decErr := DecodeRecord(r.reassemble(header, body, payloadLen))
 		if decErr != nil {
 			r.err = decErr
 			return false
 		}
-		_ = full // replaced by reassemble
+		if !isKnownRecordType(typ) {
+			r.err = fmt.Errorf("%w: %d", ErrUnknownRecordType, typ)
+			return false
+		}
 
 		r.rec = Record{Type: typ, Data: cloneBytes(body[:payloadLen])}
 		return true
@@ -211,11 +213,14 @@ func recoverSegment(dir string, index int, repairTail bool) (bool, error) {
 	off := 0
 	var recordErr error
 	for off < len(data) {
-		_, _, consumed, err := DecodeRecord(data[off:])
+		typ, _, consumed, err := DecodeRecord(data[off:])
 		if err != nil {
 			// Corruption or truncation at this offset.
 			recordErr = err
 			break
+		}
+		if !isKnownRecordType(typ) {
+			return false, fmt.Errorf("wal: unknown record in segment %08d at offset %d: %w: %d", index, off, ErrUnknownRecordType, typ)
 		}
 		off += consumed
 		validEnd = off
@@ -256,10 +261,6 @@ func recoverSegment(dir string, index int, repairTail bool) (bool, error) {
 
 func hasValidRecordAfter(data []byte, off int) bool {
 	for start := off + 1; start+recordHeaderSize+recordTrailerSize <= len(data); start++ {
-		typ := RecordType(data[start])
-		if typ < RecordSeries || typ > RecordCheckpointActivate {
-			continue
-		}
 		if _, _, _, err := DecodeRecord(data[start:]); err == nil {
 			return true
 		}

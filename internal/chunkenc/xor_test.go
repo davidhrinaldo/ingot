@@ -381,6 +381,58 @@ func TestXORChunkFromBytes(t *testing.T) {
 	}
 }
 
+func TestXORChunkRejectsShortHeader(t *testing.T) {
+	tests := []struct {
+		name  string
+		data  []byte
+		valid bool
+	}{
+		{name: "nil"},
+		{name: "empty", data: []byte{}},
+		{name: "one_zero_byte", data: []byte{0}},
+		{name: "one_nonzero_byte", data: []byte{1}},
+		{name: "valid_empty_chunk", data: []byte{0, 0}, valid: true},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			chunk := XORChunkFromBytes(tc.data)
+			if got := chunk.NumSamples(); got != 0 {
+				t.Fatalf("NumSamples: got %d, want 0", got)
+			}
+			it := chunk.Iterator()
+			if it.Next() {
+				t.Fatal("short chunk produced a sample")
+			}
+			if it.Next() {
+				t.Fatal("terminal iterator produced a sample")
+			}
+			_, appErr := chunk.Appender()
+			if tc.valid {
+				if it.Err() != nil {
+					t.Fatalf("valid empty iterator error: %v", it.Err())
+				}
+				if appErr != nil {
+					t.Fatalf("valid empty appender error: %v", appErr)
+				}
+				return
+			}
+			if !errors.Is(it.Err(), ErrShortStream) {
+				t.Fatalf("iterator error: got %v, want ErrShortStream", it.Err())
+			}
+			if !errors.Is(appErr, ErrShortStream) {
+				t.Fatalf("appender error: got %v, want ErrShortStream", appErr)
+			}
+
+			direct := XORIteratorFromBytes(tc.data)
+			next := direct.Next()
+			if next || !errors.Is(direct.Err(), ErrShortStream) {
+				t.Fatalf("direct iterator: Next=%v Err=%v", next, direct.Err())
+			}
+		})
+	}
+}
+
 func TestXORIteratorRejectsInvalidWindows(t *testing.T) {
 	tests := []struct {
 		name      string
@@ -428,14 +480,17 @@ func FuzzXORIterator(f *testing.F) {
 	a.Append(1000, 71.3)
 	a.Append(1015, 71.4)
 	f.Add(c.Bytes())
+	f.Add([]byte{})
+	f.Add([]byte{0})
 
 	f.Fuzz(func(t *testing.T, data []byte) {
-		if len(data) < 2 {
-			return
-		}
-		chunk := &XORChunk{b: bstream{stream: data}}
+		chunk := XORChunkFromBytes(data)
+		_ = chunk.NumSamples()
 		it := chunk.Iterator()
 		for it.Next() {
+		}
+		direct := XORIteratorFromBytes(data)
+		for direct.Next() {
 		}
 		// Termination without panic is the only assertion.
 	})

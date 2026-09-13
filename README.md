@@ -80,6 +80,10 @@ With `SyncPeriodic`, `Commit` does not wait for `fsync`; a crash can lose commit
 
 Recovery removes an incomplete record only from the physical end of the final WAL segment. A CRC mismatch in any segment fails startup without changing the WAL. Ingot does not persist a durable-offset watermark, so it cannot distinguish a crash-torn final append from external truncation in the middle of a previously durable final record. External changes to WAL files are unsupported and can cause that final record to be discarded as an incomplete tail.
 
+A complete record with an unknown type also fails startup without changing the WAL. Current readers accept the released `v0.1.1` record framing, but downgrading after a newer writer has created checkpoint records is unsupported.
+
+`Retention: 0` disables retention, and `BlockDuration: 0` uses the two-hour default. Nonzero values for either option must be at least one millisecond; negative and nonzero sub-millisecond values are rejected by `Open` before it creates the data directory.
+
 ## Tools
 
 ### ingotctl
@@ -155,7 +159,7 @@ go build ./cmd/ingotctl/                                             # build CLI
 go build ./cmd/ingothttp/                                            # build HTTP server
 ```
 
-The decoder is total: arbitrary bytes produce values or `ErrShortStream` and never panics. Fuzzing gates every change to `chunkenc`.
+The decoder is total: arbitrary bytes produce values or a decoding error such as `ErrShortStream` or `ErrInvalidXORWindow`, and never panic. Fuzz targets are available under `internal/chunkenc`.
 
 ## Inspiration
 
@@ -167,7 +171,7 @@ The chunk encoding comes from the Gorilla paper (Pelkonen et al., VLDB 2015) via
 
 ## Non-goals
 
-Replication, query languages, non-float64 values, deletes, multi-process access, out-of-order ingestion, Windows (sorry not my thing). Check DESIGN.md for reasoning.
+Replication, query languages, non-float64 values, deletes, shared multi-process access, out-of-order ingestion, Windows (sorry not my thing). `Open` takes an exclusive advisory lock on the data directory and rejects a second owner. Check DESIGN.md for reasoning.
 
 ## License
 
