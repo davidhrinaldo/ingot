@@ -33,6 +33,101 @@ func collectRecords(t *testing.T, dir string) []Record {
 	return recs
 }
 
+func TestLogRejectsUnknownRecordTypeWithoutWriting(t *testing.T) {
+	dir := filepath.Join(t.TempDir(), "wal")
+	w, err := Open(dir, Options{})
+	if err != nil {
+		t.Fatalf("open WAL: %v", err)
+	}
+	path := segmentPath(dir, 1)
+	before, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read WAL before rejected write: %v", err)
+	}
+
+	if err := w.Log(RecordType(255), []byte("future")); !errors.Is(err, ErrUnknownRecordType) {
+		t.Fatalf("unknown record error: got %v, want ErrUnknownRecordType", err)
+	}
+	after, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read WAL after rejected write: %v", err)
+	}
+	if !reflect.DeepEqual(after, before) {
+		t.Fatal("rejected unknown record changed WAL")
+	}
+	if err := w.LogSamples([]RefSample{{Ref: 1, T: 1, V: 1}}); err != nil {
+		t.Fatalf("known record after rejection: %v", err)
+	}
+	if err := w.Close(); err != nil {
+		t.Fatalf("close WAL: %v", err)
+	}
+}
+
+func TestReaderRejectsUnknownRecordType(t *testing.T) {
+	dir := t.TempDir()
+	data := EncodeRecord(nil, RecordSamples, []byte("known"))
+	data = EncodeRecord(data, RecordType(255), []byte("future"))
+	data = EncodeRecord(data, RecordSamples, []byte("later"))
+	if err := os.WriteFile(segmentPath(dir, 1), data, 0644); err != nil {
+		t.Fatalf("write WAL: %v", err)
+	}
+
+	r, err := NewReader(dir)
+	if err != nil {
+		t.Fatalf("new reader: %v", err)
+	}
+	defer r.Close()
+	next := r.Next()
+	if !next || r.Record().Type != RecordSamples {
+		t.Fatalf("known prefix: Next=%v record=%+v err=%v", next, r.Record(), r.Err())
+	}
+	if r.Next() {
+		t.Fatal("reader returned unknown record")
+	}
+	if !errors.Is(r.Err(), ErrUnknownRecordType) {
+		t.Fatalf("reader error: got %v, want ErrUnknownRecordType", r.Err())
+	}
+}
+
+func TestUnknownRecordTypeLeavesWALIntact(t *testing.T) {
+	known := EncodeRecord(nil, RecordSamples, []byte("known"))
+	unknown := EncodeRecord(nil, RecordType(255), []byte("future"))
+	tests := []struct {
+		name     string
+		segments [][]byte
+	}{
+		{name: "only_record", segments: [][]byte{unknown}},
+		{name: "between_known_records", segments: [][]byte{append(append(append([]byte(nil), known...), unknown...), known...)}},
+		{name: "closed_segment", segments: [][]byte{unknown, known}},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			dir := t.TempDir()
+			before := make([][]byte, len(tc.segments))
+			for i, segment := range tc.segments {
+				before[i] = append([]byte(nil), segment...)
+				if err := os.WriteFile(segmentPath(dir, i+1), segment, 0644); err != nil {
+					t.Fatalf("write segment %d: %v", i+1, err)
+				}
+			}
+
+			if w, err := Open(dir, Options{}); !errors.Is(err, ErrUnknownRecordType) || w != nil {
+				t.Fatalf("open unknown WAL: wal=%v err=%v", w, err)
+			}
+			for i, want := range before {
+				got, err := os.ReadFile(segmentPath(dir, i+1))
+				if err != nil {
+					t.Fatalf("read segment %d: %v", i+1, err)
+				}
+				if !reflect.DeepEqual(got, want) {
+					t.Fatalf("segment %d changed after failed recovery", i+1)
+				}
+			}
+		})
+	}
+}
+
 func TestLogSeriesRejectsOversizedBatchBeforeWriting(t *testing.T) {
 	dir := filepath.Join(t.TempDir(), "wal")
 	w, err := Open(dir, Options{})

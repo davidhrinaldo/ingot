@@ -162,6 +162,8 @@ func (h *Head) replay() error {
 			h.applyReplayCheckpoint(checkpoint.series, checkpoint.samples)
 			checkpoint.applied = true
 			acceptedCheckpoint = cp.StartSegment
+		default:
+			return fmt.Errorf("head: replay: %w: %d", wal.ErrUnknownRecordType, rec.Type)
 		}
 	}
 	if err := r.Err(); err != nil {

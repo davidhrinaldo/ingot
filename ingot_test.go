@@ -8,6 +8,7 @@ import (
 	"reflect"
 	"sort"
 	"strconv"
+	"strings"
 	"testing"
 	"time"
 
@@ -248,6 +249,49 @@ func TestSyncPolicyOptions(t *testing.T) {
 			}
 			if got.SyncInterval != tc.wantInterval {
 				t.Errorf("sync interval: got %v, want %v", got.SyncInterval, tc.wantInterval)
+			}
+		})
+	}
+}
+
+func TestDurationOptions(t *testing.T) {
+	tests := []struct {
+		name      string
+		opts      Options
+		wantError string
+	}{
+		{name: "zero_values"},
+		{name: "retention_one_millisecond", opts: Options{Retention: time.Millisecond}},
+		{name: "retention_fraction_truncated", opts: Options{Retention: time.Millisecond + time.Nanosecond}},
+		{name: "block_duration_one_millisecond", opts: Options{BlockDuration: time.Millisecond}},
+		{name: "block_duration_fraction_truncated", opts: Options{BlockDuration: time.Millisecond + time.Nanosecond}},
+		{name: "negative_retention", opts: Options{Retention: -time.Nanosecond}, wantError: "retention"},
+		{name: "sub_millisecond_retention", opts: Options{Retention: time.Millisecond - time.Nanosecond}, wantError: "retention"},
+		{name: "negative_block_duration", opts: Options{BlockDuration: -time.Nanosecond}, wantError: "block duration"},
+		{name: "sub_millisecond_block_duration", opts: Options{BlockDuration: time.Millisecond - time.Nanosecond}, wantError: "block duration"},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			dataDir := filepath.Join(t.TempDir(), "db")
+			db, err := Open(dataDir, tc.opts)
+			if tc.wantError != "" {
+				if err == nil || !strings.Contains(err.Error(), tc.wantError) {
+					t.Fatalf("Open error: got %v, want error containing %q", err, tc.wantError)
+				}
+				if db != nil {
+					t.Fatal("Open returned a DB for invalid options")
+				}
+				if _, statErr := os.Stat(dataDir); !os.IsNotExist(statErr) {
+					t.Fatalf("invalid options created data directory: %v", statErr)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("Open: %v", err)
+			}
+			if err := db.Close(); err != nil {
+				t.Fatalf("Close: %v", err)
 			}
 		})
 	}

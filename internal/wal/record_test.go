@@ -186,6 +186,27 @@ func TestRecordSize(t *testing.T) {
 	}
 }
 
+func TestKnownRecordType(t *testing.T) {
+	for _, typ := range []RecordType{
+		RecordSeries,
+		RecordSamples,
+		RecordCheckpointBegin,
+		RecordCheckpointSeries,
+		RecordCheckpointSamples,
+		RecordCheckpointCommit,
+		RecordCheckpointActivate,
+	} {
+		if !isKnownRecordType(typ) {
+			t.Errorf("record type %d is not recognized", typ)
+		}
+	}
+	for _, typ := range []RecordType{0, 8, 255} {
+		if isKnownRecordType(typ) {
+			t.Errorf("record type %d is unexpectedly recognized", typ)
+		}
+	}
+}
+
 func TestCheckpointCodec(t *testing.T) {
 	want := Checkpoint{StartSegment: 42, BlockULID: "01JTESTBLOCK"}
 	encoded := EncodeCheckpoint(nil, want)
