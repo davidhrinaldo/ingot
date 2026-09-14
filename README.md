@@ -31,7 +31,7 @@ db.Close()
 
 ## Status
 
-**Alpha.** The API is frozen (M4) and the system survives a 48h soak test under sustained load (M5), but this hasn't seen production use yet.
+**Alpha.** The system survives a 48h soak test under sustained load, but it has not seen production use yet. Releases may still change behavior and add API before v1.
 
 | Milestone | State |
 |---|---|
@@ -42,7 +42,9 @@ db.Close()
 | M5 — Compaction + retention, 48h soak | Done |
 | M6 — ingotctl, HTTP layer, self-instrumentation | Done |
 
-See [DESIGN.md](DESIGN.md) for architecture, on-disk format, and the non-goals table. See [ROADMAP.md](ROADMAP.md) for what's next.
+See [ARCHITECTURE.md](ARCHITECTURE.md) for the current runtime and data-flow diagram. See [DESIGN.md](DESIGN.md) for design decisions, the on-disk format, and the non-goals table. See [ROADMAP.md](ROADMAP.md) for what's next.
+
+See [CHANGELOG.md](CHANGELOG.md) for release notes and upgrade guidance.
 
 ## Why
 
@@ -65,7 +67,7 @@ go get github.com/davidhrinaldo/ingot
 
 ## Commit durability
 
-The zero-value `Options{}` uses `SyncOnCommit`. `Appender.Commit` writes the batch to the WAL, calls `fsync`, and applies it to the in-memory head only after the sync succeeds. A successful commit therefore survives a process or machine crash, subject to the storage device honoring `fsync`.
+The zero-value `Options{}` uses `SyncOnCommit`. `Appender.Commit` writes the batch to the WAL, calls `fsync`, and applies it to the in-memory head only after the sync succeeds. A successful commit therefore survives a process or machine crash, subject to the storage device honoring `fsync`. This differs from `v0.1.1`, which synced periodically by default, so applications upgrading from `v0.1.1` should expect higher commit latency unless they select `SyncPeriodic`.
 
 Applications that accept a bounded loss window can opt into background sync:
 
@@ -80,7 +82,7 @@ With `SyncPeriodic`, `Commit` does not wait for `fsync`; a crash can lose commit
 
 Recovery removes an incomplete record only from the physical end of the final WAL segment. A CRC mismatch in any segment fails startup without changing the WAL. Ingot does not persist a durable-offset watermark, so it cannot distinguish a crash-torn final append from external truncation in the middle of a previously durable final record. External changes to WAL files are unsupported and can cause that final record to be discarded as an incomplete tail.
 
-A complete record with an unknown type also fails startup without changing the WAL. Current readers accept the released `v0.1.1` record framing, but downgrading after a newer writer has created checkpoint records is unsupported.
+A complete record with an unknown type also fails startup without changing the WAL. Current readers accept the released `v0.1.1` record framing. Do not open a data directory with `v0.1.1` after this version has written checkpoint records: `v0.1.1` can silently ignore those records and recover incomplete head state. Restore a pre-upgrade backup instead.
 
 `Retention: 0` disables retention, and `BlockDuration: 0` uses the two-hour default. Nonzero values for either option must be at least one millisecond; negative and nonzero sub-millisecond values are rejected by `Open` before it creates the data directory.
 

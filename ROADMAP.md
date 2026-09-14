@@ -18,6 +18,6 @@ Docker-compose setup with ingothttp and Grafana pre-configured. Include a data g
 
 At minimum:
 - `go test -race -short ./...` on every push
-- `go test -race -run TestSoak ./...` with a 10-minute timeout on main/nightly
+- `go test -run TestSoak ./...` with a 10-minute test timeout on main/nightly
 - `go vet ./...`
 - A linter (staticcheck or golangci-lint)

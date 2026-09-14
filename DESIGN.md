@@ -35,7 +35,7 @@ Explicit and load-bearing. Each of these is a decision, not an omission.
 - Series are identified internally by a `uint64` series ID (also called a ref), assigned on first append and stable for the life of the store.
 - Labels are validated on ingest: non-empty name, UTF-8, sorted canonical order for hashing.
 
-### Public API (frozen at Phase 4)
+### Public API
 ```go
 db, err := ingot.Open("./data", ingot.Options{
     Retention: 30 * 24 * time.Hour,

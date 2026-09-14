@@ -24,15 +24,15 @@ func TestSoak(t *testing.T) {
 	}
 
 	const (
-		numSeries      = 10_000
-		canaryCount    = 10 // series tracked in the oracle for query validation
-		scrapeInterval = 15_000 // 15s in ms
-		simDuration    = 48 * 3600 * 1000 // 48h in ms
-		blockDuration  = 2 * 3600 * 1000 // 2h in ms
-		retentionMs    = 24 * 3600 * 1000 // 24h in ms
-		flushInterval  = 5 * 60 * 1000 // flush every 5 simulated minutes
-		compactInterval = 30 * 60 * 1000 // compact every 30 simulated minutes
-		queryInterval  = 10 * 60 * 1000 // validate queries every 10 simulated minutes
+		numSeries       = 10_000
+		canaryCount     = 10               // series tracked in the oracle for query validation
+		scrapeInterval  = 15_000           // 15s in ms
+		simDuration     = 48 * 3600 * 1000 // 48h in ms
+		blockDuration   = 2 * 3600 * 1000  // 2h in ms
+		retentionMs     = 24 * 3600 * 1000 // 24h in ms
+		flushInterval   = 5 * 60 * 1000    // flush every 5 simulated minutes
+		compactInterval = 30 * 60 * 1000   // compact every 30 simulated minutes
+		queryInterval   = 10 * 60 * 1000   // validate queries every 10 simulated minutes
 	)
 
 	var now atomic.Int64

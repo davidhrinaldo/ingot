@@ -54,13 +54,13 @@ func TestBstream(t *testing.T) {
 		{name: "all_ones_64", data: bstreamBytes([][2]uint64{{^uint64(0), 64}}), reads: []readOp{ok(^uint64(0), 64)}},
 		{name: "all_zeros_64", data: bstreamBytes([][2]uint64{{0, 64}}), reads: []readOp{ok(0, 64)}},
 		{
-			name: "byte_aligned_sequence",
-			data: bstreamBytes([][2]uint64{{0xAA, 8}, {0xBB, 8}, {0xCC, 8}}),
+			name:  "byte_aligned_sequence",
+			data:  bstreamBytes([][2]uint64{{0xAA, 8}, {0xBB, 8}, {0xCC, 8}}),
 			reads: []readOp{ok(0xAA, 8), ok(0xBB, 8), ok(0xCC, 8)},
 		},
 		{
-			name: "non_aligned_crossing_boundary",
-			data: bstreamBytes([][2]uint64{{0b101, 3}, {0b11001, 5}, {0xFF, 8}, {1, 1}}),
+			name:  "non_aligned_crossing_boundary",
+			data:  bstreamBytes([][2]uint64{{0b101, 3}, {0b11001, 5}, {0xFF, 8}, {1, 1}}),
 			reads: []readOp{ok(0b101, 3), ok(0b11001, 5), ok(0xFF, 8), ok(1, 1)},
 		},
 		{
@@ -72,8 +72,8 @@ func TestBstream(t *testing.T) {
 			},
 		},
 		{
-			name: "sequential_64_bit_writes",
-			data: bstreamBytes([][2]uint64{{0x0123456789ABCDEF, 64}, {0xFEDCBA9876543210, 64}, {0, 64}}),
+			name:  "sequential_64_bit_writes",
+			data:  bstreamBytes([][2]uint64{{0x0123456789ABCDEF, 64}, {0xFEDCBA9876543210, 64}, {0, 64}}),
 			reads: []readOp{ok(0x0123456789ABCDEF, 64), ok(0xFEDCBA9876543210, 64), ok(0, 64)},
 		},
 		{
@@ -104,13 +104,13 @@ func TestBstream(t *testing.T) {
 			}(),
 		},
 		{
-			name: "high_bits_ignored",
-			data: bstreamBytes([][2]uint64{{0xFFFFFFFFFFFFFFFF, 1}, {0xFFFFFFFFFFFFFFFF, 4}, {0xFFFFFFFFFFFFFFFF, 8}}),
+			name:  "high_bits_ignored",
+			data:  bstreamBytes([][2]uint64{{0xFFFFFFFFFFFFFFFF, 1}, {0xFFFFFFFFFFFFFFFF, 4}, {0xFFFFFFFFFFFFFFFF, 8}}),
 			reads: []readOp{ok(1, 1), ok(0xF, 4), ok(0xFF, 8)},
 		},
 		{
-			name: "mixed_widths",
-			data: bstreamBytes([][2]uint64{{0b1, 1}, {0xABCD, 16}, {0, 1}, {0xFF, 8}, {0b110, 3}, {0xDEADBEEF, 32}, {1, 1}, {0, 0}}),
+			name:  "mixed_widths",
+			data:  bstreamBytes([][2]uint64{{0b1, 1}, {0xABCD, 16}, {0, 1}, {0xFF, 8}, {0b110, 3}, {0xDEADBEEF, 32}, {1, 1}, {0, 0}}),
 			reads: []readOp{ok(0b1, 1), ok(0xABCD, 16), ok(0, 1), ok(0xFF, 8), ok(0b110, 3), ok(0xDEADBEEF, 32), ok(1, 1), ok(0, 0)},
 		},
 	}

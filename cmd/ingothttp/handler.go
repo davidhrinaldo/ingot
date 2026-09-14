@@ -155,10 +155,10 @@ func (h *handler) read(w http.ResponseWriter, r *http.Request) {
 // --- /api/v1/status ---
 
 type statusResponse struct {
-	HeadSeries      int `json:"headSeries"`
-	HeadChunks      int `json:"headChunks"`
-	Blocks          int `json:"blocks"`
-	Compactions     int `json:"compactions"`
+	HeadSeries  int `json:"headSeries"`
+	HeadChunks  int `json:"headChunks"`
+	Blocks      int `json:"blocks"`
+	Compactions int `json:"compactions"`
 }
 
 func (h *handler) status(w http.ResponseWriter, r *http.Request) {
