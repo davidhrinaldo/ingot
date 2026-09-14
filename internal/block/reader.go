@@ -1,8 +1,8 @@
 package block
 
 import (
-	"fmt"
 	"container/heap"
+	"fmt"
 	"os"
 	"path/filepath"
 	"sync/atomic"

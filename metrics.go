@@ -6,11 +6,11 @@ import (
 
 // Self-instrumentation metric names.
 const (
-	MetricHeadSeries         = "ingot_head_series"
-	MetricHeadChunksActive   = "ingot_head_chunks_active"
-	MetricBlocksTotal        = "ingot_blocks_total"
-	MetricCompactionsTotal   = "ingot_compactions_total"
-	MetricWALFsyncDurationS  = "ingot_wal_fsync_duration_seconds"
+	MetricHeadSeries        = "ingot_head_series"
+	MetricHeadChunksActive  = "ingot_head_chunks_active"
+	MetricBlocksTotal       = "ingot_blocks_total"
+	MetricCompactionsTotal  = "ingot_compactions_total"
+	MetricWALFsyncDurationS = "ingot_wal_fsync_duration_seconds"
 )
 
 // metricsRefs caches series refs for self-instrumentation metrics.
@@ -65,4 +65,3 @@ func (db *DB) collectMetrics() {
 	}
 	app.Commit()
 }
-

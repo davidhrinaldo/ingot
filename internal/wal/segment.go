@@ -10,7 +10,7 @@ import (
 
 const (
 	defaultSegmentMaxSize = 128 * 1024 * 1024 // 128 MiB
-	segmentNameLen        = 8                  // "00000001"
+	segmentNameLen        = 8                 // "00000001"
 )
 
 // segmentFileName returns the zero-padded filename for a segment index.

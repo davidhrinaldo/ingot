@@ -3,6 +3,9 @@ name: Tests
 on:
   push:
   pull_request:
+  schedule:
+    - cron: "17 4 * * *"
+  workflow_dispatch:
 
 permissions:
   contents: read
@@ -32,3 +35,22 @@ jobs:
 
       - name: Test
         run: go test -race -short ./...
+
+  soak:
+    name: Soak
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Set up Go
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Soak
+        run: go test -run '^TestSoak$' -count=1 -timeout=10m .
